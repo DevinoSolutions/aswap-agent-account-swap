@@ -25,6 +25,7 @@ from claude_swap.autoswitch import (
 )
 from claude_swap.settings import AutoSwitchSettings, load_settings, set_setting
 
+from tests import statefiles
 from tests.test_autoswitch import EngineHarness, _R_LATER, _R_LATEST, _R_SOON, _usage7
 
 
@@ -317,8 +318,9 @@ class TestStatusLine:
         from claude_swap.usage_store import UsageEntry
 
         h = _harness(temp_home)
-        (h.switcher.backup_dir / "autoswitch_state.json").write_text(
-            json.dumps({"manualHold": {"account": "1", "since": time.time()}})
+        statefiles.write_text(
+            h.switcher.backup_dir / "autoswitch_state.json",
+            json.dumps({"manualHold": {"account": "1", "since": time.time()}}),
         )
         with patch.object(
             h.switcher, "_active_account_usage", return_value=UsageEntry()

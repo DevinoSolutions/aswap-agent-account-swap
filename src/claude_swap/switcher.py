@@ -6556,9 +6556,7 @@ class ClaudeAccountSwitcher:
         from claude_swap.autoswitch import STATE_FILENAME, clock_label, manual_hold_until
 
         try:
-            state = json.loads(
-                (self.backup_dir / STATE_FILENAME).read_text(encoding="utf-8")
-            )
+            state = json.loads(statedb.read_text(self.backup_dir / STATE_FILENAME))
         except (OSError, ValueError):
             return None
         settings = load_settings(self.backup_dir)

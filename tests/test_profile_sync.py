@@ -26,6 +26,7 @@ import pytest
 from claude_swap import cli, oauth
 from claude_swap import session as session_mod
 from claude_swap.session import session_dir_for, stale_marker_for
+from tests import statefiles
 from claude_swap.switcher import (
     PROFILE_SYNC_ADOPTED,
     PROFILE_SYNC_BUSY,
@@ -737,7 +738,7 @@ class TestNeedsLogin:
         assert NUM in switcher.switchable_account_numbers()
         assert caplog.text.count("logged in again") == 1
         assert all(CANARY not in r.getMessage() for r in caplog.records)
-        assert CANARY not in switcher.sequence_file.read_text()
+        assert CANARY not in statefiles.read_text(switcher.sequence_file)
 
     def test_a_re_added_store_credential_clears_it(self, switcher, caplog):
         """`aswap add --slot N` replaces the stored credential; a live pane may
