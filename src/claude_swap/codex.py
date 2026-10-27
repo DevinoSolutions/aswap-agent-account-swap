@@ -32,6 +32,7 @@ from claude_swap.codex_usage import (
     fetch_codex_usage,
     refresh_codex_auth,
 )
+from claude_swap import statedb
 from claude_swap.exceptions import AccountNotFoundError, ConfigError, SwitchError, ValidationError
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.locking import FileLock
@@ -128,6 +129,7 @@ class CodexAccountSwitcher:
 
     def __init__(self, debug: bool = False) -> None:
         self.backup_dir = get_backup_root()
+        statedb.manage(self.backup_dir)
         self.provider_dir = self.backup_dir / "codex"
         self.credentials_dir = self.provider_dir / "credentials"
         self.sequence_file = self.provider_dir / "sequence.json"
@@ -145,7 +147,7 @@ class CodexAccountSwitcher:
 
     def _read_json(self, path: Path) -> dict[str, Any] | None:
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(statedb.read_text(path))
         except FileNotFoundError:
             return None
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -153,6 +155,10 @@ class CodexAccountSwitcher:
         return data if isinstance(data, dict) else None
 
     def _write_json(self, path: Path, data: dict[str, Any]) -> None:
+        # The roster and stored auth backups are state documents; the live
+        # ~/.codex/auth.json stays a file Codex reads.
+        if statedb.try_write(path, json.dumps(data, indent=2) + "\n"):
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
         try:
@@ -384,7 +390,7 @@ class CodexAccountSwitcher:
                 if answer not in ("y", "yes"):
                     print("Cancelled")
                     return
-            self._credential_path(number).unlink(missing_ok=True)
+            statedb.unlink(self._credential_path(number), missing_ok=True)
             del data["accounts"][number]
             if data.get("activeAccountNumber") == int(number):
                 data["activeAccountNumber"] = None

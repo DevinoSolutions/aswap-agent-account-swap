@@ -44,12 +44,28 @@ def read_text_with_retry(
     genuine, persistent permission problem that must surface at once rather
     than after a ~0.75 s stall.
     """
+    return _with_sharing_retry(
+        lambda: Path(path).read_text(encoding="utf-8"), attempts, initial_delay
+    )
+
+
+def read_bytes_with_retry(
+    path: os.PathLike | str,
+    *,
+    attempts: int = 10,
+    initial_delay: float = 0.002,
+) -> bytes:
+    """``Path.read_bytes`` with :func:`read_text_with_retry`'s Windows retries."""
+    return _with_sharing_retry(lambda: Path(path).read_bytes(), attempts, initial_delay)
+
+
+def _with_sharing_retry(read, attempts: int, initial_delay: float):
     if attempts < 1:
         raise ValueError("attempts must be >= 1")
     delay = initial_delay
     for attempt in range(attempts):
         try:
-            return Path(path).read_text(encoding="utf-8")
+            return read()
         except OSError as e:
             transient = (
                 sys.platform == "win32"

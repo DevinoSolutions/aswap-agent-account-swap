@@ -14,7 +14,9 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap.models import Platform
+from claude_swap import statedb
 from claude_swap.switcher import ClaudeAccountSwitcher
+from tests import statefiles
 
 
 class TestMoveAccount:
@@ -158,10 +160,10 @@ class TestMoveAccount:
             "5", "account2@example.com", "stale-foreign"
         )
 
-        real_unlink = Path.unlink
+        real_unlink = statedb.unlink
 
         def failing_unlink(path, *args, **kwargs):
-            if path.name.startswith(".creds-5-"):
+            if Path(path).name.startswith(".creds-5-"):
                 raise OSError("permission denied (injected)")
             return real_unlink(path, *args, **kwargs)
 
@@ -171,7 +173,7 @@ class TestMoveAccount:
         # FORCE_COLOR/NO_COLOR the developer's shell actually has exported
         # for the rest of this test.
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(Path, "unlink", failing_unlink)
+            mp.setattr(statedb, "unlink", failing_unlink)
             with pytest.raises(CredentialError, match="aborting before commit"):
                 switcher.move_account("2", "5")
 
@@ -194,20 +196,15 @@ class TestMoveAccount:
         when the target's strict clear also hit the same unreadable dir —
         a gap through which the source's own live refresh token could have
         been silently treated as absent and dropped)."""
-        if sys.platform == "win32" or os.geteuid() == 0:
-            pytest.skip("needs POSIX permission semantics (non-root)")
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data)
         switcher._write_account_credentials(
             "5", "account2@example.com", "stale-foreign"
         )
 
-        switcher.credentials_dir.chmod(0o000)
-        try:
+        with statefiles.unreadable(switcher.credentials_dir, unsearchable=True):
             with pytest.raises(ConfigError, match="could not be read"):
                 switcher.move_account("2", "5")
-        finally:
-            switcher.credentials_dir.chmod(0o700)
 
         # Nothing committed; with permissions restored, the stale credential
         # is still present but remains unreferenced.
@@ -501,18 +498,14 @@ class TestMoveUnreadableSourceIsNotAbsent:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, data)
 
-    @pytest.mark.skipif(
-        sys.platform == "win32" or os.geteuid() == 0,
-        reason="needs POSIX permission semantics (non-root)",
-    )
     def test_unreadable_enc_aborts_the_move_before_anything_changes(
         self, temp_home: Path, sample_sequence_data: dict
     ):
         switcher = ClaudeAccountSwitcher()
-        # The probe is a chmod'd .enc, so the store has to be on the file
-        # backend. Unpinned, this test only ran that way off macOS, where
+        # The probe is an unreadable .enc, so the store has to be on the
+        # file backend. Unpinned, this test only ran that way off macOS, where
         # `_write_account_credentials` goes to the Keychain and leaves no .enc
-        # to chmod. The guard under test is the move's, not the backend's.
+        # to break. The guard under test is the move's, not the backend's.
         switcher.platform = Platform.LINUX
         self._write(switcher, sample_sequence_data)
         switcher._write_account_credentials("2", "account2@example.com", "live-rt")
@@ -527,13 +520,9 @@ class TestMoveUnreadableSourceIsNotAbsent:
         )
 
         enc = switcher._backup_enc_path("2", "account2@example.com")
-        enc.chmod(0o000)
-        try:
+        with statefiles.unreadable(enc):
             with pytest.raises(ConfigError, match="could not be read"):
                 switcher.move_account("2", "6")
-        finally:
-            if enc.exists():
-                enc.chmod(0o600)
 
         # Nothing committed: account 2 is intact under its original number,
         # holding its readable credential, and slot 6 was never claimed.

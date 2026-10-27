@@ -30,7 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import oauth
-from claude_swap.fsutil import read_text_with_retry, replace_with_retry
+from claude_swap import statedb
+from claude_swap.fsutil import replace_with_retry
 from claude_swap.weekly_anchor import normalize_tier, tier_label
 
 _logger = logging.getLogger("claude-swap")
@@ -241,18 +242,21 @@ class BillingCache:
 
     def _load(self) -> dict[str, dict]:
         try:
-            raw = json.loads(read_text_with_retry(self.path))
+            raw = json.loads(statedb.read_text(self.path))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return {}
         accounts = raw.get("accounts") if isinstance(raw, dict) else None
         return accounts if isinstance(accounts, dict) else {}
 
     def _save(self, accounts: dict[str, dict]) -> None:
+        payload = {"version": _CACHE_VERSION, "accounts": accounts}
+        if statedb.try_write(self.path, json.dumps(payload)):
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".billing-")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"version": _CACHE_VERSION, "accounts": accounts}, fh)
+                json.dump(payload, fh)
             replace_with_retry(tmp, self.path)
         except BaseException:
             try:

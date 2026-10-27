@@ -20,6 +20,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from claude_swap import statedb
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import get_timestamp
 
@@ -45,12 +46,10 @@ class MappingStore:
 
     def load(self) -> dict[str, dict]:
         """Return the normalized-path → entry map (empty on missing/corrupt)."""
-        if not self.path.exists():
-            return {}
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data = json.loads(statedb.read_text(self.path))
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-            return {}
+            return {}  # FileNotFoundError included: no mappings yet
         if not isinstance(data, dict):
             return {}
         mappings = data.get("mappings", {})
@@ -118,13 +117,16 @@ class MappingStore:
         return best
 
     def _write(self, mappings: dict[str, dict]) -> None:
-        """Atomically write the mappings file (tempfile + os.replace)."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if sys.platform != "win32":
-            os.chmod(self.path.parent, 0o700)
+        """Atomically write the mappings: a state-database write, or for a
+        root outside the backup dir, tempfile + os.replace."""
         payload = json.dumps(
             {"schemaVersion": SCHEMA_VERSION, "mappings": mappings}, indent=2
         )
+        if statedb.try_write(self.path, payload):
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(self.path.parent, 0o700)
         fd, tmp = tempfile.mkstemp(
             dir=str(self.path.parent), prefix=".mappings-", suffix=".tmp"
         )

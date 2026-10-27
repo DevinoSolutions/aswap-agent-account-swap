@@ -7,10 +7,11 @@ import contextlib
 import json
 import os
 import sys
+from pathlib import Path
 
-from claude_swap import __version__, paths, printer
+from claude_swap import __version__, paths, printer, statedb
 from claude_swap.codex import CodexAccountSwitcher
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
     accent,
@@ -699,7 +700,7 @@ def _list_dispatch(claude_switcher: "ClaudeAccountSwitcher", args) -> dict | Non
         return {"claude": claude_payload, "codex": codex_switcher.list_payload()}
 
     print(bolded("Claude Code"))
-    if claude_switcher.sequence_file.exists():
+    if statedb.exists(claude_switcher.sequence_file):
         claude_switcher.list_accounts(
             show_token_status=args.token_status, json_output=False
         )
@@ -1022,18 +1023,22 @@ through aswap's isolated session profiles. Ctrl-C stops loop mode.
 
 
 def _config_command(argv: list[str]) -> None:
-    """Handle `aswap config [list|get KEY|set KEY VALUE|unset KEY|path]`.
+    """Handle `aswap config [list|get|set|unset|path|export|import]`.
 
     Pre-dispatched before the main parser is built, like `run` and `auto`
-    (same limitation: `config` must be the first argument). Edits
-    settings.json in the backup root with strict validation — unlike loading,
-    which forgivingly clamps — so a typo'd key or out-of-range value errors
-    loudly here instead of silently degrading at `aswap auto` time.
+    (same limitation: `config` must be the first argument). Edits the
+    settings document (settings.json, stored in the backup root's state.db)
+    with strict validation — unlike loading, which forgivingly clamps — so a
+    typo'd key or out-of-range value errors loudly here instead of silently
+    degrading at `aswap auto` time. `export`/`import` stand in for opening
+    the file in an editor, which no longer exists on disk.
     """
     from claude_swap.settings import (
         SETTING_SPECS,
         effective_settings,
+        export_settings,
         format_setting_value,
+        import_settings,
         set_setting,
         setting_spec,
         settings_path,
@@ -1047,8 +1052,8 @@ def _config_command(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog=f"{_prog_name()} config",
         description=(
-            "Read and edit aswap settings (settings.json in the "
-            "backup root)."
+            "Read and edit aswap settings (the settings.json document in "
+            "the backup root's state.db)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
@@ -1060,7 +1065,9 @@ Examples:
   aswap config get autoswitch.threshold
   aswap config set autoswitch.threshold 80
   aswap config unset autoswitch.threshold   # back to the default
-  aswap config path                         # where settings.json lives
+  aswap config path                         # where the settings are stored
+  aswap config export settings.json         # write them out to hand-edit
+  aswap config import settings.json         # validate and load them back
         """,
     )
     parser.add_argument(
@@ -1073,7 +1080,9 @@ Examples:
         action="store_true",
         help="Enable debug logging",
     )
-    sub = parser.add_subparsers(dest="action", metavar="{list,get,set,unset,path}")
+    sub = parser.add_subparsers(
+        dest="action", metavar="{list,get,set,unset,path,export,import}"
+    )
 
     p_list = sub.add_parser("list", help="Show all effective settings (the default)")
     p_get = sub.add_parser("get", help="Print one setting's effective value")
@@ -1092,7 +1101,16 @@ Examples:
     p_set.add_argument("value", metavar="VALUE")
     p_unset = sub.add_parser("unset", help="Remove one setting (revert to the default)")
     p_unset.add_argument("key", metavar="KEY")
-    sub.add_parser("path", help="Print the settings.json location")
+    sub.add_parser("path", help="Print where the settings are stored")
+    p_export = sub.add_parser(
+        "export", help="Write the settings as JSON to FILE (default: stdout)"
+    )
+    p_export.add_argument("file", metavar="FILE", nargs="?", default="-")
+    p_import = sub.add_parser(
+        "import",
+        help="Replace the settings with FILE ('-' for stdin), validated strictly",
+    )
+    p_import.add_argument("file", metavar="FILE")
 
     args = parser.parse_args(argv)
     json_mode = bool(getattr(args, "json", False))
@@ -1109,7 +1127,38 @@ Examples:
         root = switcher.backup_dir
 
         if action == "path":
-            print(settings_path(root))
+            hit = statedb.locate(settings_path(root))
+            if hit is None:  # a symlinked settings.json stays a plain file
+                print(settings_path(root))
+            else:
+                print(f"settings live in {hit[0].path} (document {hit[1]})")
+        elif action == "export":
+            text = json.dumps(export_settings(root), indent=2) + "\n"
+            if args.file == "-":
+                sys.stdout.write(text)
+            else:
+                dest = Path(args.file).expanduser()
+                try:
+                    dest.write_text(text, encoding="utf-8")
+                except OSError as e:
+                    raise ConfigError(f"could not write {dest}: {e}") from e
+                print(f"Settings exported to {dest}")
+        elif action == "import":
+            source = "stdin" if args.file == "-" else str(Path(args.file).expanduser())
+            try:
+                text = (
+                    sys.stdin.read() if args.file == "-"
+                    else Path(source).read_text(encoding="utf-8-sig")
+                )
+            except (OSError, UnicodeDecodeError) as e:
+                raise ConfigError(f"could not read {source}: {e}") from e
+            try:
+                raw = json.loads(text)
+            except json.JSONDecodeError as e:
+                raise ConfigError(f"{source} is not valid JSON ({e})") from e
+            stored = import_settings(root, raw)
+            count = sum(len(v) for v in stored.values() if isinstance(v, dict))
+            print(f"Imported {count} settings from {source}")
         elif action == "list":
             rows = effective_settings(root)
             if json_mode:
@@ -1776,7 +1825,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s codex <command>            manage Codex CLI accounts
-  %(prog)s backup [take|list|check|restore]  snapshots of accounts and creds; crash restore
+  %(prog)s backup [take|list|check|restore|export]  snapshots of state.db; crash restore
   %(prog)s billing <command>          exact billing, weekly resets, resub plan
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s warmup                     keep five-hour windows ready (opt-in spend)

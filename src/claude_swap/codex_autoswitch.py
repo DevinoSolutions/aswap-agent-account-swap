@@ -25,6 +25,7 @@ from claude_swap.autoswitch import (
     TickOutcome,
     binding_pct,
 )
+from claude_swap import statedb
 from claude_swap.codex import CodexAccountSwitcher, _codex_restart_hint
 from claude_swap.locking import FileLock
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json
@@ -63,7 +64,7 @@ class CodexAutoSwitchEngine:
 
     def _read_state(self) -> dict:
         try:
-            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            raw = json.loads(statedb.read_text(self.state_path))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return {}
         return raw if isinstance(raw, dict) else {}

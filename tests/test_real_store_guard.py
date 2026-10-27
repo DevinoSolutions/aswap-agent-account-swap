@@ -567,6 +567,29 @@ def test_i5_bytes_path_into_protected_root_is_refused(
     )
 
 
+def test_sqlite_connect_into_protected_root_is_refused(tmp_path: Path, monkeypatch):
+    """The state lives in ``state.db`` now, and SQLite writes it through
+    its own file handles: no ``open`` event ever fires for them. The
+    connect is the one point the hook sees, so it has to refuse there —
+    otherwise a straggling thread could open and write the real store."""
+    import sqlite3
+
+    from claude_swap import statedb
+
+    stand_in_root = tmp_path / "claude-swap"
+    stand_in_root.mkdir()
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ((stand_in_root, True),))
+
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        sqlite3.connect(stand_in_root / "state.db")
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        statedb.StateDB(stand_in_root).write("sequence.json", b"{}")
+    assert not (stand_in_root / "state.db").exists()
+
+    # Control: the same connect outside the protected root goes through.
+    sqlite3.connect(tmp_path / "elsewhere.db").close()
+
+
 def test_derived_hints_exclude_the_bare_home_root_basename():
     """C2 follow-up: deriving hints from every frozen root's basename would,
     without an exclusion, include ``Path.home()``'s own basename — the

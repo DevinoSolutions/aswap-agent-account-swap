@@ -31,7 +31,7 @@ from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, statedb
 from claude_swap.exceptions import MigrationIncomplete
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import Platform, get_timestamp
@@ -60,10 +60,8 @@ def _load_applied(switcher: "ClaudeAccountSwitcher") -> dict:
     corrupt file can never permanently block a migration.
     """
     path = _state_path(switcher)
-    if not path.exists():
-        return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(statedb.read_text(path))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
     applied = data.get("applied") if isinstance(data, dict) else None
@@ -82,6 +80,9 @@ def _mark_applied(switcher: "ClaudeAccountSwitcher", migration_id: str) -> None:
     applied = _load_applied(switcher)
     applied[migration_id] = get_timestamp()
     content = json.dumps({"version": STATE_VERSION, "applied": applied}, indent=2)
+    # A state document like the rest (one committed write to state.db).
+    if statedb.try_write(path, content):
+        return
 
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
@@ -147,7 +148,7 @@ def migrate_windows_keyring_to_files(switcher: "ClaudeAccountSwitcher") -> bool:
     """
     if switcher.platform != Platform.WINDOWS:
         return False
-    if not switcher.sequence_file.exists():
+    if not statedb.exists(switcher.sequence_file):
         return False  # No managed accounts yet — let a later restore migrate.
 
     data = switcher._get_sequence_data()
@@ -318,7 +319,7 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     """
     if switcher.platform != Platform.MACOS:
         return False
-    if not switcher.sequence_file.exists():
+    if not statedb.exists(switcher.sequence_file):
         return False  # No managed accounts yet — let a later restore migrate.
 
     data = switcher._get_sequence_data()
@@ -497,8 +498,24 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     return True
 
 
+def migrate_state_files_to_db(switcher: "ClaudeAccountSwitcher") -> bool:
+    """Record the move of the state files into ``state.db``.
+
+    The import itself cannot wait for this runner: anything that reads state
+    first (another migration, the TUI's settings load) would find no roster.
+    So ``statedb`` imports on each process's first access, and again hourly
+    from ``snapshots.maintain``, and this entry forces that and records when
+    it first completed. ``False`` while there is no database yet (a fresh
+    install with nothing to move), so a later run records it.
+    """
+    db = statedb.open_db(switcher.backup_dir)
+    db.ensure_imported()
+    return db.path.exists()
+
+
 # Registry of (id, fn). Order matters if migrations ever depend on each other.
 MIGRATIONS: list[tuple[str, Callable[["ClaudeAccountSwitcher"], bool]]] = [
+    ("state_files_to_db", migrate_state_files_to_db),
     ("windows_keyring_to_files", migrate_windows_keyring_to_files),
     ("macos_keyring_to_security", migrate_macos_keyring_to_security),
 ]

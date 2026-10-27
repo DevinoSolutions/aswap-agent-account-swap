@@ -36,6 +36,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from claude_swap import statedb
 from claude_swap.locking import FileLock
 from claude_swap import oauth
 from claude_swap.poll_policy import (
@@ -859,7 +860,7 @@ class UsageStore:
 
     def _read_rows(self) -> dict[str, dict]:
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(statedb.read_text(self.path))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return {}
         if not isinstance(raw, dict) or raw.get("schemaVersion") != SCHEMA_VERSION:

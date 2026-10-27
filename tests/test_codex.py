@@ -7,6 +7,7 @@ import json
 
 import pytest
 
+from tests import statefiles
 from claude_swap import codex
 from claude_swap.codex_usage import CodexUsageError
 from claude_swap.exceptions import ConfigError, SwitchError
@@ -77,7 +78,7 @@ def test_add_refreshes_existing_account_in_place(switcher):
 
     listed = instance.list_accounts()
     assert [account["number"] for account in listed["accounts"]] == [1]
-    assert json.loads((instance.credentials_dir / "account-1.json").read_text()) == refreshed
+    assert statefiles.read_json(instance.credentials_dir / "account-1.json") == refreshed
 
 
 def test_switch_saves_the_currently_refreshed_auth_before_activating_target(switcher):
@@ -92,7 +93,7 @@ def test_switch_saves_the_currently_refreshed_auth_before_activating_target(swit
     _write_live(home, refreshed)
     instance.switch_to("1", json_output=True)
 
-    assert json.loads((instance.credentials_dir / "account-2.json").read_text()) == refreshed
+    assert statefiles.read_json(instance.credentials_dir / "account-2.json") == refreshed
 
 
 def test_disabled_account_is_skipped_by_rotation_but_stays_explicit_target(switcher):
@@ -152,7 +153,7 @@ def test_seats_sharing_a_workspace_keep_their_own_slots(switcher):
         "one@example.com",
         "two@example.com",
     ]
-    assert json.loads((instance.credentials_dir / "account-1.json").read_text()) == _auth(
+    assert statefiles.read_json(instance.credentials_dir / "account-1.json") == _auth(
         "one@example.com", "shared-workspace"
     )
 
@@ -180,10 +181,10 @@ def test_switch_away_from_a_shared_workspace_seat_keeps_both_logins(switcher):
     assert json.loads((home / "auth.json").read_text()) == _auth(
         "one@example.com", "shared-workspace"
     )
-    assert json.loads((instance.credentials_dir / "account-1.json").read_text()) == _auth(
+    assert statefiles.read_json(instance.credentials_dir / "account-1.json") == _auth(
         "one@example.com", "shared-workspace"
     )
-    assert json.loads((instance.credentials_dir / "account-2.json").read_text()) == _auth(
+    assert statefiles.read_json(instance.credentials_dir / "account-2.json") == _auth(
         "two@example.com", "shared-workspace"
     )
 
@@ -208,7 +209,7 @@ def test_switching_away_from_an_unregistered_sibling_seat_is_refused(switcher):
     with pytest.raises(SwitchError, match="unmanaged"):
         instance.switch_to("2", json_output=True)
 
-    assert json.loads((instance.credentials_dir / "account-1.json").read_text()) == _auth(
+    assert statefiles.read_json(instance.credentials_dir / "account-1.json") == _auth(
         "one@example.com", "shared-workspace"
     )
 
@@ -222,7 +223,7 @@ def test_the_same_email_in_two_workspaces_keeps_separate_slots(switcher):
     instance.add_account(assume_yes=True)
 
     assert [account["number"] for account in instance.list_accounts()["accounts"]] == [1, 2]
-    assert json.loads((instance.credentials_dir / "account-1.json").read_text()) == _auth(
+    assert statefiles.read_json(instance.credentials_dir / "account-1.json") == _auth(
         "same@example.com", "workspace-one"
     )
 
@@ -247,16 +248,16 @@ def test_an_unreadable_live_identity_matches_nothing(switcher):
     # Legacy metadata with blank fields must not be matched by a login whose
     # own identity failed to decode; switch_to reads auth.json directly and so
     # never sees the validation _read_live_auth applies.
-    sequence = json.loads(instance.sequence_file.read_text())
+    sequence = statefiles.read_json(instance.sequence_file)
     sequence["accounts"]["1"]["email"] = ""
     sequence["accounts"]["1"]["accountId"] = ""
-    instance.sequence_file.write_text(json.dumps(sequence), encoding="utf-8")
+    statefiles.write_json(instance.sequence_file, sequence)
     _write_live(home, {"auth_mode": "chatgpt", "tokens": {"id_token": "not-a-jwt"}})
 
     with pytest.raises(SwitchError, match="unmanaged"):
         instance.switch_to("2", json_output=True)
 
-    assert json.loads((instance.credentials_dir / "account-1.json").read_text()) == _auth(
+    assert statefiles.read_json(instance.credentials_dir / "account-1.json") == _auth(
         "one@example.com", "account-one"
     )
 
@@ -285,7 +286,7 @@ def test_keyring_only_configuration_is_rejected_without_writing(switcher):
     with pytest.raises(ConfigError, match="OS keyring"):
         instance.add_account(assume_yes=True)
 
-    assert not instance.sequence_file.exists()
+    assert not statefiles.exists(instance.sequence_file)
 
 
 def test_snapshot_fetches_codex_usage_and_reuses_fresh_result(switcher, monkeypatch):
@@ -352,7 +353,7 @@ def test_snapshot_refreshes_an_inactive_codex_login_after_usage_401(switcher, mo
 
     assert snapshot.accounts[0].usage.last_good == {"five_hour": {"pct": 25}}
     assert refresh_calls == [_auth("one@example.com", "account-one")]
-    assert json.loads((instance.credentials_dir / "account-1.json").read_text()) == refreshed
+    assert statefiles.read_json(instance.credentials_dir / "account-1.json") == refreshed
 
 
 def test_snapshot_never_refreshes_the_active_codex_login(switcher, monkeypatch):
@@ -405,7 +406,7 @@ def test_snapshot_never_refreshes_a_token_the_live_login_still_holds(switcher, m
     snapshot = instance.accounts_snapshot(fetch={"1"})
 
     assert snapshot.accounts[0].usage.last_error == "expired"
-    assert json.loads((instance.credentials_dir / "account-1.json").read_text()) == _auth(
+    assert statefiles.read_json(instance.credentials_dir / "account-1.json") == _auth(
         "old@example.com", "account-one"
     )
 
@@ -460,7 +461,7 @@ def test_add_records_plan_and_list_shows_team_label(switcher):
     _write_live(home, _auth_with_plan("team@example.com", "acct-team", "team"))
     instance.add_account(assume_yes=True)
 
-    stored = json.loads(instance.sequence_file.read_text())
+    stored = statefiles.read_json(instance.sequence_file)
     assert stored["accounts"]["1"]["planType"] == "team"
 
     listed = instance.list_accounts()["accounts"][0]
@@ -475,9 +476,9 @@ def test_list_derives_plan_for_accounts_saved_without_plan_type(switcher):
     instance.add_account(assume_yes=True)
 
     # Simulate a legacy backup: drop the recorded planType from the sequence.
-    data = json.loads(instance.sequence_file.read_text())
+    data = statefiles.read_json(instance.sequence_file)
     del data["accounts"]["1"]["planType"]
-    instance.sequence_file.write_text(json.dumps(data), encoding="utf-8")
+    statefiles.write_json(instance.sequence_file, data)
 
     listed = instance.list_accounts()["accounts"][0]
     assert listed["planType"] == "team"
