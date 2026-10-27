@@ -60,10 +60,8 @@ def _load_applied(switcher: "ClaudeAccountSwitcher") -> dict:
     corrupt file can never permanently block a migration.
     """
     path = _state_path(switcher)
-    if not path.exists():
-        return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(statedb.read_text(path))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
     applied = data.get("applied") if isinstance(data, dict) else None
@@ -82,6 +80,9 @@ def _mark_applied(switcher: "ClaudeAccountSwitcher", migration_id: str) -> None:
     applied = _load_applied(switcher)
     applied[migration_id] = get_timestamp()
     content = json.dumps({"version": STATE_VERSION, "applied": applied}, indent=2)
+    # A state document like the rest (one committed write to state.db).
+    if statedb.try_write(path, content):
+        return
 
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:

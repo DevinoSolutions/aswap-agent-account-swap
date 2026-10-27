@@ -74,8 +74,11 @@ DOC_PATTERNS = (
     "billing_sessions.json",
     "settings.json",
     "autoswitch_state.json",
+    "codex_autoswitch_state.json",
     "warmup_state.json",
     "mappings.json",
+    "menubar_settings.json",
+    ".migrations.json",
     "credentials/.creds-*.enc",
     "credentials/.creds-*.enc.prev",
     "configs/.claude-config-*.json",
@@ -435,6 +438,9 @@ class StateDB:
         from claude_swap.snapshots import SnapshotStore, valid
 
         imported: list[str] = []
+        # Documents a file overwrote after they were already in the database:
+        # only an aswap from before the database writes those files.
+        stale_writers: list[str] = []
         lock = FileLock(self.root / ".statedb-import.lock", timeout=60)
         if not lock.acquire():
             raise StateDBError(f"{self.root}: timed out waiting for another state import")
@@ -455,6 +461,8 @@ class StateDB:
                     current = self.updated_at(rel)
                     if valid(rel, body):
                         if current is None or mtime > current:
+                            if current is not None:
+                                stale_writers.append(rel)
                             self.write(rel, body)
                             imported.append(rel)
                         settled.append(path)
@@ -478,6 +486,13 @@ class StateDB:
                     _logger.warning("State import: could not rename %s: %s", path, e)
         finally:
             lock.release()
+        if stale_writers:
+            _logger.warning(
+                "State import: %s reappeared as plain file(s) after the move to %s "
+                "and replaced the database copy. Unless you exported them there "
+                "yourself, an aswap from before %s is still running (aswap auto, "
+                "the dashboard): stop it and start the new one.",
+                ", ".join(stale_writers), DB_NAME, DB_NAME)
         if imported:
             _logger.info("State import: %d document(s) moved into %s",
                          len(imported), DB_NAME)

@@ -40,7 +40,8 @@ class TestDocPatterns:
         "credentials/.creds-3-a@b.com.enc.prev",
         "configs/.claude-config-3-a@b.com.json", "cache/usage.json",
         "cache/billing.json", "codex/sequence.json",
-        "codex/credentials/account-1.json",
+        "codex/credentials/account-1.json", "codex_autoswitch_state.json",
+        "menubar_settings.json", ".migrations.json",
     ])
     def test_state_documents(self, rel):
         assert is_doc(rel)
@@ -50,7 +51,7 @@ class TestDocPatterns:
         "sessions/1-a@b.com/.credentials.json", "credentials/.unclaimed-manifest.json",
         "credentials/.swap-staging-creds-1.json", "sequence.json.migrated",
         "credentials/.creds-1-a.enc.migrated", "cache/sub/x.json", "nested/sequence.json",
-        ".migrations.json", "state.db",
+        "state.db", "codex/autoswitch_state.json",
     ])
     def test_not_state_documents(self, rel):
         assert not is_doc(rel)
@@ -463,7 +464,7 @@ class TestImport:
 
         _seed_files(get_backup_root())
         switcher = ClaudeAccountSwitcher()
-        applied = json.loads((switcher.backup_dir / ".migrations.json").read_text())["applied"]
+        applied = statefiles.read_json(switcher.backup_dir / ".migrations.json")["applied"]
         assert "state_files_to_db" in applied
         assert switcher._get_sequence_data()["accounts"]["1"]["email"] == "a@x.com"
 
@@ -482,7 +483,10 @@ def switcher(temp_home):
 
 
 class TestSwitchedHelpers:
-    def test_roster_credentials_and_config_live_in_the_database(self, switcher):
+    def test_roster_credentials_and_config_live_in_the_database(self, switcher, monkeypatch):
+        # The .enc backup backend (macOS keeps backups in the Keychain while it
+        # is usable; its file fallback is the same backend as everywhere else).
+        monkeypatch.setattr(switcher._store, "_use_keychain", lambda: False)
         db = statedb.open_db(switcher.backup_dir)
         switcher._write_account_credentials("1", "a@x.com", '{"claudeAiOauth": {"t": 1}}')
         switcher._write_account_config("1", "a@x.com", '{"oauthAccount": {}}')

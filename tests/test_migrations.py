@@ -80,9 +80,9 @@ def _keyring_migrations_marked(switcher: ClaudeAccountSwitcher) -> set[str]:
     """Recorded migrations other than ``state_files_to_db``, which the
     state database's first write records on its own."""
     state_file = switcher.backup_dir / ".migrations.json"
-    if not state_file.exists():
+    if not statefiles.exists(state_file):
         return set()
-    return set(json.loads(state_file.read_text())["applied"]) - {"state_files_to_db"}
+    return set(statefiles.read_json(state_file)["applied"]) - {"state_files_to_db"}
 
 
 def _seed_sequence(switcher: ClaudeAccountSwitcher, accounts: dict) -> None:
@@ -131,7 +131,7 @@ class TestWindowsKeyringToFiles:
         assert fake.store == {}
         assert (KEYRING_SERVICE, "account-1-a@example.com") in fake.deleted
         # State recorded.
-        state = json.loads((switcher.backup_dir / ".migrations.json").read_text())
+        state = statefiles.read_json(switcher.backup_dir / ".migrations.json")
         assert "windows_keyring_to_files" in state["applied"]
         assert state["version"] == 1
 
@@ -168,7 +168,7 @@ class TestWindowsKeyringToFiles:
 
         assert switcher.credentials_dir.exists()
         assert switcher._read_account_credentials("1", "a@example.com") == "creds-A"
-        state = json.loads((switcher.backup_dir / ".migrations.json").read_text())
+        state = statefiles.read_json(switcher.backup_dir / ".migrations.json")
         assert "windows_keyring_to_files" in state["applied"]
 
     def test_completes_when_no_legacy_entries_present(self, temp_home):
@@ -183,7 +183,7 @@ class TestWindowsKeyringToFiles:
         with _patch_keyring(fake):
             run_migrations(switcher)
 
-        state = json.loads((switcher.backup_dir / ".migrations.json").read_text())
+        state = statefiles.read_json(switcher.backup_dir / ".migrations.json")
         assert "windows_keyring_to_files" in state["applied"]
         # The existing file is untouched.
         assert switcher._read_account_credentials("1", "a@example.com") == "file-creds"
@@ -591,8 +591,8 @@ class TestMacosKeyringToSecurity:
         # Deferred cleanly: no fallback .enc written, migration not recorded.
         assert not statefiles.exists(switcher.credentials_dir / ".creds-1-a@example.com.enc")
         state_file = switcher.backup_dir / ".migrations.json"
-        if state_file.exists():
-            applied = json.loads(state_file.read_text()).get("applied", {})
+        if statefiles.exists(state_file):
+            applied = statefiles.read_json(state_file).get("applied", {})
             assert "macos_keyring_to_security" not in applied
 
     def test_idempotent_via_runner_marks_applied(self, temp_home):
@@ -602,5 +602,5 @@ class TestMacosKeyringToSecurity:
 
         with _patch_keyring(fake):
             run_migrations(switcher)
-        state = json.loads((switcher.backup_dir / ".migrations.json").read_text())
+        state = statefiles.read_json(switcher.backup_dir / ".migrations.json")
         assert "macos_keyring_to_security" in state["applied"]

@@ -302,7 +302,7 @@ class TestBackupCommand:
         backup_command(["take"])
         assert "taken" in capsys.readouterr().out
         backup_command(["list"])
-        assert "6 documents" in capsys.readouterr().out
+        assert "7 documents" in capsys.readouterr().out  # + the migration ledger
         backup_command(["check"])
         assert capsys.readouterr().out.strip() == "No damaged documents"
 
@@ -365,7 +365,7 @@ class TestBackupCommand:
         out_dir = tmp_path / "out"
         backup_command(["export", str(out_dir)])
         printed = capsys.readouterr().out
-        assert "Exported 5 documents" in printed
+        assert "Exported 6 documents" in printed  # + the migration ledger
         db = statedb.open_db(root)
         assert (out_dir / CRED).read_bytes() == db.read(CRED)
         assert db.read(CRED).decode() not in printed

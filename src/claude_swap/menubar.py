@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import pace
+from claude_swap import pace, statedb
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -108,7 +108,7 @@ class MenuBarSettings:
         """
         defaults = cls()
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(statedb.read_text(path))
         except (OSError, ValueError):
             return defaults
         if not isinstance(raw, dict):
@@ -120,7 +120,9 @@ class MenuBarSettings:
         return cls(**kwargs)
 
     def save(self, path: Path) -> None:
-        """Write settings as pretty JSON, creating parent directories."""
+        """Write settings as pretty JSON (a state.db document under the backup root)."""
+        if statedb.try_write(path, json.dumps(asdict(self), indent=2)):
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
 
