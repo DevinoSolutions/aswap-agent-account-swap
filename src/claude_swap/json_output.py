@@ -197,15 +197,21 @@ INELIGIBLE_USAGE_STATUSES = frozenset(
 )
 
 
-def eligibility(usage_status: str, disabled: bool) -> tuple[bool, str | None]:
+def eligibility(
+    usage_status: str, disabled: bool, needs_login: bool = False
+) -> tuple[bool, str | None]:
     """``(eligible, ineligibleReason)`` for a slot: may work be routed here?
 
     Derived here rather than by each consumer so "never route to a dead slot"
     has one definition. ``disabled`` wins over a status reason: a held-out
-    slot stays held out whatever its credential is doing.
+    slot stays held out whatever its credential is doing. ``needs_login`` (a
+    session profile holding a wiped credential) comes next, for the same
+    reason: its usage may still read "ok" from an older measurement.
     """
     if disabled:
         return False, "disabled"
+    if needs_login:
+        return False, "needs_login"
     if usage_status in INELIGIBLE_USAGE_STATUSES:
         return False, usage_status
     return True, None
@@ -316,6 +322,7 @@ def account_row(
     last_good_usage: dict | None = None,
     alias: str = "",
     disabled: bool = False,
+    needs_login: bool = False,
     profile_path: str = "",
     profile: dict | None = None,
     usage_deferred_reason: str | None = None,
@@ -338,7 +345,7 @@ def account_row(
     that owns the token family.
     """
     status, usage = usage_fields(usage_entry, usage_fetched_at)
-    can_route, ineligible_reason = eligibility(status, disabled)
+    can_route, ineligible_reason = eligibility(status, disabled, needs_login)
     row = {
         "number": number,
         "email": email,
@@ -369,6 +376,9 @@ def account_row(
     # existing consumers keying on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
+    # Additive, same rule: present only while the slot waits for a re-login.
+    if needs_login:
+        row["needsLogin"] = True
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:
