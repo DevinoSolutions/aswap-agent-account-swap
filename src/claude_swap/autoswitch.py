@@ -2535,6 +2535,13 @@ class AutoSwitchEngine:
         merged, changed = live_usage.merge(value, live, now)
         if changed:
             usage[current] = merged
+        # Live readings mean the account is in use: a cached lapse is stale.
+        note = getattr(self.switcher, "note_live_usage", None)
+        if note is not None:
+            try:
+                note(current)
+            except Exception:
+                _logger.debug("live plan re-check failed", exc_info=True)
 
     def _perform(
         self,
