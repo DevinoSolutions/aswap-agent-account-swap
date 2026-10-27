@@ -469,6 +469,165 @@ class TestImport:
         assert switcher._get_sequence_data()["accounts"]["1"]["email"] == "a@x.com"
 
 
+# The import, killed with os._exit (no cleanup, no rollback, no finally) at
+# a chosen point. sys.argv[3] picks the point.
+_CRASHING_IMPORT = r"""
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from claude_swap import statedb
+from claude_swap.statedb import StateDB
+
+point = sys.argv[3]
+if point == "mid-transaction":
+    real_write, calls = StateDB.write, [0]
+    def write(self, rel, body, **kw):
+        calls[0] += 1
+        if calls[0] == 4:
+            os._exit(9)
+        return real_write(self, rel, body, **kw)
+    StateDB.write = write
+else:  # "mid-rename": after the commit, two files renamed
+    real_replace, calls = statedb.replace_with_retry, [0]
+    def replace(src, dst, *a, **kw):
+        calls[0] += 1
+        if calls[0] == 3:
+            os._exit(9)
+        return real_replace(src, dst, *a, **kw)
+    statedb.replace_with_retry = replace
+StateDB(Path(sys.argv[2])).import_files()
+os._exit(0)
+"""
+
+
+class TestInterruptedImport:
+    """A crash mid-import never loses state, and the next run finishes it."""
+
+    def _crash(self, root: Path, point: str) -> None:
+        r = subprocess.run([sys.executable, "-c", _CRASHING_IMPORT, SRC, str(root), point],
+                           capture_output=True, text=True, timeout=120)
+        assert r.returncode == 9, r.stderr
+
+    def test_killed_inside_the_transaction_commits_nothing(self, tmp_path):
+        files = _seed_files(tmp_path)
+        self._crash(tmp_path, "mid-transaction")
+        # Every file is still where it was, and the database holds none of it.
+        for rel, body in files.items():
+            assert (tmp_path / rel).read_bytes() == body
+            assert not (tmp_path / (rel + ".migrated")).exists()
+        conn = sqlite3.connect(tmp_path / "state.db")
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM docs").fetchone() == (0,)
+        finally:
+            conn.close()
+        # The next run imports everything.
+        db = StateDB(tmp_path)
+        assert sorted(db.import_files()) == sorted(files)
+        assert {rel: db.read(rel) for rel in files} == files
+
+    def test_killed_between_commit_and_renames_is_finished_by_the_next_run(
+        self, tmp_path, caplog
+    ):
+        files = _seed_files(tmp_path)
+        self._crash(tmp_path, "mid-rename")
+        left = [rel for rel in files if (tmp_path / rel).exists()]
+        assert left and len(left) < len(files), "the crash landed between renames"
+        db = StateDB(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            # Already committed: nothing is imported again, the rest is renamed.
+            assert db.import_files() == []
+        assert "reappeared" not in caplog.text
+        assert {rel: db.read(rel) for rel in files} == files
+        for rel, body in files.items():
+            assert not (tmp_path / rel).exists()
+            assert (tmp_path / (rel + ".migrated")).read_bytes() == body
+
+    def test_a_raised_error_mid_import_rolls_back_and_retries(self, tmp_path, monkeypatch):
+        files = _seed_files(tmp_path)
+        real_write, calls = StateDB.write, [0]
+
+        def write(self, rel, body, **kw):
+            calls[0] += 1
+            if calls[0] == 3:
+                raise KeyboardInterrupt
+            return real_write(self, rel, body, **kw)
+
+        monkeypatch.setattr(StateDB, "write", write)
+        db = StateDB(tmp_path)
+        with pytest.raises(KeyboardInterrupt):
+            db.read("sequence.json")
+        assert all((tmp_path / rel).exists() for rel in files)
+        monkeypatch.setattr(StateDB, "write", real_write)
+        assert db.read("sequence.json") == files["sequence.json"]
+        assert {rel: db.read(rel) for rel in files} == files
+
+    def test_a_second_upgrade_run_changes_nothing(self, temp_home):
+        """Idempotence end to end: the second start of the new aswap finds
+        nothing to import and leaves the kept JSON files alone."""
+        from claude_swap.paths import get_backup_root
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        root = get_backup_root()
+        files = _seed_files(root)
+        ClaudeAccountSwitcher()
+        db = statedb.open_db(root)
+        before = db.items()
+        kept = {rel: (root / (rel + ".migrated")).stat().st_mtime for rel in files}
+        statedb.reset()
+        ClaudeAccountSwitcher()
+        assert statedb.open_db(root).items() == before
+        assert {rel: (root / (rel + ".migrated")).stat().st_mtime for rel in files} == kept
+
+    def test_an_old_aswap_still_writing_files_is_reported(self, tmp_path, caplog):
+        db = StateDB(tmp_path)
+        db.write("sequence.json", '{"from": "db"}')
+        old = tmp_path / "sequence.json"
+        old.write_text('{"from": "old aswap"}')
+        os.utime(old, (time.time() + 60, time.time() + 60))
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            db.import_files()
+        assert "aswap from before state.db is still running" in caplog.text
+        assert db.read("sequence.json") == b'{"from": "old aswap"}'
+
+
+class TestRollback:
+    def test_export_into_the_data_dir_gives_an_older_aswap_its_files_back(self, tmp_path):
+        """The way back to JSON: ``aswap backup export <data dir>`` writes
+        every document out under its old name, with the current contents."""
+        from claude_swap.snapshots import SnapshotStore
+
+        files = _seed_files(tmp_path)
+        db = StateDB(tmp_path)
+        db.import_files()
+        db.write("sequence.json", '{"accounts": {"1": {"email": "a@x.com"}}, "v": 2}')
+        written = SnapshotStore(tmp_path).export(tmp_path)
+        assert sorted(written) == sorted(files)
+        assert json.loads((tmp_path / "sequence.json").read_text())["v"] == 2
+        for rel in set(files) - {"sequence.json"}:
+            assert (tmp_path / rel).read_bytes() == files[rel]
+        # Upgrading again re-imports them without loss.
+        statedb.reset()
+        again = StateDB(tmp_path)
+        again.import_files()
+        assert json.loads(again.read("sequence.json"))["v"] == 2
+
+
+class TestConcurrentReaders:
+    def test_a_reader_is_not_blocked_by_an_open_write_transaction(self, tmp_path):
+        """WAL: the TUI and one-off commands keep reading while ``aswap auto``
+        holds the write lock, and see the last committed state."""
+        writer, reader = StateDB(tmp_path), StateDB(tmp_path)
+        writer.write("sequence.json", '{"v": 1}')
+        with writer.transaction():
+            writer.write("sequence.json", '{"v": 2}')
+            started = time.monotonic()
+            assert reader.read("sequence.json") == b'{"v": 1}'
+            assert time.monotonic() - started < 1.0
+        assert reader.read("sequence.json") == b'{"v": 2}'
+        writer.close()
+        reader.close()
+
+
 # -- the switched-over helpers ---------------------------------------------------
 
 

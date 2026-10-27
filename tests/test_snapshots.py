@@ -47,6 +47,72 @@ def _zero(db, rel):
     db.write(rel, b"\x00" * len(db.read(rel)))
 
 
+_BUSY_WRITER = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from claude_swap.statedb import StateDB
+db = StateDB(Path(sys.argv[2]))
+for i in range(1, int(sys.argv[3]) + 1):
+    with db.transaction():
+        # Two documents that must always agree: a torn copy would split them.
+        db.write("cache/a.json", json.dumps({"n": i}))
+        db.write("cache/b.json", json.dumps({"n": i}))
+"""
+
+
+class TestSnapshotWhileWriting:
+    def test_snapshots_taken_during_writes_are_consistent(self, tmp_path):
+        """``aswap auto`` snapshots while the TUI and CLI write: the online
+        backup copies one committed state, never half a transaction."""
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        src = str(Path(__file__).resolve().parents[1] / "src")
+        db = statedb.StateDB(tmp_path)
+        db.write("cache/a.json", '{"n": 0}')
+        db.write("cache/b.json", '{"n": 0}')
+        writer = subprocess.Popen([sys.executable, "-c", _BUSY_WRITER, src, str(tmp_path), "400"],
+                                  stderr=subprocess.PIPE, text=True)
+        store = SnapshotStore(tmp_path)
+        seen = []
+        try:
+            for i in range(15):
+                stamp = store.take(T0 + i * 3600)
+                if stamp is None:
+                    continue
+                snap = tmp_path / "snapshots" / f"state-{stamp}.db"
+                conn = sqlite3.connect(snap)
+                try:
+                    assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+                finally:
+                    conn.close()
+                docs = store.docs(stamp)
+                a, b = json.loads(docs["cache/a.json"]), json.loads(docs["cache/b.json"])
+                assert a == b
+                seen.append(a["n"])
+        finally:
+            _out, err = writer.communicate(timeout=120)
+        assert writer.returncode == 0, err
+        assert seen, "at least one snapshot was taken"
+        assert json.loads(db.read("cache/a.json")) == {"n": 400}
+
+
+class TestRestoreRoundTrip:
+    def test_take_then_lose_everything_then_restore_all(self, tmp_path):
+        db = _seed(tmp_path)
+        before = {rel: body for rel, body, _t in db.items()}
+        store = SnapshotStore(tmp_path)
+        stamp = store.take(T0)
+        for rel in list(before):
+            db.delete(rel)
+        assert db.items() == []
+        done = store.restore(paths=sorted(store.docs(stamp)))
+        assert {r.path for r in done} >= set(before)
+        assert {rel: body for rel, body, _t in db.items()} == before
+
+
 class TestValid:
     def test_zero_filled_empty_and_garbage_are_invalid(self):
         assert not valid("sequence.json", b"\x00" * 50)

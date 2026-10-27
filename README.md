@@ -320,6 +320,10 @@ aswap purge                     # Remove all aswap data
 
 Session-mode profiles (`aswap run`) live under the backup directory in `sessions/`. The roster, credential and config backups, tool preferences (`settings.json`), auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts) and five-hour warmer state (`warmup_state.json`) are documents in one crash-safe SQLite database, `state.db`, in the backup directory root; `aswap backup export DIR` writes them all out as files.
 
+The first run of a version with `state.db` imports the JSON files of an older aswap and renames each to `<name>.migrated`, which it never writes again. Stop `aswap auto`, the dashboard and the menu bar before upgrading: an older aswap still running keeps writing the JSON files, and they win over the database copy at the next import. To go back to an older aswap, stop every aswap process, run `aswap backup export <backup directory>` (it writes the current state back out under the old file names), then install the older version.
+
+`aswap backup take|list|check|restore` manage hourly snapshots of `state.db` under `snapshots/` (taken with SQLite's online backup, so they are consistent while other aswap processes write).
+
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
 ## Menu bar (macOS)
