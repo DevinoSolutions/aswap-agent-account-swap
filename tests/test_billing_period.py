@@ -175,6 +175,52 @@ class TestResubscribeExpiresBilling:
         assert sw._billing._load()["20"]["nextCheckAt"] == 9e12
 
 
+class TestLiveUsageRechecksALapse:
+    def _switcher(self, temp_home, status: str, tier: str = "default_claude_max_5x"):
+        from tests.test_autoswitch import EngineHarness
+
+        h = EngineHarness(temp_home)
+        h.seed(20, "revived@example.com")
+        sw = h.switcher
+        sw._billing._save({"20": {
+            "email": "revived@example.com", "organizationUuid": "",
+            "subscriptionStatus": status, "rateLimitTier": tier, "nextCheckAt": 9e12,
+        }})
+        return sw
+
+    def test_a_canceled_account_in_use_has_its_plan_re_read(self, temp_home):
+        from unittest.mock import patch
+
+        sw = self._switcher(temp_home, "canceled")
+        with patch.object(type(sw._billing), "check_tiers", return_value={}) as check:
+            sw.note_live_usage("20")
+            sw.note_live_usage("20")  # within LIVE_RECHECK_S: no second request
+        assert check.call_count == 1
+        assert [str(i[0]) for i in check.call_args.args[0]] == ["20"]
+
+    def test_a_free_tier_in_use_is_re_read(self, temp_home):
+        from unittest.mock import patch
+
+        sw = self._switcher(temp_home, "active", tier="default_claude_ai")
+        with patch.object(type(sw._billing), "check_tiers", return_value={}) as check:
+            sw.note_live_usage("20")
+        assert check.call_count == 1
+
+    def test_a_renewing_account_is_left_alone(self, temp_home):
+        from unittest.mock import patch
+
+        sw = self._switcher(temp_home, "active")
+        with patch.object(type(sw._billing), "check_tiers", return_value={}) as check:
+            sw.note_live_usage("20")
+        assert check.call_count == 0
+
+    def test_looks_lapsed(self):
+        assert billing.looks_lapsed({"subscriptionStatus": "canceled"})
+        assert billing.looks_lapsed({"rateLimitTier": "default_claude_ai"})
+        assert not billing.looks_lapsed({"subscriptionStatus": "active", "rateLimitTier": "default_claude_max_5x"})
+        assert not billing.looks_lapsed(None)
+
+
 class TestPaidCommand:
     def test_paid_records_and_prints_the_renewal(self, temp_home, capsys):
         from unittest.mock import patch

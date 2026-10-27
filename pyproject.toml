@@ -11,7 +11,7 @@ dependencies = [
     # fallback and the legacy purge sweep no-ops when it's absent.
     "keyring>=25.0.0; sys_platform == 'win32'",
     "textual>=8.2.8,<9",
-    "truststore>=0.10.4",
+    "truststore>=0.10.5",
     "websocket-client>=1.8",
 ]
 authors = [

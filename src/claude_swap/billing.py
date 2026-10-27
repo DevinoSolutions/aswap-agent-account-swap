@@ -103,6 +103,16 @@ def parse_profile(data: object) -> dict | None:
     return {"subscriptionCreatedAt": created, **fields}
 
 
+def looks_lapsed(record: dict | None) -> bool:
+    """Whether a cached record says the plan stopped renewing or is free."""
+    if not record:
+        return False
+    status = record.get("subscriptionStatus")
+    if status is not None and status not in _RENEWING_STATUSES:
+        return True
+    return normalize_tier(record.get("rateLimitTier")) == "ai"
+
+
 def _tier_name(tier: object) -> str:
     return tier_label(normalize_tier(tier))
 

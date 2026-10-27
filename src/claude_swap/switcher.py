@@ -52,7 +52,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
-from claude_swap.billing import BillingCache, billing_text, billing_view
+from claude_swap.billing import BillingCache, billing_text, billing_view, looks_lapsed
 from claude_swap.billing_session import SessionStore
 from claude_swap.weekly_anchor import (
     WeeklyAnchorStore,
@@ -135,6 +135,9 @@ _TORN_READ_ATTEMPTS = 3
 _WIPED_WARN_INTERVAL_S = 3600.0
 _wiped_warned_at: dict[str, float] = {}
 _TORN_READ_DELAY_S = 0.05
+# An account cached as lapsed but reporting live usage gets its plan re-read
+# at most this often (one profile request each time).
+LIVE_RECHECK_S = 10 * 60.0
 
 # Outcome vocabulary for one profile → store reconciliation attempt. Closed
 # set: every refusal names itself, so a slot that stops being synced says
@@ -448,6 +451,10 @@ class ClaudeAccountSwitcher:
         # account in a long-lived process warns afresh and distinct
         # conditions don't suppress each other's warning.
         self._provenance_warned: set[tuple[str, str, str]] = set()
+
+        # Slot -> monotonic time its plan was last re-read because live usage
+        # contradicted a cached lapse; see note_live_usage.
+        self._live_rechecked: dict[str, float] = {}
 
         # Definitive ownership verdicts for credential lineages, keyed by
         # _lineage_key (slot, caller email, stored email, org, uuid,
@@ -2013,6 +2020,47 @@ class ClaudeAccountSwitcher:
         data = oauth.extract_oauth_data(creds or "") or {}
         tier = data.get("rateLimitTier")
         return tier if isinstance(tier, str) else None
+
+    def note_live_usage(self, num: str) -> None:
+        """The active account reports live usage, so a cached lapse is stale.
+
+        2026-10-27: a revived account kept its cached "canceled" / free tier
+        for the hour its usage poll was backed off (429), and auto-switching
+        judged it as a lapsed account. Usage on the statusline proves the plan
+        is running, so re-read it now: only while the cache says it lapsed,
+        and at most once per ``LIVE_RECHECK_S``.
+        """
+        num = str(num)
+        now = time.monotonic()
+        if now - self._live_rechecked.get(num, float("-inf")) < LIVE_RECHECK_S:
+            return
+        account = (self._get_sequence_data_migrated() or {}).get("accounts", {}).get(num)
+        if not isinstance(account, dict) or not account.get("email"):
+            return
+        identity = (account["email"], account.get("organizationUuid") or "")
+        try:
+            record = self._billing.records({num: identity}).get(num)
+        except Exception:
+            return
+        if not looks_lapsed(record):
+            return
+        self._live_rechecked[num] = now
+        info = [i for i in self._build_accounts_info() if str(i[0]) == num]
+        if not info:
+            return
+        self._logger.info(
+            "Account %s (%s) is in use but cached as lapsed; re-reading its plan", num, identity[0]
+        )
+        self._billing.check_tiers(info)
+        try:
+            if self._anchors.note_usable(identity):
+                self._logger.info(
+                    "Account %s (%s) usable again after a lapse: billing period restarts now",
+                    num, identity[0],
+                )
+                self._billing.expire(identity)
+        except Exception:
+            self._logger.debug("lapse tracking failed", exc_info=True)
 
     def _observe_usage(self, num: str, identity: tuple[str, str], usage: dict) -> None:
         """UsageStore hook: remember the account's weekly reset anchor."""
