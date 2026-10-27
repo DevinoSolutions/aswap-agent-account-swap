@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap.autoswitch import (
+    LANDING_BURN_WINDOW_S,
     LIMIT_GUARD_S,
     LIVE_MIN_TICK_S,
     BurnTracker,
@@ -222,6 +223,32 @@ class TestLandingRunway:
         })
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
+
+    def test_a_lull_does_not_shrink_the_landing_check(self, temp_home):
+        # Burning a point a minute now, but four a minute ten minutes ago: #2's
+        # 20 points last 5 minutes at the recent pace, not 20.
+        h = _harness(temp_home, {"1": "5x", "2": "5x", "3": "5x"}, strategy="consume-first")
+        self._burning(h, 50)
+        h.engine._recent_burns = [(h.clock.now - 600, 4.0 / 60)]
+        outcome = h.tick_with_usage({
+            "1": _usage7(50, 20, _R_LATER),
+            "2": _usage7(80, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATER),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_an_old_burst_stops_counting_after_the_window(self, temp_home):
+        h = _harness(temp_home, {"1": "5x", "2": "5x", "3": "5x"}, strategy="consume-first")
+        self._burning(h, 50)
+        h.engine._recent_burns = [(h.clock.now - LANDING_BURN_WINDOW_S - 60, 4.0 / 60)]
+        outcome = h.tick_with_usage({
+            "1": _usage7(50, 20, _R_LATER),
+            "2": _usage7(80, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
 
     def test_idle_active_account_lands_where_there_is_room(self, temp_home):
         h = _harness(temp_home, {"1": "20x", "2": "20x", "3": "20x"}, strategy="consume-first")
