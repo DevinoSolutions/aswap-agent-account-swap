@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.12', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # uv (not pip) so the PEP 735 dev dependency-group (pytest,
+      # pytest-asyncio, pytest-xdist) installs from the committed lockfile,
+      # same as local development.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run tests
+        # faulthandler dumps every thread's stack if a test exceeds 120s: a
+        # macOS `security` call blocking on an invisible SecurityAgent dialog
+        # would otherwise hang the job with no clue where.
+        run: uv run pytest -o faulthandler_timeout=120
+
+  build:
+    name: build and smoke-test the package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Install the wheel and run it
+        run: |
+          uv tool install dist/*.whl
+          aswap --version
+          aswap --help > /dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7

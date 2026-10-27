@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 📖 Tips & how it works
+    url: https://github.com/DevinoSolutions/aswap-agent-account-swap#readme
+    about: Restart-after-switch behavior, macOS Keychain caching, and other common gotchas are covered in the README.
