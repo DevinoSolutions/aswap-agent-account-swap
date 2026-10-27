@@ -28,6 +28,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
     binding_pct,
+    clock_label,
     pct_label,
 )
 from claude_swap.codex_autoswitch import CodexAutoSwitchEngine
@@ -229,6 +230,13 @@ class AutoScreen(Screen):
                 "on" if self._settings.warmup_five_hour else "off",
                 style=palette.accent if self._settings.warmup_five_hour else palette.muted,
             )
+        held = getattr(self._engine, "manual_hold", None)
+        if held:
+            account, until = held
+            text.append(
+                f" · #{account} held until {clock_label(until)} (switched by hand)",
+                style=palette.accent,
+            )
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
@@ -331,6 +339,8 @@ class AutoScreen(Screen):
             return
         palette = Palette.from_theme(self.app.current_theme)
         self.query_one("#event-log", RichLog).write(event_text(event, palette=palette))
+        if event.kind in ("switch", "no-switch"):
+            self._update_summary()  # the manual-hold note comes and goes
         if event.kind == "switch":
             self.app.request_refresh(self.provider)
 

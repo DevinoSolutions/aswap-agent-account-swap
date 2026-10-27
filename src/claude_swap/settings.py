@@ -65,6 +65,11 @@ class AutoSwitchSettings:
     # Opt-in: let `aswap auto` also keep OAuth accounts' five-hour windows
     # started. The warmer keeps its own five-hour duplicate-spend guard.
     warmup_five_hour: bool = False
+    # After a switch made outside the engine (`aswap switch`, the TUI, an
+    # in-app `/login`), how long the engine leaves that account alone for its
+    # OPTIONAL moves (consume-first). Moves that protect the session — at the
+    # limit, over the threshold, failover — still happen. 0 disables.
+    manual_hold_minutes: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -181,6 +186,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "warmupFiveHour", "warmup_five_hour", "bool",
             help="Let aswap auto start cold or unconfirmed five-hour windows",
+        ),
+        SettingSpec(
+            "autoswitch", "manualHoldMinutes", "manual_hold_minutes", "float",
+            0.0, 1440.0,
+            help="Minutes auto leaves a hand-picked account alone (0 = off)",
         ),
         SettingSpec(
             "profiles", "persistent", "persistent", "bool",
