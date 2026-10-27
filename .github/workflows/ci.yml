@@ -25,13 +25,13 @@ jobs:
         python: ['3.12', '3.13']
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # uv (not pip) so the PEP 735 dev dependency-group (pytest,
       # pytest-asyncio, pytest-xdist) installs from the committed lockfile,
       # same as local development.
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python }}
 
@@ -50,10 +50,10 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: '3.12'
 
@@ -66,7 +66,7 @@ jobs:
           aswap --version
           aswap --help > /dev/null
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
