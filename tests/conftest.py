@@ -241,7 +241,7 @@ _REAL_STORE_HINTS = _derive_real_store_hints(_REAL_STORE_SPECS, _HOME_AT_FREEZE_
 _WRITE_EVENTS = frozenset(
     {
         "open", "os.rename", "os.mkdir", "os.remove", "os.rmdir",
-        "shutil.rmtree", "os.symlink", "os.truncate",
+        "shutil.rmtree", "os.symlink", "os.truncate", "sqlite3.connect",
     }
 )
 
@@ -294,6 +294,15 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
         # write elsewhere alias into the store" shape a hardlink or bind
         # mount would be — only the destination matters here.
         candidates = (args[1],)
+    elif event == "sqlite3.connect":
+        # The state database (``statedb``) opens the store with SQLite, whose
+        # writes never pass through the ``open`` event above. Refusing the
+        # connect is the only point this hook sees them. args are
+        # (database,), a str or a Path.
+        try:
+            candidates = (os.fspath(args[0]),)
+        except TypeError:
+            candidates = ()
     elif event == "os.truncate":
         # I-4: `os.truncate(path, length)` destroys content in place without
         # going through `open`, so it reached none of the write-mode checks
@@ -479,6 +488,21 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.setenv("HOME", str(safe_home))
     monkeypatch.setenv("USERPROFILE", str(safe_home))
     monkeypatch.setattr("pathlib.Path.home", lambda: safe_home)
+
+
+@pytest.fixture(autouse=True)
+def _close_state_dbs():
+    """Close every state-database connection a test opened.
+
+    ``statedb`` keeps one store per backup root for the life of the process;
+    without this, each test's temp root would keep its ``state.db`` open (on
+    Windows, undeletable) for the rest of the worker's run, and a later test
+    reusing a root would see an earlier one's store.
+    """
+    yield
+    from claude_swap import statedb
+
+    statedb.reset()
 
 
 @pytest.fixture(autouse=True)

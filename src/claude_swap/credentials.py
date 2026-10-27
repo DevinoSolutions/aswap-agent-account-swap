@@ -33,6 +33,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     CredentialWriteError,
 )
+from claude_swap import statedb
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import Platform
 from claude_swap.paths import (
@@ -1115,10 +1116,17 @@ class CredentialStore:
         self._atomic_b64_write(self._backup_enc_path(account_num, email), credentials)
 
     def _atomic_b64_write(self, target: Path, credentials: str) -> None:
-        """Atomically write a base64-encoded credential file (0600)."""
-        self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
+        """Atomically write a base64-encoded credential file (0600).
+
+        Slot backups and their ``.prev`` are state documents and land in the
+        state database as one committed write; the bytes are the same base64
+        the file would hold.
+        """
         enc_file = target
         encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
+        if statedb.try_write(enc_file, encoded):
+            return
+        self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
         import tempfile
         fd, tmp_path = tempfile.mkstemp(dir=str(self._host.credentials_dir), suffix=".tmp")
         try:
@@ -1147,10 +1155,10 @@ class CredentialStore:
         also fails, raise so the inconsistency surfaces rather than serving stale.
         """
         enc_file = self._backup_enc_path(account_num, email)
-        if not enc_file.exists():
+        if not statedb.exists(enc_file):
             return
         try:
-            enc_file.unlink()
+            statedb.unlink(enc_file)
             return
         except Exception as e:
             self._host._logger.warning(
@@ -1170,7 +1178,9 @@ class CredentialStore:
         """
         enc_file = self._backup_enc_path(account_num, email)
         try:
-            # `stat`, NOT `exists`. `Path.exists()` SWALLOWS OSError from 3.13
+            # `stat` (here the state-path `mtime`, which raises for an
+            # unreadable database the same way), NOT `exists`.
+            # `Path.exists()` SWALLOWS OSError from 3.13
             # on and answers False, so an unsearchable credentials/ dir became
             # byte-identical to a genuinely absent backup — on 3.12 the raise
             # reached the handler below and marked the read failed, on 3.13+
@@ -1178,7 +1188,7 @@ class CredentialStore:
             # reported, and the fleet runs both (3.12 on two machines, 3.14 on
             # one). `stat` raises on every version, so the distinction the
             # handler below exists to draw survives on all of them.
-            enc_file.stat()
+            statedb.mtime(enc_file)
         except FileNotFoundError:
             enc_present = False
         except OSError as e:
@@ -1196,7 +1206,7 @@ class CredentialStore:
             enc_present = True
         if enc_present:
             try:
-                encoded = enc_file.read_text(encoding="utf-8").strip()
+                encoded = statedb.read_text(enc_file).strip()
             except OSError as e:
                 # The .enc EXISTS but could not be read (permissions, a
                 # mid-unmount, ...) — a real read failure, not "no backup".
@@ -1359,8 +1369,8 @@ class CredentialStore:
         for num in nums:
             enc_file = self._backup_enc_path(num, email)
             try:
-                if enc_file.exists():
-                    enc_file.unlink()
+                if statedb.exists(enc_file):
+                    statedb.unlink(enc_file)
             except Exception as e:
                 self._host._logger.warning(f"Failed to delete credentials file: {e}")
             if self._host.platform == Platform.MACOS:
@@ -1395,7 +1405,7 @@ class CredentialStore:
         # directory, which would fail open here — missing is fine
         # (missing_ok), permission/I/O errors must abort the commit.
         try:
-            self._backup_enc_path(account_num, email).unlink(missing_ok=True)
+            statedb.unlink(self._backup_enc_path(account_num, email), missing_ok=True)
             if self._host.platform == Platform.MACOS:
                 self._kc_delete_backup(account_num, email)
         except (OSError, *macos_keychain.KEYCHAIN_ERRORS) as e:
@@ -1428,8 +1438,8 @@ class CredentialStore:
         """
         prev_file = self._prev_backup_path(account_num, email)
         try:
-            if prev_file.exists():
-                prev_file.unlink()
+            if statedb.exists(prev_file):
+                statedb.unlink(prev_file)
         except Exception as e:
             self._host._logger.warning(f"Failed to delete .prev file: {e}")
         if self._host.platform == Platform.MACOS:
@@ -1532,9 +1542,14 @@ class CredentialStore:
         Keychain was unusable beats a possibly-stale Keychain copy.
         """
         prev_file = self._prev_backup_path(account_num, email)
-        if prev_file.exists():
+        try:
+            prev_present = statedb.exists(prev_file)
+        except OSError as e:
+            self._host._logger.warning(f"Failed to read .prev file: {e}")
+            prev_present = False
+        if prev_present:
             try:
-                encoded = prev_file.read_text(encoding="utf-8").strip()
+                encoded = statedb.read_text(prev_file).strip()
                 decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
                 if decoded:
                     return decoded

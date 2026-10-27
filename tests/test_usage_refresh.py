@@ -20,6 +20,7 @@ import pytest
 from claude_swap import cli, oauth
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import ClaudeAccountSwitcher
+from tests import statefiles
 from claude_swap.usage_store import (
     AUTH_DEAD_STRIKES,
     MIN_FORCED_AGE_S,
@@ -160,7 +161,7 @@ class TestTheGlobalSweepStamp:
         _seed_usage(switcher)
 
         stamp = switcher.backup_dir / "cache" / "forced_usage_sweep.json"
-        assert stamp.exists()
+        assert statefiles.exists(stamp)
 
     def test_the_stamp_is_read_and_claimed_under_one_lock(self, switcher):
         """Unlocked, two callers both read 'no recent sweep' and both sweep."""
@@ -225,7 +226,7 @@ class TestACorruptSweepStampIsDistinguishableFromAnAbsentOne:
         return switcher.backup_dir / "cache" / "forced_usage_sweep.json"
 
     def test_an_absent_stamp_is_silent(self, switcher, caplog):
-        assert not self._stamp(switcher).exists()
+        assert not statefiles.exists(self._stamp(switcher))
 
         with caplog.at_level(0, logger="claude-swap"):
             rows = _refresh(switcher)
@@ -236,7 +237,7 @@ class TestACorruptSweepStampIsDistinguishableFromAnAbsentOne:
     def test_an_unreadable_stamp_warns_and_still_sweeps(self, switcher, caplog):
         stamp = self._stamp(switcher)
         stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.write_text("{truncated", encoding="utf-8")
+        statefiles.write_text(stamp, "{truncated")
 
         with caplog.at_level(0, logger="claude-swap"):
             rows = _refresh(switcher)
@@ -253,7 +254,7 @@ class TestACorruptSweepStampIsDistinguishableFromAnAbsentOne:
         """Valid JSON, no `at`: the read succeeded and still says nothing."""
         stamp = self._stamp(switcher)
         stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.write_text('{"swept": true}', encoding="utf-8")
+        statefiles.write_text(stamp, '{"swept": true}')
 
         with caplog.at_level(0, logger="claude-swap"):
             _refresh(switcher)

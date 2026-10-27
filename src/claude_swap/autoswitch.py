@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import live_usage, oauth, poll_policy, snapshots
+from claude_swap import live_usage, oauth, poll_policy, snapshots, statedb
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -883,7 +883,7 @@ class AutoSwitchEngine:
 
     def _read_state(self) -> dict:
         try:
-            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            raw = json.loads(statedb.read_text(self.state_path))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return {}
         return raw if isinstance(raw, dict) else {}

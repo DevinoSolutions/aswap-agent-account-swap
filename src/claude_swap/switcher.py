@@ -61,7 +61,8 @@ from claude_swap.weekly_anchor import (
     weekly_text,
     weekly_view,
 )
-from claude_swap.fsutil import read_text_with_retry, replace_with_retry
+from claude_swap import statedb
+from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -403,6 +404,7 @@ class ClaudeAccountSwitcher:
                 file=sys.stderr,
             )
 
+        statedb.manage(self.backup_dir)
         self.sequence_file = self.backup_dir / "sequence.json"
         self.configs_dir = self.backup_dir / "configs"
         self.credentials_dir = self.backup_dir / "credentials"
@@ -551,10 +553,12 @@ class ClaudeAccountSwitcher:
         ``ClaudeSwitchError``. ``_read_global_config`` already ends with the
         same isinstance check; the two readers of the same file disagreed.
         """
-        if not path.exists():
-            return None
         try:
-            data = json.loads(read_text_with_retry(path))
+            # State documents (the roster) come from the state database;
+            # a database that cannot be read lands in the OSError arm.
+            if not statedb.exists(path):
+                return None
+            data = json.loads(statedb.read_text(path))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             self._logger.warning(f"Invalid JSON in {path}")
             if strict:
@@ -646,6 +650,11 @@ class ClaudeAccountSwitcher:
     def _write_json(self, path: Path, data: dict) -> None:
         """Write JSON file with validation."""
         content = json.dumps(data, indent=2)
+
+        # The roster is a state document: one committed database write.
+        # Other paths (``~/.claude.json``) stay files.
+        if statedb.try_write(path, content):
+            return
 
         # Write to temp file first
         temp_path = path.with_suffix(f".{os.getpid()}.tmp")
@@ -1059,8 +1068,8 @@ class ClaudeAccountSwitcher:
         self._ensure_no_live_session(account_num, email, "the operation")
         self._delete_account_credentials(account_num, email)
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
-        if config_file.exists():
-            config_file.unlink()
+        if statedb.exists(config_file):
+            statedb.unlink(config_file)
         self._delete_session_profile(account_num, email)
 
     def _prune_mappings(self, email: str, org_uuid: str) -> None:
@@ -1080,8 +1089,8 @@ class ClaudeAccountSwitcher:
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
-        if config_file.exists():
-            return config_file.read_text(encoding="utf-8")
+        if statedb.exists(config_file):
+            return statedb.read_text(config_file)
         return ""
 
     def _account_is_switchable(self, account_num: str) -> bool:
@@ -1107,6 +1116,8 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Write account config to backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
+        if statedb.try_write(config_file, config):
+            return
         temp_path = config_file.with_suffix(f".{os.getpid()}.tmp")
         temp_path.write_text(config, encoding="utf-8")
         if sys.platform != "win32":
@@ -1244,7 +1255,7 @@ class ClaudeAccountSwitcher:
 
         Returns the two resolved slot numbers ``(first_num, second_num)``.
         """
-        if not self.sequence_file.exists():
+        if not statedb.exists(self.sequence_file):
             raise ConfigError("No accounts are managed yet")
 
         # Local I/O only from here on, so the account lock can span the whole
@@ -1427,7 +1438,7 @@ class ClaudeAccountSwitcher:
         wraps and counts the failure (rollback, stray cleanup).
         """
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
-        config_file.unlink(missing_ok=True)
+        statedb.unlink(config_file, missing_ok=True)
 
     def _discard_staging(self, staging: dict[str, Path]) -> None:
         """Remove staged pre-swap copies, telling the user about survivors.
@@ -1653,7 +1664,7 @@ class ClaudeAccountSwitcher:
         when an occupant was displaced.
         """
         self._refuse_session_shell()
-        if not self.sequence_file.exists():
+        if not statedb.exists(self.sequence_file):
             raise ConfigError("No accounts are managed yet")
 
         target = target.strip()
@@ -2123,7 +2134,7 @@ class ClaudeAccountSwitcher:
             return self._poll_inputs_override
         path = settings_path(self.backup_dir)
         try:
-            mtime: float | None = path.stat().st_mtime
+            mtime: float | None = statedb.mtime(path)
         except OSError:
             mtime = None
         if self._poll_inputs_cache is not None and self._poll_inputs_cache[0] == mtime:
@@ -2183,7 +2194,7 @@ class ClaudeAccountSwitcher:
             ConfigError: no accounts are managed yet, or the email is ambiguous.
             AccountNotFoundError: identifier doesn't match any account.
         """
-        if not self.sequence_file.exists():
+        if not statedb.exists(self.sequence_file):
             raise ConfigError("No accounts are managed yet")
 
         # resolve_account migrates org fields and hard-errors on ambiguity.
@@ -3494,7 +3505,7 @@ class ClaudeAccountSwitcher:
 
     def _init_sequence_file(self) -> None:
         """Initialize sequence.json if it doesn't exist."""
-        if not self.sequence_file.exists():
+        if not statedb.exists(self.sequence_file):
             init_data = {
                 "activeAccountNumber": None,
                 "lastUpdated": get_timestamp(),
@@ -4341,7 +4352,7 @@ class ClaudeAccountSwitcher:
         the TUI, which collects confirmation before calling).
         """
         self._refuse_session_shell()
-        if not self.sequence_file.exists():
+        if not statedb.exists(self.sequence_file):
             raise ConfigError("No accounts are managed yet")
 
         # Ensure org fields are migrated before resolving accounts
@@ -6005,7 +6016,7 @@ class ClaudeAccountSwitcher:
             with FileLock(self.lock_file):
                 try:
                     last_sweep = json.loads(
-                        stamp_path.read_text(encoding="utf-8")
+                        statedb.read_text(stamp_path)
                     )["at"]
                 except FileNotFoundError:
                     last_sweep = None  # never swept: the ordinary first run
@@ -6112,7 +6123,7 @@ class ClaudeAccountSwitcher:
         stale account eligible. ``include_profiles`` adds the per-slot session
         profile block to the JSON payload (``--profiles``).
         """
-        if not self.sequence_file.exists():
+        if not statedb.exists(self.sequence_file):
             # JSON mode must never prompt — emit an empty list instead of the
             # interactive first-run setup.
             if json_output:
@@ -6452,7 +6463,7 @@ class ClaudeAccountSwitcher:
                 + (f" (from {source})" if source else "")
             ))
 
-        if not self.sequence_file.exists():
+        if not statedb.exists(self.sequence_file):
             raise ConfigError("No accounts are managed yet")
 
         identity = self._get_current_account()
@@ -6810,7 +6821,7 @@ class ClaudeAccountSwitcher:
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
         """
-        if not self.sequence_file.exists():
+        if not statedb.exists(self.sequence_file):
             raise ConfigError("No accounts are managed yet")
 
         # Ensure org fields are migrated before resolving accounts
@@ -7944,8 +7955,8 @@ class ClaudeAccountSwitcher:
                 for num in nums:
                     cred_file = self.credentials_dir / f".creds-{num}-{email}.enc"
                     try:
-                        if cred_file.exists():
-                            cred_file.unlink()
+                        if statedb.exists(cred_file):
+                            statedb.unlink(cred_file)
                             removed_items.append(f"Credential file: {cred_file.name}")
                     except Exception:
                         pass  # Ignore errors during purge
@@ -7984,6 +7995,8 @@ class ClaudeAccountSwitcher:
             for handler in self._logger.handlers[:]:
                 handler.close()
                 self._logger.removeHandler(handler)
+            # And the state database's connections, for the same reason.
+            statedb.close(self.backup_dir)
 
             shutil.rmtree(self.backup_dir)
             removed_items.append(f"Directory: {self.backup_dir}")

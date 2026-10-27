@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests import statefiles
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
@@ -182,9 +183,9 @@ class EngineHarness:
 
     def state(self) -> dict:
         path = self.switcher.backup_dir / "autoswitch_state.json"
-        if not path.exists():
+        if not statefiles.exists(path):
             return {}
-        return json.loads(path.read_text())
+        return statefiles.read_json(path)
 
 
 @pytest.fixture

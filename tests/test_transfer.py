@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests import statefiles
 from claude_swap.exceptions import TransferError
 from claude_swap.models import Platform
 from claude_swap.oauth import credential_fingerprint
@@ -481,7 +482,7 @@ class TestCrossPlatform:
                 cred_file = (
                     dst.credentials_dir / ".creds-1-alice@example.com.enc"
                 )
-                assert cred_file.exists()
+                assert statefiles.exists(cred_file)
 
 
 # ---------------------------------------------------------------------------
@@ -716,11 +717,11 @@ class TestEmptyHome:
                 dst = ClaudeAccountSwitcher()
                 dst.platform = Platform.LINUX
                 # Don't pre-init — verify import does it
-                assert not dst.sequence_file.exists()
+                assert not statefiles.exists(dst.sequence_file)
 
                 import_accounts(dst, str(out))
 
-                assert dst.sequence_file.exists()
+                assert statefiles.exists(dst.sequence_file)
                 seq = dst._get_sequence_data()
                 assert seq["accounts"]["1"]["email"] == "alice@example.com"
 
@@ -1307,15 +1308,13 @@ class TestExportSkipsBrokenSlots:
         cred_file = (
             switcher.credentials_dir / f".creds-{num}-{email}.enc"
         )
-        if cred_file.exists():
-            cred_file.unlink()
+        statefiles.unlink(cred_file, missing_ok=True)
 
     def _break_config(self, switcher: ClaudeAccountSwitcher, num: int, email: str) -> None:
         cfg_file = (
             switcher.configs_dir / f".claude-config-{num}-{email}.json"
         )
-        if cfg_file.exists():
-            cfg_file.unlink()
+        statefiles.unlink(cfg_file, missing_ok=True)
 
     def test_all_accounts_skips_missing_credentials_with_stderr_warning(
         self, temp_home: Path, capsys

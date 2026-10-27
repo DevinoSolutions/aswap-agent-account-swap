@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests import statefiles
 from claude_swap import macos_keychain
 from claude_swap import oauth
 from claude_swap import session as session_mod
@@ -435,7 +436,7 @@ class TestBootstrap:
             seeded_switcher.configs_dir
             / f".claude-config-{ACCOUNT_NUM}-{ACCOUNT_EMAIL}.json"
         )
-        config_file.unlink()
+        statefiles.unlink(config_file)
         with pytest.raises(SessionError, match="no stored config backup"):
             manager.setup_session("2", share=False)
 

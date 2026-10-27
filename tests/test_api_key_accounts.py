@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from tests import statefiles
 from claude_swap import macos_keychain
 from claude_swap import session as session_mod
 from claude_swap.credentials import (
@@ -876,11 +877,11 @@ class TestATornRosterDoesNotDestroyBackups:
         before = s._read_account_credentials("1", "shared@example.com")
         assert before, "premise: slot 1 has a credential backup"
 
-        s.sequence_file.write_text(
-            s.sequence_file.read_text(encoding="utf-8")[:-12], encoding="utf-8"
+        statefiles.write_text(
+            s.sequence_file, statefiles.read_text(s.sequence_file)[:-12]
         )
         with pytest.raises(json.JSONDecodeError):
-            json.loads(s.sequence_file.read_text(encoding="utf-8"))
+            statefiles.read_json(s.sequence_file)
 
         # A live login for the SAME email under a different org — what makes
         # the collapsed slot number land on top of the resident one.

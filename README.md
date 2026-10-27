@@ -318,7 +318,7 @@ aswap purge                     # Remove all aswap data
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
-Session-mode profiles (`aswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`), auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset), and five-hour warmer state (`warmup_state.json`) live in the backup directory root.
+Session-mode profiles (`aswap run`) live under the backup directory in `sessions/`. The roster, credential and config backups, tool preferences (`settings.json`), auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts) and five-hour warmer state (`warmup_state.json`) are documents in one crash-safe SQLite database, `state.db`, in the backup directory root; `aswap backup export DIR` writes them all out as files.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
@@ -342,7 +342,7 @@ Shows every account's 5h / 7d / spend usage and switches with a click (specific 
 
 ### Configuration
 
-Tool preferences live in `settings.json` in the backup root; `aswap config` reads and edits it with validation, so you never have to find the file or guess valid ranges.
+Tool preferences are the `settings.json` document in the backup root's `state.db`; `aswap config` reads and edits them with validation, so you never have to guess valid ranges.
 
 <details>
 <summary>Commands & usage</summary>
@@ -356,10 +356,12 @@ aswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fa
 aswap config set profiles.persistent true # keep session profiles logged in across rotations
 aswap config set autoswitch.enabled false # observe only: never change the active account
 aswap config unset autoswitch.threshold   # back to the default
-aswap config path                         # where settings.json lives
+aswap config path                         # where the settings are stored
+aswap config export settings.json         # write them out (no FILE: stdout)
+aswap config import settings.json         # validate strictly, then replace them
 ```
 
-`aswap config --help` lists every key with its valid range and default. Hand-editing the file still works — `aswap config` is just a safer front door. `list` and `get` take `--json` for scripting.
+`aswap config --help` lists every key with its valid range and default. To hand-edit, export, edit the file, and import it back: the import rejects unknown keys and out-of-range or mistyped values before writing anything. `list` and `get` take `--json` for scripting.
 
 </details>
 

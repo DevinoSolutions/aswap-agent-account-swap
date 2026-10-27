@@ -13,7 +13,9 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap.models import Platform
+from claude_swap import statedb
 from claude_swap.switcher import ClaudeAccountSwitcher
+from tests import statefiles
 
 
 class TestSwapAccounts:
@@ -272,12 +274,19 @@ class TestSwapAccounts:
     ):
         """chmod runs on the temp file, making the rename the final commit —
         a chmod failure must abort *without* publishing, otherwise callers
-        would roll files back around already-committed metadata."""
+        would roll files back around already-committed metadata.
+
+        State documents are committed by the database and never chmod'd, so
+        this runs on a plain file (a path ``_write_json`` still writes as one).
+        """
         if sys.platform == "win32":
             pytest.skip("_write_json skips chmod on Windows (no POSIX file modes)")
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data)
-        before = switcher.sequence_file.read_text(encoding="utf-8")
+        plain = switcher.backup_dir / "plain.json"
+        assert statedb.locate(plain) is None, "premise: not a state document"
+        switcher._write_json(plain, sample_sequence_data)
+        before = plain.read_text(encoding="utf-8")
 
         def failing_chmod(path, mode):
             raise OSError("chmod denied (injected)")
@@ -286,9 +295,9 @@ class TestSwapAccounts:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("claude_swap.switcher.os.chmod", failing_chmod)
             with pytest.raises(OSError):
-                switcher._write_json(switcher.sequence_file, {"x": 1})
+                switcher._write_json(plain, {"x": 1})
 
-        assert switcher.sequence_file.read_text(encoding="utf-8") == before
+        assert plain.read_text(encoding="utf-8") == before
 
     def test_swap_same_email_one_sided_clears_destination(
         self, temp_home: Path, sample_sequence_data_with_org: dict
@@ -362,16 +371,16 @@ class TestSwapAccounts:
         email = "user@example.com"
         switcher._write_account_credentials("1", email, "creds-org")
 
-        real_unlink = Path.unlink
+        real_unlink = statedb.unlink
 
         def failing_unlink(path, *args, **kwargs):
-            if path.name.startswith(".creds-1-"):
+            if Path(path).name.startswith(".creds-1-"):
                 raise OSError("permission denied (injected)")
             return real_unlink(path, *args, **kwargs)
 
         # Scoped context: see H-1 comment above.
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(Path, "unlink", failing_unlink)
+            mp.setattr(statedb, "unlink", failing_unlink)
             with pytest.raises(CredentialError, match="aborting before commit"):
                 switcher.swap_accounts("1", "2")
 
@@ -455,18 +464,14 @@ class TestSwapUnreadableSourceIsNotAbsent:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, data)
 
-    @pytest.mark.skipif(
-        sys.platform == "win32" or os.geteuid() == 0,
-        reason="needs POSIX permission semantics (non-root)",
-    )
     def test_unreadable_enc_aborts_the_swap_before_anything_changes(
         self, temp_home: Path, sample_sequence_data: dict
     ):
         switcher = ClaudeAccountSwitcher()
-        # The probe is a chmod'd .enc, so the store has to be on the file
-        # backend. Unpinned, this test only ran that way off macOS, where
+        # The probe is an unreadable .enc, so the store has to be on the
+        # file backend. Unpinned, this test only ran that way off macOS, where
         # `_write_account_credentials` goes to the Keychain and leaves no .enc
-        # to chmod. The guard under test is the swap's, not the backend's.
+        # to break. The guard under test is the swap's, not the backend's.
         switcher.platform = Platform.LINUX
         self._write(switcher, sample_sequence_data)
         switcher._write_account_credentials("1", "account1@example.com", "rt-1")
@@ -486,13 +491,9 @@ class TestSwapUnreadableSourceIsNotAbsent:
         switcher.swap_accounts("1", "2")
 
         enc = switcher._backup_enc_path("2", "account2@example.com")
-        enc.chmod(0o000)
-        try:
+        with statefiles.unreadable(enc):
             with pytest.raises(ConfigError, match="could not be read"):
                 switcher.swap_accounts("1", "2")
-        finally:
-            if enc.exists():
-                enc.chmod(0o600)
 
         # Nothing committed: both accounts intact under their original
         # numbers, account 2 still holding its readable credential.

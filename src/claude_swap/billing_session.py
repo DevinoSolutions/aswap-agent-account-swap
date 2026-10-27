@@ -30,7 +30,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap.fsutil import read_text_with_retry
+from claude_swap import statedb
 from claude_swap.locking import FileLock
 from claude_swap.settings import atomic_write_json
 
@@ -85,7 +85,7 @@ class SessionStore:
 
     def rows(self) -> dict[str, dict]:
         try:
-            raw = json.loads(read_text_with_retry(self.path))
+            raw = json.loads(statedb.read_text(self.path))
         except (OSError, ValueError, UnicodeDecodeError):
             return {}
         rows = raw.get("sessions") if isinstance(raw, dict) else None

@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
+from claude_swap import statedb
 from claude_swap.exceptions import ClaudeSwitchError, PromptOutcomeUnknown, WarmupError
 from claude_swap.locking import FileLock
 from claude_swap.models import AccountSnapshot
@@ -386,10 +387,10 @@ class WarmupEngine:
         ]
 
     def _load_state(self) -> dict:
-        if not self.state_path.exists():
-            return {"schemaVersion": STATE_SCHEMA_VERSION, "accounts": {}}
         try:
-            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if not statedb.exists(self.state_path):
+                return {"schemaVersion": STATE_SCHEMA_VERSION, "accounts": {}}
+            data = json.loads(statedb.read_text(self.state_path))
         except (OSError, ValueError) as exc:
             raise WarmupError(
                 f"Could not read {self.state_path}; refusing to risk duplicate "
