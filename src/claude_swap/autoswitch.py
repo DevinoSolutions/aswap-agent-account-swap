@@ -188,6 +188,11 @@ MIN_LANDING_RUNWAY_S = 15 * 60.0
 # it an idle spell switched the check off: 2026-10-26 consume-first hopped
 # 13 -> 26 -> 15 -> 32 in ten minutes, landing on accounts 95-97% used.
 DEFAULT_LANDING_BURN = 1.0 / 60
+# The landing check sizes a target by the fastest burn seen this long ago or
+# less, not the instant rate. 2026-10-27: consume-first went back to a 5x
+# account with 7 points left 19 minutes after leaving it at 4.7 points a
+# minute, because a lull had dropped the instant rate to 0.4.
+LANDING_BURN_WINDOW_S = 30 * 60.0
 
 # Switch below the threshold when the active account would reach 100% within
 # this long at the current burn rate: the switch itself plus Claude Code
@@ -814,6 +819,7 @@ class AutoSwitchEngine:
         self._burn = BurnTracker()
         self._burn_rate: float | None = None
         self._last_burn_rate: float | None = None
+        self._recent_burns: list[tuple[float, float]] = []  # (collected_at, rate)
         self._time_to_limit: float | None = None
         self._limit_guard = False
         self._collected_at = 0.0
@@ -1203,6 +1209,7 @@ class AutoSwitchEngine:
             self._burn_rate = self._burn.rate()
             if self._burn_rate:
                 self._last_burn_rate = self._burn_rate
+                self._recent_burns.append((self._collected_at, self._burn_rate))
                 self._time_to_limit = (
                     active_headroom * self._cap(current) / self._burn_rate
                 )
@@ -2015,13 +2022,17 @@ class AutoSwitchEngine:
     def _runway_s(self, num: str, h: float | None, *, landing: bool = False) -> float | None:
         """Seconds of work the account holds at the current burn rate.
 
-        ``landing`` judges a switch target, so an idle spell falls back to
-        the last rate seen, then to ``DEFAULT_LANDING_BURN``, instead of
-        waving every target through.
+        ``landing`` judges a switch target by the fastest rate seen within
+        ``LANDING_BURN_WINDOW_S``, so a lull does not shrink the check; an
+        idle spell falls back to the last rate seen, then to
+        ``DEFAULT_LANDING_BURN``, instead of waving every target through.
         """
         rate = self._burn_rate
-        if landing and not rate:
-            rate = self._last_burn_rate or DEFAULT_LANDING_BURN
+        if landing:
+            cutoff = self._collected_at - LANDING_BURN_WINDOW_S
+            self._recent_burns = [(t, r) for t, r in self._recent_burns if t >= cutoff]
+            peak = max((r for _t, r in self._recent_burns), default=0.0)
+            rate = max(rate or 0.0, peak) or self._last_burn_rate or DEFAULT_LANDING_BURN
         if h is None or not rate:
             return None
         return max(h, 0.0) * self._cap(num) / rate
