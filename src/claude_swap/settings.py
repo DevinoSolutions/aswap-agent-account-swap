@@ -20,6 +20,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from claude_swap import statedb
 from claude_swap.exceptions import ConfigError
 from claude_swap.fsutil import replace_with_retry
 
@@ -284,7 +285,7 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
 
 def _read_raw(path: Path) -> dict:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(statedb.read_text(path))
     except FileNotFoundError:
         return {}
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -452,7 +453,7 @@ def _read_raw_for_write(path: Path) -> dict:
     maybe hand-recoverable) file with a near-empty one.
     """
     try:
-        text = path.read_text(encoding="utf-8")
+        text = statedb.read_text(path)
     except FileNotFoundError:
         return {}
     except (OSError, UnicodeDecodeError) as e:
@@ -508,6 +509,86 @@ def unset_setting(backup_root: Path, dotted_key: str) -> bool:
         del raw[spec.section]
     atomic_write_json(path, raw)
     return True
+
+
+def export_settings(backup_root: Path) -> dict:
+    """The settings document as stored, for ``aswap config export``.
+
+    Never-written settings export as a bare ``schemaVersion`` stub, which
+    imports back as "everything at its default".
+    """
+    raw = _read_raw_for_write(settings_path(backup_root))
+    return raw or {"schemaVersion": SETTINGS_SCHEMA_VERSION}
+
+
+def _parse_json_setting(spec: SettingSpec, value):
+    """Validate one value from an imported document with ``config set``'s parser.
+
+    JSON already carries a type, so it is checked first — a quoted ``"80"``
+    or ``"false"`` is the hand-edit mistake this exists to catch, and
+    stringifying would wave it through. The checked value then goes through
+    ``parse_setting_value`` so bounds and choices cannot drift from ``set``.
+    """
+    if spec.kind == "bool":
+        if not isinstance(value, bool):
+            raise ConfigError(f"{spec.dotted} expects true or false, got {json.dumps(value)}")
+        return value
+    if spec.kind in ("float", "int"):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            noun = "an integer" if spec.kind == "int" else "a number"
+            raise ConfigError(f"{spec.dotted} expects {noun}, got {json.dumps(value)}")
+        return parse_setting_value(spec, str(value))
+    if not isinstance(value, str):
+        raise ConfigError(f"{spec.dotted} expects a string, got {json.dumps(value)}")
+    return parse_setting_value(spec, value)
+
+
+def validate_settings_document(raw) -> dict:
+    """Strictly check a whole settings document for ``aswap config import``.
+
+    The load path forgives (clamps, falls back to defaults) because a bad
+    file must not stop ``aswap auto``; an import is the moment to be told.
+    Unknown sections and keys are errors too: a typo'd key would otherwise
+    be stored and silently ignored forever.
+    """
+    if not isinstance(raw, dict):
+        raise ConfigError("settings must be a JSON object")
+    version = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+    if isinstance(version, bool) or version not in range(1, SETTINGS_SCHEMA_VERSION + 1):
+        raise ConfigError(
+            f"unsupported schemaVersion {json.dumps(version)} "
+            f"(this aswap reads {SETTINGS_SCHEMA_VERSION})"
+        )
+    sections = list(dict.fromkeys(spec.section for spec in SETTING_SPECS.values()))
+    out: dict = {"schemaVersion": version}
+    for name, section in raw.items():
+        if name == "schemaVersion":
+            continue
+        if name not in sections:
+            raise ConfigError(
+                f"unknown settings section '{name}'\n"
+                f"Valid sections: {', '.join(sections)}"
+            )
+        if not isinstance(section, dict):
+            raise ConfigError(f"'{name}' must be a JSON object")
+        clean = {
+            key: _parse_json_setting(setting_spec(f"{name}.{key}"), value)
+            for key, value in section.items()
+        }
+        if clean:
+            out[name] = clean
+    return out
+
+
+def import_settings(backup_root: Path, raw) -> dict:
+    """Replace the settings document with a validated one; returns what was stored.
+
+    All or nothing: one bad value rejects the whole document before anything
+    is written.
+    """
+    clean = validate_settings_document(raw)
+    atomic_write_json(settings_path(backup_root), clean)
+    return clean
 
 
 def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, bool]]:
@@ -574,7 +655,13 @@ def atomic_write_json(path: Path, data: dict) -> None:
       else, and raise ``PermissionError`` outright when that parent is not
       ours to chmod. The written file still gets 0600, and ``mkstemp``
       creates it 0600 to begin with, so the secret is never exposed.
+
+    A state document under the backup root (``settings.json``, the
+    autoswitch state, ...) goes to the state database instead, as the same
+    bytes; a symlinked one stays a file and is written through as above.
     """
+    if statedb.try_write(path, json.dumps(data, indent=2)):
+        return
     target = Path(os.path.realpath(path)) if path.is_symlink() else path
     target.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":

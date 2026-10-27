@@ -22,6 +22,7 @@ from claude_swap.macos_keychain import KeychainError
 from claude_swap.migrations import run_migrations
 from claude_swap.models import Platform
 from claude_swap.switcher import KEYRING_SERVICE, ClaudeAccountSwitcher
+from tests import statefiles
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +76,15 @@ def _make_windows_switcher(temp_home: Path) -> ClaudeAccountSwitcher:
     return switcher
 
 
+def _keyring_migrations_marked(switcher: ClaudeAccountSwitcher) -> set[str]:
+    """Recorded migrations other than ``state_files_to_db``, which the
+    state database's first write records on its own."""
+    state_file = switcher.backup_dir / ".migrations.json"
+    if not statefiles.exists(state_file):
+        return set()
+    return set(statefiles.read_json(state_file)["applied"]) - {"state_files_to_db"}
+
+
 def _seed_sequence(switcher: ClaudeAccountSwitcher, accounts: dict) -> None:
     data = {
         "activeAccountNumber": None,
@@ -121,7 +131,7 @@ class TestWindowsKeyringToFiles:
         assert fake.store == {}
         assert (KEYRING_SERVICE, "account-1-a@example.com") in fake.deleted
         # State recorded.
-        state = json.loads((switcher.backup_dir / ".migrations.json").read_text())
+        state = statefiles.read_json(switcher.backup_dir / ".migrations.json")
         assert "windows_keyring_to_files" in state["applied"]
         assert state["version"] == 1
 
@@ -158,7 +168,7 @@ class TestWindowsKeyringToFiles:
 
         assert switcher.credentials_dir.exists()
         assert switcher._read_account_credentials("1", "a@example.com") == "creds-A"
-        state = json.loads((switcher.backup_dir / ".migrations.json").read_text())
+        state = statefiles.read_json(switcher.backup_dir / ".migrations.json")
         assert "windows_keyring_to_files" in state["applied"]
 
     def test_completes_when_no_legacy_entries_present(self, temp_home):
@@ -173,7 +183,7 @@ class TestWindowsKeyringToFiles:
         with _patch_keyring(fake):
             run_migrations(switcher)
 
-        state = json.loads((switcher.backup_dir / ".migrations.json").read_text())
+        state = statefiles.read_json(switcher.backup_dir / ".migrations.json")
         assert "windows_keyring_to_files" in state["applied"]
         # The existing file is untouched.
         assert switcher._read_account_credentials("1", "a@example.com") == "file-creds"
@@ -194,7 +204,7 @@ class TestSkips:
         with _patch_keyring(fake):
             assert migrations.migrate_windows_keyring_to_files(switcher) is False
         assert fake.get_calls == []
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert _keyring_migrations_marked(switcher) == set()
 
     def test_no_sequence_file_skips_unmarked(self, temp_home):
         switcher = _make_windows_switcher(temp_home)
@@ -202,16 +212,16 @@ class TestSkips:
         fake = FakeKeyring()
         with _patch_keyring(fake):
             assert migrations.migrate_windows_keyring_to_files(switcher) is False
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert _keyring_migrations_marked(switcher) == set()
 
     def test_corrupt_sequence_not_marked(self, temp_home):
         switcher = _make_windows_switcher(temp_home)
-        switcher.sequence_file.write_text("{ not json", encoding="utf-8")
+        statefiles.write_text(switcher.sequence_file, "{ not json")
         fake = FakeKeyring()
         with _patch_keyring(fake):
             run_migrations(switcher)
         # Unparseable sequence → never marked, so a later repair can migrate.
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert _keyring_migrations_marked(switcher) == set()
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +305,7 @@ class TestFailures:
         # Source entry preserved, migration not recorded → retried next run.
         assert (KEYRING_SERVICE, "account-1-a@example.com") in fake.store
         assert fake.deleted == []
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert _keyring_migrations_marked(switcher) == set()
         # The bad/partial file must not shadow the intact keyring entry.
         assert not (
             switcher.credentials_dir / ".creds-1-a@example.com.enc"
@@ -324,7 +334,7 @@ class TestFailures:
         # The healthy account migrated; the failed one is untouched + unmarked.
         assert switcher._read_account_credentials("1", "ok@example.com") == "good"
         assert (KEYRING_SERVICE, "account-2-bad@example.com") in fake.store
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert _keyring_migrations_marked(switcher) == set()
 
     def test_partial_failure_raises_from_migration_fn(self, temp_home):
         switcher = _make_windows_switcher(temp_home)
@@ -345,7 +355,7 @@ class TestFailures:
         # Runner swallows it and leaves it unmarked.
         with patch.dict(sys.modules, {"keyring": None}):
             run_migrations(switcher)
-        assert not (switcher.backup_dir / ".migrations.json").exists()
+        assert _keyring_migrations_marked(switcher) == set()
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +397,7 @@ class TestWindowsFileBackend:
 
         # The on-disk file lives under credentials/ as a base64 .enc file.
         cred_file = switcher.credentials_dir / ".creds-1-a@example.com.enc"
-        assert not cred_file.exists()  # deleted above
+        assert not statefiles.exists(cred_file)  # deleted above
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +411,7 @@ class TestPurgeWindows:
         _seed_sequence(switcher, {"1": {"email": "a@example.com"}})
         switcher._write_account_credentials("1", "a@example.com", "secret")
         cred_file = switcher.credentials_dir / ".creds-1-a@example.com.enc"
-        assert cred_file.exists()
+        assert statefiles.exists(cred_file)
 
         # purge()'s Windows branch lazily `import keyring`, so inject the fake via
         # sys.modules (patching switcher.keyring would not intercept it).
@@ -410,7 +420,7 @@ class TestPurgeWindows:
             switcher.purge()
 
         # File backend cleaned up.
-        assert not cred_file.exists()
+        assert not statefiles.exists(cred_file)
         # Best-effort legacy Credential Manager cleanup attempted.
         assert (KEYRING_SERVICE, "account-1-a@example.com") in fake.deleted
 
@@ -579,10 +589,10 @@ class TestMacosKeyringToSecurity:
             run_migrations(switcher)  # swallows MigrationIncomplete → left unmarked
 
         # Deferred cleanly: no fallback .enc written, migration not recorded.
-        assert not (switcher.credentials_dir / ".creds-1-a@example.com.enc").exists()
+        assert not statefiles.exists(switcher.credentials_dir / ".creds-1-a@example.com.enc")
         state_file = switcher.backup_dir / ".migrations.json"
-        if state_file.exists():
-            applied = json.loads(state_file.read_text()).get("applied", {})
+        if statefiles.exists(state_file):
+            applied = statefiles.read_json(state_file).get("applied", {})
             assert "macos_keyring_to_security" not in applied
 
     def test_idempotent_via_runner_marks_applied(self, temp_home):
@@ -592,5 +602,5 @@ class TestMacosKeyringToSecurity:
 
         with _patch_keyring(fake):
             run_migrations(switcher)
-        state = json.loads((switcher.backup_dir / ".migrations.json").read_text())
+        state = statefiles.read_json(switcher.backup_dir / ".migrations.json")
         assert "macos_keyring_to_security" in state["applied"]

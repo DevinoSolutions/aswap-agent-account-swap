@@ -1,4 +1,4 @@
-"""Tests for the `aswap config` subcommand (get/set/unset/list/path)."""
+"""Tests for the `aswap config` subcommand (get/set/unset/list/path/export/import)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import cli
+from tests import statefiles
 
 
 def _run(argv: list[str], capsys) -> tuple[int, str, str]:
@@ -30,9 +31,11 @@ def _run(argv: list[str], capsys) -> tuple[int, str, str]:
 
 
 def _settings_file(capsys) -> Path:
-    code, out, _ = _run(["path"], capsys)
-    assert code == 0
-    return Path(out.strip())
+    """The settings document's path (``statefiles`` reads and seeds it)."""
+    from claude_swap.paths import get_backup_root
+    from claude_swap.settings import settings_path
+
+    return settings_path(get_backup_root())
 
 
 class TestConfigList:
@@ -103,7 +106,7 @@ class TestConfigSetGet:
     def test_set_writes_only_that_key(self, temp_home, capsys):
         """The trap guard: no other defaults get materialized into the file."""
         _run(["set", "autoswitch.threshold", "80"], capsys)
-        raw = json.loads(_settings_file(capsys).read_text())
+        raw = statefiles.read_json(_settings_file(capsys))
         assert set(raw) == {"schemaVersion", "autoswitch"}
         assert set(raw["autoswitch"]) == {"threshold"}
         assert raw["autoswitch"]["threshold"] == 80.0
@@ -114,7 +117,7 @@ class TestConfigSetGet:
         )
         assert code == 0
         assert "= false" in out
-        raw = json.loads(_settings_file(capsys).read_text())
+        raw = statefiles.read_json(_settings_file(capsys))
         assert raw["autoswitch"]["includeApiKeyAccounts"] is False
 
     def test_set_five_hour_warmup(self, temp_home, capsys):
@@ -123,20 +126,20 @@ class TestConfigSetGet:
         )
         assert code == 0
         assert "= true" in out
-        raw = json.loads(_settings_file(capsys).read_text())
+        raw = statefiles.read_json(_settings_file(capsys))
         assert raw["autoswitch"]["warmupFiveHour"] is True
 
     def test_set_preserves_unknown_keys(self, temp_home, capsys):
         path = _settings_file(capsys)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
+        statefiles.write_text(path, json.dumps({
             "schemaVersion": 1,
             "futureSection": {"x": 1},
             "autoswitch": {"threshold": 80, "futureKnob": True},
         }))
         code, _, _ = _run(["set", "autoswitch.threshold", "70"], capsys)
         assert code == 0
-        raw = json.loads(path.read_text())
+        raw = statefiles.read_json(path)
         assert raw["futureSection"] == {"x": 1}
         assert raw["autoswitch"]["futureKnob"] is True
         assert raw["autoswitch"]["threshold"] == 70.0
@@ -204,11 +207,11 @@ class TestConfigValidation:
     ):
         path = _settings_file(capsys)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{not json")
+        statefiles.write_text(path, "{not json")
         code, _, err = _run(["set", "autoswitch.threshold", "80"], capsys)
         assert code == 1
         assert "not valid JSON" in err
-        assert path.read_text() == "{not json"
+        assert statefiles.read_text(path) == "{not json"
 
     def test_missing_value_usage_error_exits_2(self, temp_home, capsys):
         code, _, _ = _run(["set", "autoswitch.threshold"], capsys)
@@ -234,7 +237,7 @@ class TestConfigUnset:
         code, out, _ = _run(["get", "autoswitch.threshold"], capsys)
         assert out.strip() == "90"
         # The emptied autoswitch section is removed entirely.
-        raw = json.loads(_settings_file(capsys).read_text())
+        raw = statefiles.read_json(_settings_file(capsys))
         assert "autoswitch" not in raw
 
     def test_unset_when_not_set_is_a_noop(self, temp_home, capsys):
@@ -244,10 +247,91 @@ class TestConfigUnset:
 
 
 class TestConfigMisc:
-    def test_path_prints_settings_location(self, temp_home, capsys):
+    def test_path_prints_the_database_and_document(self, temp_home, capsys):
         code, out, _ = _run(["path"], capsys)
         assert code == 0
-        assert out.strip().endswith("settings.json")
+        db = _settings_file(capsys).parent / "state.db"
+        assert out.strip() == f"settings live in {db} (document settings.json)"
+
+
+class TestConfigExportImport:
+    def test_export_of_unset_settings_is_an_importable_stub(self, temp_home, capsys):
+        code, out, _ = _run(["export"], capsys)
+        assert code == 0
+        assert json.loads(out) == {"schemaVersion": 1}
+
+    def test_round_trip_through_a_file(self, temp_home, tmp_path, capsys):
+        _run(["set", "autoswitch.threshold", "80"], capsys)
+        out_file = tmp_path / "settings.json"
+        code, out, _ = _run(["export", str(out_file)], capsys)
+        assert code == 0 and str(out_file) in out
+        doc = json.loads(out_file.read_text(encoding="utf-8"))
+        assert doc["autoswitch"] == {"threshold": 80.0}
+
+        doc["autoswitch"]["strategy"] = "consume-first"
+        doc["ui"] = {"theme": "light"}
+        out_file.write_text(json.dumps(doc), encoding="utf-8")
+        code, out, _ = _run(["import", str(out_file)], capsys)
+        assert code == 0
+        assert "Imported 3 settings" in out
+        assert statefiles.read_json(_settings_file(capsys)) == {
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 80.0, "strategy": "consume-first"},
+            "ui": {"theme": "light"},
+        }
+        _, out, _ = _run(["get", "autoswitch.strategy"], capsys)
+        assert out.strip() == "consume-first"
+
+    def test_import_replaces_the_whole_document(self, temp_home, tmp_path, capsys):
+        _run(["set", "autoswitch.threshold", "80"], capsys)
+        src = tmp_path / "in.json"
+        src.write_text(json.dumps({"ui": {"view": "codex"}}), encoding="utf-8")
+        assert _run(["import", str(src)], capsys)[0] == 0
+        assert statefiles.read_json(_settings_file(capsys)) == {
+            "schemaVersion": 1, "ui": {"view": "codex"},
+        }
+
+    def test_import_from_stdin(self, temp_home, capsys, monkeypatch):
+        import io
+
+        monkeypatch.setattr(sys, "stdin", io.StringIO('{"autoswitch": {"enabled": false}}'))
+        code, out, _ = _run(["import", "-"], capsys)
+        assert code == 0 and "from stdin" in out
+        _, out, _ = _run(["get", "autoswitch.enabled"], capsys)
+        assert out.strip() == "false"
+
+    @pytest.mark.parametrize("doc, message", [
+        ({"autoswitch": {"threshold": 120}}, "between 50 and 99.9"),
+        ({"autoswitch": {"threshold": "80"}}, "expects a number"),
+        ({"autoswitch": {"enabled": "false"}}, "expects true or false"),
+        ({"autoswitch": {"unhealthyTicks": 2.5}}, "expects an integer"),
+        ({"autoswitch": {"strategy": "fastest"}}, "must be one of"),
+        ({"autoswitch": {"model": None}}, "expects a string"),
+        ({"autoswitch": {"treshold": 80}}, "unknown setting 'autoswitch.treshold'"),
+        ({"autoswich": {}}, "unknown settings section 'autoswich'"),
+        ({"ui": "dark"}, "'ui' must be a JSON object"),
+        ({"schemaVersion": 2}, "unsupported schemaVersion 2"),
+        ([1, 2], "must be a JSON object"),
+    ])
+    def test_import_rejects_what_set_would_refuse(
+        self, temp_home, tmp_path, capsys, doc, message,
+    ):
+        _run(["set", "autoswitch.threshold", "80"], capsys)
+        before = statefiles.read_text(_settings_file(capsys))
+        src = tmp_path / "bad.json"
+        src.write_text(json.dumps(doc), encoding="utf-8")
+        code, _, err = _run(["import", str(src)], capsys)
+        assert code == 1
+        assert message in err
+        assert statefiles.read_text(_settings_file(capsys)) == before
+
+    def test_import_of_invalid_json_or_missing_file_errors(self, temp_home, tmp_path, capsys):
+        src = tmp_path / "bad.json"
+        src.write_text("{nope", encoding="utf-8")
+        code, _, err = _run(["import", str(src)], capsys)
+        assert code == 1 and "is not valid JSON" in err
+        code, _, err = _run(["import", str(tmp_path / "absent.json")], capsys)
+        assert code == 1 and "could not read" in err
 
     def test_config_help(self, temp_home, capsys):
         code, out, _ = _run(["--help"], capsys)

@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, statedb
 from claude_swap import oauth
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
@@ -27,6 +27,7 @@ from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
+from tests import statefiles
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
@@ -4032,10 +4033,9 @@ class TestDeadTokenQuarantine:
         })}, ident)
         # Age the row past the serve TTL so it is fetch-eligible, without
         # advancing the clock (which would move the scoped reset with it).
-        with store.path.open() as fh:
-            table = json.load(fh)
+        table = statefiles.read_json(store.path)
         table["accounts"]["2"]["fetchedAt"] -= SERVE_TTL_S * 4
-        store.path.write_text(json.dumps(table))
+        statefiles.write_json(store.path, table)
 
         with patch.object(
             switcher, "_run_usage_fetches",
@@ -4050,12 +4050,11 @@ class TestDeadTokenQuarantine:
         # Move the scoped window's reset into the PAST — the state a real
         # clock reaches 30 minutes later — while the unscoped windows stay far
         # ahead. Only a bound that sees the configured models ends the trust.
-        with store.path.open() as fh:
-            table = json.load(fh)
+        table = statefiles.read_json(store.path)
         row = table["accounts"]["2"]
         row["lastGood"]["scoped"][0]["resets_at"] = iso(-60.0 / 3600.0)
         row["fetchedAt"] -= 1860.0
-        store.path.write_text(json.dumps(table))
+        statefiles.write_json(store.path, table)
 
         # BOTH RETURN PATHS, and the FETCHING one first. `_collect_usage_entries`
         # has two `store.entries(identities, models)` sites: :3520 on the
@@ -4077,10 +4076,9 @@ class TestDeadTokenQuarantine:
         # unreachable through six earlier shapes of this assertion. The row's
         # own backoff is cleared here rather than by advancing a clock the
         # store does not share with the test.
-        with store.path.open() as fh:
-            table = json.load(fh)
+        table = statefiles.read_json(store.path)
         table["accounts"]["2"]["backoffUntil"] = None
-        store.path.write_text(json.dumps(table))
+        statefiles.write_json(store.path, table)
 
         # And the fetch answers with NOTHING: the slot is claimed so the block
         # opens and :3581 runs, but `record()` gets an empty `records`, touches
@@ -4156,7 +4154,7 @@ class TestAddAccountOrgFields:
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account()
 
-        seq = json.loads((get_backup_root() / "sequence.json").read_text())
+        seq = statefiles.read_json(get_backup_root() / "sequence.json")
         assert len(seq["accounts"]) == 2
         assert seq["accounts"]["1"]["organizationUuid"] == "org-uuid-A"
         assert seq["accounts"]["2"]["organizationUuid"] == ""
@@ -4191,7 +4189,7 @@ class TestAddAccountOrgFields:
             switcher.add_account()
         assert "Updated credentials" in f.getvalue()
 
-        seq = json.loads((get_backup_root() / "sequence.json").read_text())
+        seq = statefiles.read_json(get_backup_root() / "sequence.json")
         assert len(seq["accounts"]) == 1
 
     def test_stores_org_name_in_sequence(self, temp_home):
@@ -4213,7 +4211,7 @@ class TestAddAccountOrgFields:
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account()
 
-        seq = json.loads((get_backup_root() / "sequence.json").read_text())
+        seq = statefiles.read_json(get_backup_root() / "sequence.json")
         assert seq["accounts"]["1"]["organizationName"] == "My Org"
         assert seq["accounts"]["1"]["organizationUuid"] == "org-uuid"
 
@@ -4506,11 +4504,12 @@ class TestUpgradeMigration:
         encoded = base64.b64encode(
             json.dumps({"claudeAiOauth": {"accessToken": "token-2"}}).encode()
         ).decode()
-        (creds_dir / ".creds-2-other@example.com.enc").write_text(encoded)
+        statefiles.write_text(creds_dir / ".creds-2-other@example.com.enc", encoded)
 
         configs_dir = backup_dir / "configs"
         configs_dir.mkdir(exist_ok=True)
-        (configs_dir / ".claude-config-2-other@example.com.json").write_text(
+        statefiles.write_text(
+            configs_dir / ".claude-config-2-other@example.com.json",
             json.dumps({"oauthAccount": {
                 "emailAddress": "other@example.com",
                 "accountUuid": "other-uuid-5678",
@@ -6219,22 +6218,22 @@ class TestMacosKeychainFallback:
         s._write_backup_enc("1", "a@example.com", "OLD-FILE")
         enc = s._backup_enc_path("1", "a@example.com")
 
-        orig_unlink = Path.unlink
+        orig_unlink = statedb.unlink
 
-        def flaky_unlink(self_path, *a, **k):
-            if self_path == enc:
+        def flaky_unlink(path, *a, **k):
+            if Path(path) == enc:
                 raise OSError("cannot unlink")
-            return orig_unlink(self_path, *a, **k)
+            return orig_unlink(path, *a, **k)
 
-        monkeypatch.setattr(Path, "unlink", flaky_unlink)
+        monkeypatch.setattr(statedb, "unlink", flaky_unlink)
         p1, p2 = self._no_session(s)
         with p1, p2:
             s._write_account_credentials("1", "a@example.com", "NEW-KC")
-        monkeypatch.setattr(Path, "unlink", orig_unlink)
+        monkeypatch.setattr(statedb, "unlink", orig_unlink)
 
         # Could not delete the .enc → it was rewritten fresh, so .enc-wins reads
         # still return the new creds (no stale shadow).
-        assert base64.b64decode(enc.read_text()).decode() == "NEW-KC"
+        assert base64.b64decode(statefiles.read_text(enc)).decode() == "NEW-KC"
         assert s._read_account_credentials("1", "a@example.com") == "NEW-KC"
 
     def test_backup_file_mode_writes_enc_and_clears_keychain(
@@ -7467,10 +7466,6 @@ class TestStashAndRetentionStore:
         store._delete_account_credentials("1", "a@b.c")
         assert store._read_previous_backup("1", "a@b.c") == ""
 
-    @pytest.mark.skipif(
-        sys.platform == "win32" or os.geteuid() == 0,
-        reason="needs POSIX permission semantics (non-root)",
-    )
     def test_unreadable_current_backup_warns_instead_of_silent_no_op(
         self, temp_home, caplog,
     ):
@@ -7495,12 +7490,9 @@ class TestStashAndRetentionStore:
         enc = store._backup_enc_path("1", "a@b.c")
 
         caplog.clear()
-        enc.chmod(0o000)
-        try:
+        with statefiles.unreadable(enc):
             with caplog.at_level(logging.WARNING, logger="claude-swap"):
                 store._retain_previous_backup("1", "a@b.c", "gen-2")
-        finally:
-            enc.chmod(0o600)
 
         assert any(
             "could not be retained" in r.message.lower()
@@ -7512,10 +7504,6 @@ class TestStashAndRetentionStore:
             "no warning distinguishing it from a genuinely absent one"
         )
 
-    @pytest.mark.skipif(
-        sys.platform == "win32" or os.geteuid() == 0,
-        reason="needs POSIX permission semantics (non-root)",
-    )
     def test_strict_clear_final_belt_fails_closed_on_unreadable_enc(
         self, temp_home,
     ):
@@ -7534,15 +7522,12 @@ class TestStashAndRetentionStore:
         store._write_account_credentials("1", "a@b.c", "live-material")
         enc = store._backup_enc_path("1", "a@b.c")
 
-        with patch.object(type(enc), "unlink", return_value=None):
-            enc.chmod(0o000)
-            try:
+        with patch("claude_swap.statedb.unlink", return_value=None):
+            with statefiles.unreadable(enc):
                 with pytest.raises(CredentialError):
                     store.delete_account_credentials_strict("1", "a@b.c")
-            finally:
-                enc.chmod(0o600)
 
-        assert enc.exists() and enc.stat().st_size > 0, (
+        assert statefiles.read_text(enc), (
             "premise: the no-op'd unlink left material behind"
         )
 
@@ -8988,10 +8973,6 @@ class TestEncPermissionDeniedIsUnreadable:
     mid-unmount) read as "there is no backup" on every platform.
     """
 
-    @pytest.mark.skipif(
-        sys.platform == "win32" or os.geteuid() == 0,
-        reason="needs POSIX permission semantics (non-root)",
-    )
     def test_unreadable_enc_is_not_absent_on_linux(self, temp_home: Path):
         s = ClaudeAccountSwitcher()
         s.platform = Platform.LINUX
@@ -8999,7 +8980,7 @@ class TestEncPermissionDeniedIsUnreadable:
         num, email = "3", "c@example.com"
         s._write_account_credentials(num, email, '{"access_token":"live"}')
         enc = s._backup_enc_path(num, email)
-        assert enc.exists(), "premise: the backup landed in the .enc"
+        assert statefiles.exists(enc), "premise: the backup landed in the .enc"
 
         # CONTROL A: readable -> value, not unreadable (instrument says YES)
         v_a, unread_a = s._store._read_account_credentials_ex(num, email)
@@ -9012,11 +8993,8 @@ class TestEncPermissionDeniedIsUnreadable:
         assert (v_b, unread_b) == ("", False), f"control B broken: {(v_b, unread_b)}"
 
         # THE PROBE: present but unreadable
-        enc.chmod(0o000)
-        try:
+        with statefiles.unreadable(enc):
             v_c, unread_c = s._store._read_account_credentials_ex(num, email)
-        finally:
-            enc.chmod(0o600)
 
         assert unread_c is True, (
             f"({v_c!r}, {unread_c}) is byte-identical to the ABSENT control "
@@ -9025,10 +9003,6 @@ class TestEncPermissionDeniedIsUnreadable:
             "this platform has."
         )
 
-    @pytest.mark.skipif(
-        sys.platform == "win32" or os.geteuid() == 0,
-        reason="needs POSIX permission semantics (non-root)",
-    )
     def test_unreadable_enc_is_not_absent_on_macos(
         self, temp_home: Path, block_real_keychain
     ):
@@ -9050,11 +9024,8 @@ class TestEncPermissionDeniedIsUnreadable:
         )
         assert (v_b, unread_b) == ("", False), f"control B broken: {(v_b, unread_b)}"
 
-        enc.chmod(0o000)
-        try:
+        with statefiles.unreadable(enc):
             v_c, unread_c = s._store._read_account_credentials_ex(num, email)
-        finally:
-            enc.chmod(0o600)
 
         assert unread_c is True, (
             f"({v_c!r}, {unread_c}) is byte-identical to the ABSENT control "
@@ -9063,10 +9034,6 @@ class TestEncPermissionDeniedIsUnreadable:
         )
 
 
-    @pytest.mark.skipif(
-        sys.platform == "win32" or os.geteuid() == 0,
-        reason="needs POSIX permission semantics (non-root)",
-    )
     def test_unsearchable_credentials_dir_is_not_absent(self, temp_home: Path):
         """C2: the third instance, six lines above C1's fix. The
         ``enc_file.exists()`` probe's own ``OSError`` arm (an unsearchable
@@ -9080,7 +9047,6 @@ class TestEncPermissionDeniedIsUnreadable:
         s._setup_directories()
         num, email = "3", "c@example.com"
         s._write_account_credentials(num, email, '{"access_token":"live"}')
-        cred_dir = s._store._host.credentials_dir
 
         # CONTROL A: readable -> value, not unreadable (instrument says YES)
         v_a, unread_a = s._store._read_account_credentials_ex(num, email)
@@ -9089,19 +9055,13 @@ class TestEncPermissionDeniedIsUnreadable:
         # CONTROL B (C1's fixed arm): .enc unreadable -> unread=True, proves
         # the instrument CAN say unreadable.
         enc = s._backup_enc_path(num, email)
-        enc.chmod(0o000)
-        try:
+        with statefiles.unreadable(enc):
             v_b, unread_b = s._store._read_account_credentials_ex(num, email)
-        finally:
-            enc.chmod(0o600)
         assert unread_b is True, f"control B broken: {(v_b, unread_b)}"
 
         # THE PROBE: the dir itself is unsearchable.
-        cred_dir.chmod(0o000)
-        try:
+        with statefiles.unreadable(enc.parent, unsearchable=True):
             v_c, unread_c = s._store._read_account_credentials_ex(num, email)
-        finally:
-            cred_dir.chmod(0o700)
 
         assert unread_c is True, (
             f"({v_c!r}, {unread_c}) is byte-identical to a genuinely ABSENT "

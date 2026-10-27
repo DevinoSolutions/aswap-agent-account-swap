@@ -150,6 +150,7 @@ class TestCLI:
     def test_token_status_flag_is_forwarded_to_list(self):
         """--list --token-status should call list_accounts(show_token_status=True)."""
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.cli.statedb.exists", return_value=True), \
              patch.object(sys, "argv", ["claude-swap", "--list", "--token-status"]), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
