@@ -1825,7 +1825,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s codex <command>            manage Codex CLI accounts
-  %(prog)s backup [take|list|check|restore]  snapshots of accounts and creds; crash restore
+  %(prog)s backup [take|list|check|restore|export]  snapshots of state.db; crash restore
   %(prog)s billing <command>          exact billing, weekly resets, resub plan
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s warmup                     keep five-hour windows ready (opt-in spend)
