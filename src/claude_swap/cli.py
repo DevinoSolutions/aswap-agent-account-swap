@@ -9,7 +9,7 @@ import os
 import sys
 from pathlib import Path
 
-from claude_swap import __version__, paths, printer, statedb
+from claude_swap import __version__, endpoints, paths, printer, statedb
 from claude_swap.codex import CodexAccountSwitcher
 from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 from claude_swap.json_output import error_envelope
@@ -1724,6 +1724,13 @@ def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
     _use_native_tls()
+    try:
+        endpoints.validate_environment()
+    except endpoints.EndpointOverrideError as e:
+        # Before anything can send a token: a refused override never falls
+        # back to some other host.
+        error(f"Error: {e}")
+        sys.exit(2)
     argv = sys.argv[1:]
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme

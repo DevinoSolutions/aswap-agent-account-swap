@@ -14,6 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from claude_swap.endpoints import scaled  # test-only clock scale (1.0 outside tests)
 from claude_swap import macos_keychain
 
 from claude_swap.exceptions import (
@@ -150,7 +151,7 @@ _wiped_warned_at: dict[str, float] = {}
 _TORN_READ_DELAY_S = 0.05
 # An account cached as lapsed but reporting live usage gets its plan re-read
 # at most this often (one profile request each time).
-LIVE_RECHECK_S = 10 * 60.0
+LIVE_RECHECK_S = scaled(10 * 60.0)
 # Auto-add waits this long for the account lock before deferring to the next
 # poll: a switch holds it for local I/O only, and an auto-add that queued
 # behind one would only find the live login moved anyway.

@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
+from claude_swap.endpoints import scaled  # test-only clock scale (1.0 outside tests)
 from claude_swap import oauth
 from claude_swap import statedb
 from claude_swap.fsutil import replace_with_retry
@@ -41,7 +42,7 @@ SUCCESS_TTL_S = 24 * 3600
 EXACT_TTL_S = 6 * 3600
 # A lapsed subscription can be bought again any minute, so its row is
 # re-checked far sooner than an active one.
-LAPSED_TTL_S = 30 * 60
+LAPSED_TTL_S = scaled(30 * 60)
 # 2026-10-27: a re-subscribed account kept its cached "canceled" for the
 # better part of an hour while its usage poll sat in 429 backoff. A row
 # cached as lapsed is re-read from the profile alone (a different endpoint
@@ -50,10 +51,10 @@ LAPSED_TTL_S = 30 * 60
 # together; on becoming active, a re-read waits only PLAN_RECHECK_MIN_S,
 # which merely folds the several surfaces that notice one switch into one
 # request.
-LAPSED_RECHECK_S = 5 * 60
-LAPSED_STAGGER_S = 60
-PLAN_RECHECK_MIN_S = 60
-FAILURE_RETRY_S = 3600
+LAPSED_RECHECK_S = scaled(5 * 60)
+LAPSED_STAGGER_S = scaled(60)
+PLAN_RECHECK_MIN_S = scaled(60)
+FAILURE_RETRY_S = scaled(3600)
 # A tier check asked for an off-schedule weekly reading stays open this long;
 # an older one is asked again rather than answered by an unrelated fetch.
 TIER_CHECK_MAX_AGE_S = 6 * 3600

@@ -36,13 +36,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import oauth, statedb
+from claude_swap.endpoints import scaled  # test-only clock scale (1.0 outside tests)
+from claude_swap import endpoints, oauth, statedb
 from claude_swap.locking import FileLock
 from claude_swap.settings import atomic_write_json
 
 _logger = logging.getLogger("claude-swap")
 
-GATE_URL = "https://api.anthropic.com/v1/messages"
+GATE_URL = "https://api.anthropic.com/v1/messages"  # default; see endpoints
+GATE_PATH = "/v1/messages"
 PROBE_MODEL = "claude-haiku-5-5"
 # Claude Code's own system line: OAuth subscription tokens are accepted on
 # /v1/messages only for Claude Code traffic.
@@ -59,10 +61,10 @@ BLOCKED = "blocked"
 
 # One probe per account per this long, whatever the outcome (a failure is
 # throttled exactly like a success, so a broken probe cannot become a loop).
-PROBE_INTERVAL_S = 10 * 60.0
+PROBE_INTERVAL_S = scaled(10 * 60.0)
 # The ACTIVE account riding an open gate is re-probed this often: it is
 # burning its last point, and the next closed answer is what moves the work.
-RIDE_REPROBE_S = 150.0
+RIDE_REPROBE_S = scaled(150.0)
 # A probe is trusted for decisions this long (a little over one interval, so
 # an account due for its next probe is not dropped between two ticks)...
 FRESH_S = PROBE_INTERVAL_S + 60.0
@@ -153,7 +155,7 @@ def request_gate(access_token: str, now: float) -> GateOutcome:
         "messages": [{"role": "user", "content": "hi"}],
     }).encode()
     req = urllib.request.Request(
-        GATE_URL,
+        endpoints.api_base() + GATE_PATH,
         data=body,
         method="POST",
         headers={

@@ -30,7 +30,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import statedb
+from claude_swap import endpoints, statedb
 from claude_swap.locking import FileLock
 from claude_swap.settings import atomic_write_json
 
@@ -224,14 +224,15 @@ def _http_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, s
 
 
 def _request(path: str, session_key: str, timeout: float = 40.0) -> object:
+    base = endpoints.claude_ai_base()
     status, body = _http_get(
-        CLAUDE + path,
+        base + path,
         {
             "Cookie": f"sessionKey={session_key}",
             "User-Agent": _UA,
             "Accept": "application/json",
-            "Origin": CLAUDE,
-            "Referer": CLAUDE + "/settings/billing",
+            "Origin": base,
+            "Referer": base + "/settings/billing",
             "anthropic-client-platform": "web_claude_ai",
         },
         timeout,

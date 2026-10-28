@@ -67,16 +67,17 @@ import random
 from collections.abc import Callable
 from datetime import datetime
 
+from claude_swap.endpoints import scaled  # test-only clock scale (1.0 outside tests)
 from claude_swap import oauth
 
 # Freshness floor shared by every collector: an entry younger than this is
 # served from the store without any fetch, so the maximum sustained rate on
 # one token is 1/SERVE_TTL_S regardless of how many surfaces are open.
-SERVE_TTL_S = 180.0
+SERVE_TTL_S = scaled(180.0)
 
 # Normal cadence floor — movement can halve an interval down to this, never
 # below.
-MIN_INTERVAL_S = 180.0
+MIN_INTERVAL_S = scaled(180.0)
 
 # Urgent mode: the ACTIVE account, within ESCALATION_MARGIN_PCT of the
 # switch threshold, with movement observed this poll (i.e. actually burning
@@ -85,13 +86,13 @@ MIN_INTERVAL_S = 180.0
 # to MIN_INTERVAL_S) — worst case margin/movement-delta ≈ 15 polls per
 # episode, inside the measured ~28-30 request rolling-hour window; overshoot
 # on top of steady traffic is absorbed by the post-429 floor below.
-URGENT_INTERVAL_S = 60.0
+URGENT_INTERVAL_S = scaled(60.0)
 
 # Decay ceilings for an account whose usage is not moving: the active account
 # stays reasonably fresh, an idle alternate drifts out to ten minutes.
-ACTIVE_MAX_INTERVAL_S = 300.0
-CANDIDATE_DEFAULT_INTERVAL_S = 300.0
-CANDIDATE_MAX_INTERVAL_S = 600.0
+ACTIVE_MAX_INTERVAL_S = scaled(300.0)
+CANDIDATE_DEFAULT_INTERVAL_S = scaled(300.0)
+CANDIDATE_MAX_INTERVAL_S = scaled(600.0)
 
 # Exhaustion is stable enough to poll slowly, but not to stop polling until a
 # reported reset. Quota grants and provider-side corrections can make an
@@ -100,7 +101,7 @@ CANDIDATE_MAX_INTERVAL_S = 600.0
 # polling (six requests/hour) stays below the measured budget and
 # detects recovery promptly; a nearer reported reset still pulls the next poll
 # forward.
-EXHAUSTED_INTERVAL_S = 600.0
+EXHAUSTED_INTERVAL_S = scaled(600.0)
 
 # A window whose binding pct moved at least this much between polls is being
 # consumed somewhere (this machine, another PC, session mode) → tighten; an
@@ -114,13 +115,13 @@ JITTER_FRAC = 0.1
 # Reaction to a 429 with ``Retry-After: 0`` (the saturated-window edge):
 # probe at most every 5 minutes (≤12/hour) so aging-out — up to ~30/hour —
 # outpaces the probing (used by the usage store's failure backoff)...
-EDGE_BACKOFF_S = 300.0
+EDGE_BACKOFF_S = scaled(300.0)
 # ...and while any 429 was seen on the token within this window, floor the
 # planned cadence here so freed capacity accumulates instead of being
 # re-spent. The window matches the saturation horizon: a full trailing hour
 # takes up to 60 minutes to age out.
-POST_429_MIN_INTERVAL_S = 360.0
-RECENT_429_WINDOW_S = 3600.0
+POST_429_MIN_INTERVAL_S = scaled(360.0)
+RECENT_429_WINDOW_S = scaled(3600.0)
 
 # AIMD on a contended budget. The budget is shared across every machine
 # polling the same account (under the account-scoped regime a machine with its
@@ -135,7 +136,7 @@ RECENT_429_WINDOW_S = 3600.0
 # the budget gets fair-shared by reaction alone, with no machine count or
 # shared state to configure.
 POST_429_BACKOFF_MULT = 1.5
-POST_429_MAX_INTERVAL_S = 1800.0
+POST_429_MAX_INTERVAL_S = scaled(1800.0)
 
 # The engine escalates to a full candidate refresh when the active account is
 # within this margin of the threshold (decision policy, but the urgent-mode
@@ -144,7 +145,7 @@ ESCALATION_MARGIN_PCT = 15.0
 
 # Never schedule a poll later than a known window reset (+ slack): stored
 # usage is obsolete the moment the window rolls over.
-RESET_SLACK_S = 60.0
+RESET_SLACK_S = scaled(60.0)
 
 
 def binding_pct(usage: dict | None, models: tuple[str, ...] = ()) -> float | None:
