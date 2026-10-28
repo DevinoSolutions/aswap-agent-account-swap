@@ -1375,7 +1375,7 @@ class AutoSwitchEngine:
         # about the CHOICE, so it belongs where the choice is made rather than
         # in this census of what exists. See `_no_return_account` for the
         # incident, the scoping, and the release.
-        api_key_candidates = (
+        metered_candidates = (
             [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
             if settings.include_api_key_accounts
             else []
@@ -1403,7 +1403,7 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
-        if not oauth_candidates and not api_key_candidates:
+        if not oauth_candidates and not metered_candidates:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -1535,11 +1535,11 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if not ordered and metered_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
-            ordered = api_key_candidates
+            ordered = metered_candidates
 
         if not ordered:
             if not any_known:
