@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from claude_swap import oauth, pace, poll_policy, usage_store
+from claude_swap import gate, oauth, pace, poll_policy, usage_store
 
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
@@ -55,6 +55,10 @@ def _window_to_json(entry: dict) -> dict:
     cell = oauth.fresh_reset_strings(entry)
     if cell:
         out["countdown"], out["clock"] = cell
+    # Additive: the rate-limit gate's answer when a fresh probe qualifies
+    # this window ({status: open|blocked, pct, probedAt}; see gate.py).
+    if isinstance(entry.get("gate"), dict):
+        out["gate"] = gate.gate_to_json(entry["gate"])
     return out
 
 
