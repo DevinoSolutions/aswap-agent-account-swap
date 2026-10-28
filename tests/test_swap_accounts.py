@@ -417,7 +417,7 @@ class TestSwapAccounts:
         entered: list[object] = []
 
         class SpyLock:
-            def __init__(self, path):
+            def __init__(self, path, **_kw):
                 self.path = path
 
             def __enter__(self):
@@ -430,7 +430,15 @@ class TestSwapAccounts:
         monkeypatch.setattr("claude_swap.switcher.FileLock", SpyLock)
         switcher.swap_accounts("1", "2")
 
-        assert entered == [switcher.lock_file]
+        # The engine state lock, both slots' consume locks, then the account
+        # lock: the order the engine and the consume gate use.
+        cred = switcher.credentials_dir
+        assert entered == [
+            switcher.backup_dir / ".autoswitch_state.lock",
+            cred / ".consume-1.lock",
+            cred / ".consume-2.lock",
+            switcher.lock_file,
+        ]
 
     def test_swap_moves_session_profiles(
         self, temp_home: Path, sample_sequence_data: dict

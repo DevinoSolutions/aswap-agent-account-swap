@@ -11,7 +11,7 @@ from pathlib import Path
 
 from claude_swap import __version__, endpoints, paths, printer, statedb
 from claude_swap.codex import CodexAccountSwitcher
-from claude_swap.exceptions import ClaudeSwitchError, ConfigError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError, ValidationError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
     accent,
@@ -484,6 +484,124 @@ Examples:
             print(f"{accent('Moved')} {email} to slot {num_target}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _renumber_command(argv: list[str]) -> None:
+    """Handle `aswap renumber [--by-email] [--dry-run] [--yes] [--json]`.
+
+    Packs every Claude account's slot number to 1..N with the same machinery
+    as `aswap move`. Pre-dispatched before the main parser for the same
+    reason as `alias`.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} renumber",
+        description=(
+            "Renumber every account to 1..N. By default the current list "
+            "order is kept; --by-email orders by email (then organization), "
+            "so two machines with the same accounts get the same numbers. "
+            "Aliases, backups, session history, cached usage and the "
+            "auto-switch state move with each account, a safety snapshot is "
+            "taken first, and a running `aswap auto` keeps working. Codex "
+            "accounts are not renumbered."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  aswap renumber --dry-run        show old -> new, change nothing
+  aswap renumber                  keep list order, close the gaps
+  aswap renumber --by-email --yes same numbering on every machine
+        """,
+    )
+    parser.add_argument(
+        "--by-email",
+        action="store_true",
+        help="Order by email, then organization (stable across machines)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print the mapping; change nothing"
+    )
+    parser.add_argument(
+        "--yes", "-y", action="store_true", help="Do not ask for confirmation"
+    )
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    json_mode = args.json
+
+    def show_mapping(rows: list[dict]) -> None:
+        width = max((len(str(r["from"])) for r in rows), default=1)
+        for row in rows:
+            old, new = row["from"], row["to"]
+            label = f"  {str(old).rjust(width)} -> {new}: {row['email']}"
+            print(label if old != new else dimmed(label))
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        with _json_stdout_guard(json_mode):
+            preview = switcher.renumber_preview(by_email=args.by_email)
+        count = len(preview["accounts"])
+
+        if not preview["changed"] or args.dry_run:
+            if json_mode:
+                print(json.dumps(
+                    {"schemaVersion": 1, "dryRun": bool(args.dry_run),
+                     "renumbered": False, "snapshot": None, **preview},
+                    indent=2,
+                ))
+                return
+            if not preview["changed"]:
+                print(f"{dimmed('Already numbered')} 1..{count}; nothing to do.")
+                return
+            print(f"Would renumber {count} account(s) "
+                  f"({len(preview['moves'])} move(s)):")
+            show_mapping(preview["accounts"])
+            return
+
+        if not args.yes:
+            if json_mode:
+                raise ValidationError(
+                    "renumber --json needs --yes (or --dry-run): it cannot prompt"
+                )
+            print(f"Renumber {count} account(s) to 1..{count} "
+                  f"({len(preview['moves'])} move(s)):")
+            show_mapping(preview["accounts"])
+            try:
+                answer = input("Continue? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print(f"\n{dimmed('Cancelled')}")
+                return
+            if answer not in ("y", "yes"):
+                print(dimmed("Cancelled"))
+                return
+
+        with _json_stdout_guard(json_mode):
+            result = switcher.renumber_accounts(
+                by_email=args.by_email, expected=preview["accounts"]
+            )
+        if json_mode:
+            print(json.dumps(
+                {"schemaVersion": 1, "dryRun": False,
+                 "renumbered": bool(result["changed"]), **result},
+                indent=2,
+            ))
+            return
+        print(f"{accent('Renumbered')} {count} account(s) to 1..{count}:")
+        show_mapping(result["accounts"])
+        if result.get("snapshot"):
+            print(dimmed(
+                f"Snapshot {result['snapshot']} holds the old numbering "
+                f"(undo: aswap backup restore --all --at {result['snapshot']})"
+            ))
+    except ClaudeSwitchError as e:
+        if json_mode:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
@@ -1805,6 +1923,9 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    if argv and argv[0] == "renumber":
+        _renumber_command(argv[1:])
+        return
 
     # Bare `aswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -1843,6 +1964,7 @@ Commands:
   %(prog)s alias                      list all aliases
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
+  %(prog)s renumber [--by-email]      renumber every account to 1..N
   %(prog)s codex <command>            manage Codex CLI accounts
   %(prog)s backup [take|list|check|restore|export]  snapshots of state.db; crash restore
   %(prog)s billing <command>          exact billing, weekly resets, resub plan

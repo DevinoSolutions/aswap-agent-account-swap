@@ -408,6 +408,18 @@ class GateStore:
             and row.get("organizationUuid", "") == identity[1]
         )
 
+    def rekey(self, moves: Mapping[str, tuple[str, Identity]]) -> None:
+        """Carry rows to the accounts' new slot numbers after a move/renumber
+        (``moves``: old -> (new, identity)); see ``renumber.rekey_rows``."""
+        from claude_swap.renumber import rekey_rows
+
+        with FileLock(self._lock_path):
+            rows, changed = rekey_rows(self._read_rows(), dict(moves))
+            if changed:
+                atomic_write_json(
+                    self.path, {"schemaVersion": SCHEMA_VERSION, "accounts": rows}
+                )
+
     def records(self, identities: Mapping[str, Identity]) -> dict[str, dict]:
         rows = self._read_rows()
         return {

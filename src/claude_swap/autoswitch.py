@@ -48,7 +48,7 @@ from typing import ClassVar
 
 from claude_swap.endpoints import scaled  # test-only clock scale (1.0 outside tests)
 from claude_swap import gate, live_usage, oauth, poll_policy, snapshots, statedb
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, RosterChangedError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
@@ -297,6 +297,15 @@ class BurnTracker:
     def record(self, now: float, account: str, used_pct: float, capacity: float) -> None:
         self._samples.append((now, account, used_pct, capacity))
         self._samples = [s for s in self._samples if now - s[0] <= BURN_WINDOW_S]
+
+    def renumber(self, mapping: dict[str, str]) -> None:
+        """Follow a renumber (``mapping``: old -> new for every account still
+        on the roster); samples of accounts that left are dropped."""
+        self._samples = [
+            (t, mapping[str(a)], pct, cap)
+            for t, a, pct, cap in self._samples
+            if str(a) in mapping
+        ]
 
     def rate(self) -> float | None:
         burned = span = 0.0
@@ -988,6 +997,10 @@ class AutoSwitchEngine:
         # Active account as of the last plan re-check: a change re-reads a
         # plan cached as lapsed at once (see ``_recheck_plans``).
         self._plan_seen_active: str | None = None
+        # The roster as of this tick, number -> (email, organization uuid).
+        # Slot numbers can change under a running engine (``aswap renumber``,
+        # ``move``, ``swap`` from another process); see ``_follow_roster``.
+        self._roster: dict[str, tuple[str, str]] | None = None
         self._warmup: WarmupEngine | None = None
         self._next_warmup_at: float | None = None
         if settings.warmup_five_hour:
@@ -1097,9 +1110,18 @@ class AutoSwitchEngine:
         if not isinstance(quarantine, dict) or not quarantine:
             return state
         to_release: list[tuple[str, str, str]] = []
+        # A quarantined account that now lives under another number (a
+        # renumber/move the roster commit could not remap, e.g. an entry
+        # written by an engine that decided on the old numbers) keeps its
+        # quarantine there, as long as it is provably the same lineage.
+        to_move: dict[str, str] = {}
         for number, entry in quarantine.items():
             email_now = self.switcher.account_email(number)
             if not email_now or email_now != entry.get("email"):
+                moved_to = self._quarantine_moved_to(number, entry, quarantine)
+                if moved_to is not None and moved_to not in to_move.values():
+                    to_move[number] = moved_to
+                    continue
                 to_release.append(
                     (number, entry.get("email", ""), "account-replaced")
                 )
@@ -1108,7 +1130,7 @@ class AutoSwitchEngine:
             fingerprint = _refresh_fingerprint(creds) if creds else None
             if fingerprint != entry.get("refreshTokenFingerprint"):
                 to_release.append((number, email_now, "credentials-replaced"))
-        if not to_release:
+        if not to_release and not to_move:
             return state
 
         def drop(s: dict) -> None:
@@ -1116,11 +1138,104 @@ class AutoSwitchEngine:
             if isinstance(q, dict):
                 for number, _, _ in to_release:
                     q.pop(number, None)
+                moved = {
+                    new: q.pop(old) for old, new in to_move.items() if old in q
+                }
+                for new, entry in moved.items():
+                    q.setdefault(new, entry)
 
         state = self._mutate_state(drop)
         for number, email, reason in to_release:
             self._emit(UnquarantineEvent(number=number, email=email, reason=reason))
         return state
+
+    def _quarantine_moved_to(
+        self, number: str, entry: dict, quarantine: dict
+    ) -> str | None:
+        """The one other number holding ``entry``'s account and lineage, if any.
+
+        Same email, exactly one such slot, not already quarantined, and the
+        stored refresh-token fingerprint unchanged: the account moved, it was
+        not re-captured, so the dead lineage is still dead.
+        """
+        email = entry.get("email")
+        fingerprint = entry.get("refreshTokenFingerprint")
+        if not email or not fingerprint:
+            return None
+        try:
+            roster = self.switcher.roster_identities()
+        except Exception:  # noqa: BLE001 - fall back to releasing
+            return None
+        hits = [n for n, (e, _org) in roster.items() if e == email and n != number]
+        if len(hits) != 1 or hits[0] in quarantine:
+            return None
+        creds = self.switcher.read_account_credentials(hits[0], email)
+        if not creds or _refresh_fingerprint(creds) != fingerprint:
+            return None
+        return hits[0]
+
+    # -- roster changes under a running engine --------------------------------
+
+    def _follow_roster(self) -> None:
+        """Keep this engine's slot-keyed memory on the right accounts.
+
+        Another process may renumber, move or swap accounts while this engine
+        runs. The persisted state follows in the same transaction as the
+        roster (``ClaudeAccountSwitcher._commit_roster``) and every switch
+        names the account it expects (``switch_to(expect=...)``), so a stale
+        number can neither switch to the wrong account nor misattribute a
+        quarantine. What is left is this process's own memory: the previous
+        active account, the plan re-check marker, logged gate verdicts, a dry
+        run's hold and the burn samples. They are translated by identity here,
+        once per tick; an account that left (or whose identity is ambiguous)
+        is dropped.
+        """
+        try:
+            roster = self.switcher.roster_identities()
+        except Exception:  # noqa: BLE001 - next tick tries again
+            return
+        prev, self._roster = self._roster, roster
+        if prev is None or prev == roster:
+            return
+        counts: dict[tuple[str, str], int] = {}
+        for identity in roster.values():
+            counts[identity] = counts.get(identity, 0) + 1
+        by_identity = {identity: num for num, identity in roster.items()}
+        mapping = {
+            num: by_identity[identity]
+            for num, identity in prev.items()
+            if counts.get(identity) == 1
+        }
+        if all(old == new for old, new in mapping.items()) and len(mapping) == len(prev):
+            return  # accounts added only: nothing moved
+
+        def tr(value: object) -> str | None:
+            return mapping.get(str(value)) if value is not None else None
+
+        _logger.info(
+            "Account numbers changed under the running engine: %s",
+            ", ".join(f"{o}->{n}" for o, n in sorted(mapping.items()) if o != n) or "-",
+        )
+        self._last_seen = tr(self._last_seen)
+        self._plan_seen_active = tr(self._plan_seen_active)
+        self._gate_logged = {
+            new: v for k, v in self._gate_logged.items() if (new := tr(k)) is not None
+        }
+        if isinstance(self._dry_hold, dict):
+            account = tr(self._dry_hold.get("account"))
+            self._dry_hold = (
+                {**self._dry_hold, "account": account} if account is not None else None
+            )
+        # The state file's lastSeenActive was remapped with the roster; a dry
+        # run compares against the value it last read, so follow it too.
+        if self._stored_seen is not None and str(self._stored_seen) in mapping:
+            new_seen = mapping[str(self._stored_seen)]
+            self._stored_seen = (
+                int(new_seen) if isinstance(self._stored_seen, int) else new_seen
+            )
+        self._hold_noted = None
+        self.manual_hold = None
+        self._burn.renumber(mapping)
 
     # -- freshening -----------------------------------------------------------
 
@@ -1262,6 +1377,7 @@ class AutoSwitchEngine:
         self._time_to_limit = None
         self._limit_guard = False
         self.manual_hold = None
+        self._follow_roster()
         self._reload_settings()
         settings = self.settings
         self._caps = {
@@ -3130,7 +3246,31 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
+            # The account this tick decided on, by identity: if another
+            # process renumbered/moved accounts since, the number may now
+            # name someone else, and switch_to refuses (under its lock)
+            # instead of activating them. The next tick decides afresh.
+            roster = (
+                self._roster
+                if self._roster is not None
+                else self.switcher.roster_identities()
+            )
+            expect = roster.get(str(number))
+            if expect is None or expect[0] != email:
+                self._emit(
+                    NoSwitchEvent(
+                        reason="roster-changed",
+                        detail=f"account {number} changed since this tick began",
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            try:
+                result = self.switcher.switch_to(
+                    number, json_output=True, expect=expect
+                )
+            except RosterChangedError as e:
+                self._emit(NoSwitchEvent(reason="roster-changed", detail=str(e)))
+                return TickOutcome.NO_ACTION
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(

@@ -76,7 +76,7 @@ class TestMoveAccount:
         entered: list[object] = []
 
         class SpyLock:
-            def __init__(self, path):
+            def __init__(self, path, **_kw):
                 self.path = path
 
             def __enter__(self):
@@ -89,7 +89,17 @@ class TestMoveAccount:
         monkeypatch.setattr("claude_swap.switcher.FileLock", SpyLock)
         switcher.move_account("2", "5")
 
-        assert entered == [switcher.lock_file]
+        # Lock order shared with the engine and the consume gate: the engine
+        # state lock, the consume locks of every number involved (ascending),
+        # then the account lock -- each taken once.
+        cred = switcher.credentials_dir
+        assert entered == [
+            switcher.backup_dir / ".autoswitch_state.lock",
+            cred / ".consume-1.lock",
+            cred / ".consume-2.lock",
+            cred / ".consume-5.lock",
+            switcher.lock_file,
+        ]
 
     def test_relocate_rechecks_target(
         self, temp_home: Path, sample_sequence_data: dict
@@ -112,7 +122,7 @@ class TestMoveAccount:
         entered: list[object] = []
 
         class SpyLock:
-            def __init__(self, path):
+            def __init__(self, path, **_kw):
                 self.path = path
 
             def __enter__(self):
@@ -126,7 +136,8 @@ class TestMoveAccount:
         num_src, num_target, swapped = switcher.move_account("1", "2")
 
         assert (num_src, num_target, swapped) == ("1", "2", True)
-        assert entered == [switcher.lock_file]
+        assert entered.count(switcher.lock_file) == 1
+        assert entered[-1] == switcher.lock_file
 
     def test_move_unbacked_account_clears_stale_target_key(
         self, temp_home: Path, sample_sequence_data: dict
