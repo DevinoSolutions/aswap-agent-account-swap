@@ -28,6 +28,12 @@ from claude_swap.tui.theme import Palette
 if TYPE_CHECKING:
     from claude_swap.tui.app import AswapApp
 
+# Under a "needs login" card: the TUI runs the auto engine, whose auto-add
+# (``autoswitch.autoAddAccounts``, on by default) re-captures the slot.
+NEEDS_LOGIN_CARD_HINT = (
+    "└ log in with Claude Code (/login): auto picks it up (or run: aswap add)"
+)
+
 _BAR_FILLED = "━"
 _BAR_HALF = "╸"
 _BAR_EMPTY = "─"
@@ -214,6 +220,9 @@ def account_card_text(
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
+    if acc.needs_login:
+        text.append("\n    ")
+        text.append(NEEDS_LOGIN_CARD_HINT, style=palette.muted)
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:

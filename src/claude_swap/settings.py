@@ -71,6 +71,11 @@ class AutoSwitchSettings:
     # OPTIONAL moves (consume-first). Moves that protect the session — at the
     # limit, over the threshold, failover — still happen. 0 disables.
     manual_hold_minutes: float = 60.0
+    # A Claude Code `/login` aswap does not manage yet is added to the next
+    # free slot by `aswap auto` (and the TUI's engine) once it has been
+    # stable for two polls, and a re-login for a managed slot refreshes its
+    # stored credential — no `aswap add` by hand. OAuth logins only.
+    auto_add_accounts: bool = True
 
 
 @dataclass(frozen=True)
@@ -111,7 +116,12 @@ _SECTION_DEFAULT_SOURCES = {
 # reading the file wrong spends quota, changes what is kept on disk, or
 # stops aswap doing the job it was left running to do.
 _STRICT_BOOL_KEYS = frozenset(
-    {"autoswitch.enabled", "autoswitch.warmupFiveHour", "profiles.persistent"}
+    {
+        "autoswitch.enabled",
+        "autoswitch.warmupFiveHour",
+        "autoswitch.autoAddAccounts",
+        "profiles.persistent",
+    }
 )
 
 
@@ -192,6 +202,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "manualHoldMinutes", "manual_hold_minutes", "float",
             0.0, 1440.0,
             help="Minutes auto leaves a hand-picked account alone (0 = off)",
+        ),
+        SettingSpec(
+            "autoswitch", "autoAddAccounts", "auto_add_accounts", "bool",
+            help="Let aswap auto add new Claude Code logins (no aswap add)",
         ),
         SettingSpec(
             "profiles", "persistent", "persistent", "bool",

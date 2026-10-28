@@ -888,6 +888,14 @@ class AutoSwitchEngine:
         self._dry_hold: dict | None = None
         self.manual_hold: tuple[str, float] | None = None
         self._hold_noted: tuple[tuple[str, float], float] | None = None
+        # Auto-add (``autoswitch.autoAddAccounts``): the previous tick's
+        # live-login observation — a login is adopted only once two
+        # consecutive polls agree — and a once-per-process hint when off.
+        self._live_login_seen: object = None
+        self._auto_add_hinted = False
+        # Active account as of the last plan re-check: a change re-reads a
+        # plan cached as lapsed at once (see ``_recheck_plans``).
+        self._plan_seen_active: str | None = None
         self._warmup: WarmupEngine | None = None
         self._next_warmup_at: float | None = None
         if settings.warmup_five_hour:
@@ -1180,7 +1188,9 @@ class AutoSwitchEngine:
             else {}
         )
 
+        self._auto_add_live_login()
         current = self.switcher.current_account_number()
+        self._recheck_plans(current)
         if current is None:
             self._emit(
                 PollEvent(active=None, headroom={}, threshold=settings.threshold)
@@ -1191,7 +1201,11 @@ class AutoSwitchEngine:
                 self._emit(
                     NoSwitchEvent(
                         reason="unmanaged-active-account",
-                        detail="run 'aswap --add-account' to include it in rotation",
+                        detail=(
+                            "added automatically once the login is stable"
+                            if settings.auto_add_accounts and not self.dry_run
+                            else "run 'aswap --add-account' to include it in rotation"
+                        ),
                     )
                 )
             else:
@@ -1706,6 +1720,63 @@ class AutoSwitchEngine:
         return TickOutcome.BLOCKED
 
     # -- manual hold ------------------------------------------------------------
+
+    def _auto_add_live_login(self) -> None:
+        """Add a new Claude Code login (or re-capture a re-login) unasked.
+
+        Acts only when this poll's observation of the live login equals the
+        previous poll's — identity AND credential lineage — so a ``/login``
+        still being written, or a switch landing between polls, is never
+        adopted; the switcher then re-checks everything under the switch
+        locks. Never in a dry run (it writes the roster). With
+        ``autoswitch.autoAddAccounts`` off, today's behaviour stays and an
+        unmanaged live login gets one hint per process.
+        """
+        if self.dry_run:
+            return
+        try:
+            if not self.settings.auto_add_accounts:
+                if (
+                    not self._auto_add_hinted
+                    and self.switcher.current_account_number() is None
+                    and self.switcher.has_live_login()
+                ):
+                    self._auto_add_hinted = True
+                    _logger.info(
+                        "The live Claude Code login is not managed and "
+                        "autoswitch.autoAddAccounts is off; run 'aswap add' "
+                        "to include it."
+                    )
+                return
+            observe = getattr(self.switcher, "observe_live_login", None)
+            if observe is None:
+                return
+            seen = observe()
+            previous, self._live_login_seen = self._live_login_seen, seen
+            if seen is None or seen != previous:
+                return
+            self.switcher.adopt_live_login(seen)
+        except Exception:
+            _logger.debug("auto-add pass failed", exc_info=True)
+
+    def _recheck_plans(self, current: str | None) -> None:
+        """Re-read plans cached as lapsed: the active account's at once when
+        it changed (a switch by anyone, an in-app ``/login``), and every
+        lapsed slot in the background every few minutes — profile endpoint
+        only, so a usage 429 backoff cannot hold a revived plan hostage."""
+        if self.dry_run:
+            return
+        try:
+            if current is not None and current != self._plan_seen_active:
+                recheck = getattr(self.switcher, "recheck_plan_if_lapsed", None)
+                if recheck is not None:
+                    recheck(current)
+            self._plan_seen_active = current
+            background = getattr(self.switcher, "recheck_lapsed_plans", None)
+            if background is not None:
+                background()
+        except Exception:
+            _logger.debug("lapsed-plan re-check failed", exc_info=True)
 
     def _manual_hold_until(self, state: dict, current: str) -> float | None:
         """Notice a switch made outside this engine; when its hold ends.

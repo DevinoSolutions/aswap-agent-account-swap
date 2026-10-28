@@ -18,6 +18,7 @@ from claude_swap import macos_keychain
 
 from claude_swap.exceptions import (
     AccountNotFoundError,
+    ClaudeSwitchError,
     ConfigError,
     CredentialReadError,
     LockError,
@@ -52,7 +53,15 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
-from claude_swap.billing import BillingCache, billing_text, billing_view, looks_lapsed
+from claude_swap import live_login
+from claude_swap.billing import (
+    LAPSED_RECHECK_S,
+    PLAN_RECHECK_MIN_S,
+    BillingCache,
+    billing_text,
+    billing_view,
+    looks_lapsed,
+)
 from claude_swap.billing_session import SessionStore
 from claude_swap.weekly_anchor import (
     WeeklyAnchorStore,
@@ -142,6 +151,10 @@ _TORN_READ_DELAY_S = 0.05
 # An account cached as lapsed but reporting live usage gets its plan re-read
 # at most this often (one profile request each time).
 LIVE_RECHECK_S = 10 * 60.0
+# Auto-add waits this long for the account lock before deferring to the next
+# poll: a switch holds it for local I/O only, and an auto-add that queued
+# behind one would only find the live login moved anyway.
+_AUTO_ADD_LOCK_TIMEOUT_S = 2.0
 
 # Outcome vocabulary for one profile → store reconciliation attempt. Closed
 # set: every refusal names itself, so a slot that stops being synced says
@@ -280,7 +293,10 @@ SENTINEL_NOTES = {
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
-    USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: aswap add",
+    USAGE_RELOGIN_REQUIRED: (
+        "re-login needed — refresh token dead; log in with Claude Code "
+        "(a running aswap auto picks it up; without it: aswap add)"
+    ),
 }
 
 
@@ -459,6 +475,10 @@ class ClaudeAccountSwitcher:
         # Slot -> monotonic time its plan was last re-read because live usage
         # contradicted a cached lapse; see note_live_usage.
         self._live_rechecked: dict[str, float] = {}
+        # Live-login observations (identity + credential fingerprint) the
+        # profile endpoint said belong to someone else: never adopted, and not
+        # probed again until the login moves. See adopt_live_login.
+        self._adopt_refused: set[live_login.LiveLogin] = set()
 
         # Definitive ownership verdicts for credential lineages, keyed by
         # _lineage_key (slot, caller email, stored email, org, uuid,
@@ -2067,6 +2087,50 @@ class ClaudeAccountSwitcher:
         except Exception:
             self._logger.debug("lapse tracking failed", exc_info=True)
 
+    def recheck_plan_if_lapsed(self, num: str) -> None:
+        """Re-read the plan of an account that just became active, if it is
+        cached as lapsed (canceled, past due, free).
+
+        Called on every switch and by ``aswap auto`` when the active account
+        changes or a new login for it is captured: an account the owner just
+        re-subscribed is typically the one they switch to next. Only the
+        cheap profile request, never the usage endpoint, so a usage 429
+        backoff does not delay it. Best-effort; never raises.
+        """
+        self._recheck_lapsed([str(num)], PLAN_RECHECK_MIN_S, stagger=False)
+
+    def recheck_lapsed_plans(self) -> None:
+        """Background pass: re-read every slot cached as lapsed, each at most
+        once per ``LAPSED_RECHECK_S`` (staggered per slot) across processes.
+
+        2026-10-27: a revived subscription showed "canceled" for the hour its
+        usage poll was backed off, until ``aswap billing tier`` re-read it.
+        Run each ``aswap auto`` tick; a no-op unless something is due.
+        """
+        self._recheck_lapsed(None, LAPSED_RECHECK_S, stagger=True)
+
+    def _recheck_lapsed(
+        self, nums: list[str] | None, min_age: float, *, stagger: bool
+    ) -> None:
+        try:
+            accounts = (self._get_sequence_data() or {}).get("accounts", {})
+            identities = {
+                num: (acct["email"], acct.get("organizationUuid") or "")
+                for num, acct in accounts.items()
+                if isinstance(acct, dict) and acct.get("email")
+                and (nums is None or num in nums)
+            }
+            if not identities:
+                return
+            due = self._billing.claim_plan_checks(identities, min_age, stagger=stagger)
+            if not due:
+                return
+            info = [i for i in self._build_accounts_info() if str(i[0]) in due]
+            if info:
+                self._billing.check_tiers(info)
+        except Exception:
+            self._logger.debug("Lapsed-plan re-check failed", exc_info=True)
+
     def _observe_usage(self, num: str, identity: tuple[str, str], usage: dict) -> None:
         """UsageStore hook: remember the account's weekly reset anchor."""
         try:
@@ -2232,6 +2296,19 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(str(account_num))
         mark = record.get("needsLogin") if record else None
         return isinstance(mark, dict) and bool(mark.get("storeFp"))
+
+    def needs_login_hint(self) -> str:
+        """What to do about a "needs login" slot, per ``autoAddAccounts``."""
+        try:
+            auto_add = load_settings(self.backup_dir).auto_add_accounts
+        except Exception:
+            auto_add = True
+        if auto_add:
+            return (
+                "Log in with Claude Code (/login); a running aswap auto "
+                "picks the login up automatically."
+            )
+        return "Log in with Claude Code (/login), then run: aswap add"
 
     def is_account_needs_login(self, account_num: str) -> bool:
         """Whether a slot is waiting for its owner to log in again."""
@@ -4328,6 +4405,220 @@ class ClaudeAccountSwitcher:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
+    # -- auto-add (aswap auto) ------------------------------------------------
+
+    def observe_live_login(self) -> live_login.LiveLogin | None:
+        """Claude Code's live login right now, without its token (local reads).
+
+        The identity comes from ``~/.claude.json``'s ``oauthAccount`` and the
+        credential from the same store ``add_account`` captures from, so an
+        observation describes exactly what an add would write. None when
+        there is no live identity or the store cannot be read this pass.
+        """
+        try:
+            config = self._read_json(self._get_claude_config_path())
+            if not config:
+                return None
+            creds = self._read_capture_credentials()
+        except (ClaudeSwitchError, OSError):
+            return None
+        return live_login.observe(config.get("oauthAccount"), creds)
+
+    def _probe_live_login_owner(self, creds: str) -> dict | None:
+        """Whose token the live credential is, per ``/api/oauth/profile``."""
+        return oauth.fetch_oauth_profile(oauth.extract_access_token(creds) or "")
+
+    def _adopt_reason(self, num: str, seen: live_login.LiveLogin) -> str | None:
+        """Why slot ``num`` should take the live credential ``seen``, or None.
+
+        Never when the slot already holds the same lineage. Otherwise when
+        the slot waits for a re-login (``needs-login``), its stored
+        credential is gone or a husk (``wiped``), its lineage is provably
+        dead (``relogin-required``), or the live token was minted after the
+        stored one (``older``). A stored credential that outlives the live
+        one — aswap rotated the backup itself — is kept.
+        """
+        if self._account_kind(num) == "api_key":
+            return None
+        data = self._get_sequence_data() or {}
+        email = data.get("accounts", {}).get(num, {}).get("email", "")
+        org = data.get("accounts", {}).get(num, {}).get("organizationUuid", "") or ""
+        try:
+            stored = self._read_account_credentials(num, email) or ""
+        except ClaudeSwitchError:
+            return None
+        stored_fp = oauth.credential_fingerprint(stored)
+        if stored_fp == seen.fingerprint:
+            return None
+        if self._needs_login_from_data(data, num):
+            return "needs-login"
+        if live_login.credential_kind(stored) == live_login.KIND_PARTIAL:
+            return "wiped"
+        try:
+            entry = self._usage_store.entries({num: (email, org)}).get(num)
+            if entry is not None and entry.token_dead(stored_fp=stored_fp):
+                return "relogin-required"
+        except Exception:
+            self._logger.debug("dead-token lookup failed", exc_info=True)
+        stored_exp = (oauth.extract_oauth_data(stored) or {}).get("expiresAt")
+        if seen.expires_at is not None and (
+            not isinstance(stored_exp, (int, float)) or stored_exp < seen.expires_at
+        ):
+            return "older"
+        return None
+
+    def adopt_live_login(
+        self, seen: live_login.LiveLogin | None
+    ) -> tuple[str, str] | None:
+        """Add or re-capture a stable live OAuth login, as ``aswap add`` would.
+
+        ``aswap auto`` calls this once ``seen`` has held for two polls. A new
+        identity (email + organization) goes to the next free slot; a managed
+        one only refreshes its stored credential when ``_adopt_reason`` says
+        so. Returns ``("added" | "refreshed", slot)`` or None.
+
+        Races, in order:
+
+        * The credential is re-read and must still be ``seen`` (same refresh
+          lineage), else the login moved and the next polls decide again.
+        * The profile endpoint must say the token belongs to ``seen``'s
+          account. ``/login`` writes the credential and ``~/.claude.json``
+          separately, so for a moment one account's tokens sit under
+          another's identity; that pairing is refused (and remembered, so it
+          is not re-probed every poll).
+        * The write happens under aswap's account lock plus Claude Code's
+          credential and config locks — the switch path's locks, in its
+          order — after re-checking that the live login is still exactly
+          ``seen``. A switch in progress holds the lock; this defers to the
+          next poll instead of waiting long.
+
+        Never raises; anything unexpected skips this poll.
+        """
+        if (
+            seen is None
+            or seen.kind != live_login.KIND_OAUTH
+            or seen in self._adopt_refused
+        ):
+            return None
+        try:
+            self._refuse_session_shell()
+        except SwitchError:
+            return None  # an `aswap run` shell's live store is its profile
+        try:
+            data = self._get_sequence_data() or {}
+            slot = self._find_account_slot(data, seen.email, seen.org_uuid)
+            if slot is not None and self._adopt_reason(slot, seen) is None:
+                return None
+            if seen.expires_at is not None and oauth.is_oauth_token_expired(seen.expires_at):
+                return None  # cannot answer the probe; Claude Code refreshes on use
+            if self.observe_live_login() != seen:
+                return None
+            creds = self._read_capture_credentials() or ""
+            if oauth.credential_fingerprint(creds) != seen.fingerprint:
+                return None
+            resolved = self._probe_live_login_owner(creds)
+            if resolved is None:
+                self._logger.debug(
+                    "Could not confirm who the live login %s belongs to; retrying next poll.",
+                    seen.email,
+                )
+                return None
+            if not live_login.owner_matches(resolved, seen):
+                self._adopt_refused.add(seen)
+                self._logger.warning(
+                    "The live login names %s but its credential belongs to another "
+                    "account (a /login still being written?); not adding it.",
+                    seen.email,
+                )
+                return None
+            with (
+                FileLock(self.lock_file, timeout=_AUTO_ADD_LOCK_TIMEOUT_S),
+                claude_credentials_lock(),
+                claude_config_lock(),
+            ):
+                result = self._adopt_live_login_locked(seen)
+        except LockError:
+            self._logger.debug("Auto-add deferred: a switch holds the lock.")
+            return None
+        except Exception:
+            self._logger.warning("Auto-add of the live login failed.", exc_info=True)
+            return None
+        if result is not None:
+            self.recheck_plan_if_lapsed(result[1])
+        return result
+
+    def _adopt_live_login_locked(
+        self, seen: live_login.LiveLogin
+    ) -> tuple[str, str] | None:
+        """The writes of ``adopt_live_login``; caller holds the switch locks."""
+        config_path = self._get_claude_config_path()
+        config_text = config_path.read_text(encoding="utf-8")
+        oauth_account = json.loads(config_text).get("oauthAccount")
+        creds = self._read_capture_credentials() or ""
+        if live_login.observe(oauth_account, creds) != seen:
+            return None  # moved since the probe: a switch or another /login
+        email, org = seen.identity
+        self._setup_directories()
+        self._init_sequence_file()
+        data = self._get_sequence_data()
+        slot = self._find_account_slot(data, email, org)
+        if slot is None:
+            slot = str(self._get_next_account_number())
+            self._write_account_credentials(slot, email, creds, reason="relogin")
+            self._write_account_config(slot, email, config_text)
+            self._usage_store.clear_dead_token([slot], {slot: (email, org)})
+            data = self._get_sequence_data()
+            data["accounts"][slot] = {
+                "email": email,
+                "uuid": seen.account_uuid,
+                "organizationUuid": org,
+                "organizationName": oauth_account.get("organizationName", "") or "",
+                "added": get_timestamp(),
+            }
+            if int(slot) not in data["sequence"]:
+                data["sequence"].append(int(slot))
+                data["sequence"].sort()
+            data["activeAccountNumber"] = int(slot)
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+            self._logger.info(
+                "Auto-added account %s: %s (org: %s) from the live Claude Code login",
+                slot, email, org or "personal",
+            )
+            return ("added", slot)
+
+        reason = self._adopt_reason(slot, seen)
+        if reason is None:
+            return None
+        if reason == "older":
+            # The routine case: Claude Code rotated the active login and the
+            # backup still holds the spent predecessor. Same write as the
+            # usage path's rotated-backup resync.
+            self._write_account_credentials(slot, email, creds)
+            self._logger.debug(
+                "Account %s's stored credential refreshed from the newer live login.", slot
+            )
+            return ("refreshed", slot)
+        # A re-login: exactly add_account's refresh-in-place.
+        self._write_account_credentials(slot, email, creds, reason="relogin")
+        self._write_account_config(slot, email, config_text)
+        self._usage_store.clear_dead_token([slot], {slot: (email, org)})
+        data = self._get_sequence_data()
+        mark = data["accounts"][slot].get("needsLogin")
+        if isinstance(mark, dict) and mark.get("storeFp"):
+            # Resolved in place, as _note_profile_login does when the store
+            # is replaced: a session pane still holding the husk stays quiet.
+            mark["storeFp"] = None
+        data["activeAccountNumber"] = int(slot)
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        self._logger.info(
+            "Account %s logged in again (%s, %s); stored credential refreshed "
+            "from the live login, back in rotation.",
+            slot, email, reason,
+        )
+        return ("refreshed", slot)
+
     def add_account_from_token(
         self,
         token: str,
@@ -6358,13 +6649,16 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
-            if self._needs_login_from_data(seq_data, str(num)):
+            needs_login = self._needs_login_from_data(seq_data, str(num))
+            if needs_login:
                 markers += f" {yellowed('(needs login)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             bills = billing_text(billing.get(str(num)))
             week = weekly_text(weekly.get(str(num)))
             for line in _usage_entry_lines(entries[str(num)], bills, week):
                 print(f"     {line}")
+            if needs_login:
+                print(f"     {dimmed(self.needs_login_hint())}")
 
             if show_token_status:
                 for line in self._token_status_lines(accounts_info[i]):
@@ -6545,6 +6839,7 @@ class ClaudeAccountSwitcher:
             if needs:
                 names = ", ".join(f"Account-{n}" for n in needs)
                 print(f"  {yellowed(f'Needs login: {names}')}")
+                print(f"  {dimmed(self.needs_login_hint())}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
         return None
@@ -7577,6 +7872,11 @@ class ClaudeAccountSwitcher:
                     warning(msg)
                 else:
                     warnings_out.append(msg)
+
+        # The target is about to become active: if its plan is cached as
+        # lapsed, re-read it now (network, so before the locks) — the owner
+        # may just have re-subscribed it, and the listing below shows it.
+        self.recheck_plan_if_lapsed(target_account)
 
         # Pre-lock identity resolution (may hit the network — must happen
         # before the locks). Callers that already resolved (self-switch

@@ -683,6 +683,17 @@ def _no_billing_network(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_auto_add_network(monkeypatch):
+    """``aswap auto`` confirms who a new live login belongs to over the
+    network before adding it; the suite answers "unresolvable" (nothing is
+    added). test_auto_add.py patches the probe per test."""
+    monkeypatch.setattr(
+        "claude_swap.switcher.ClaudeAccountSwitcher._probe_live_login_owner",
+        lambda self, creds: None,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _deterministic_poll_jitter(monkeypatch):
     """Zero the poll-plan jitter so cadence tests are clock-exact; the jitter
     itself is exercised in test_poll_policy via an injected rng."""
