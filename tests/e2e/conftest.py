@@ -374,9 +374,11 @@ class Box:
         tests and a developer's real login keychain never meet."""
         kc = self.home / "Library" / "Keychains" / "login.keychain-db"
         kc.parent.mkdir(parents=True)
-        self.security("create-keychain", "-p", "", str(kc))
+        self.security("create-keychain", "-p", "", str(kc))  # created unlocked
         self.security("set-keychain-settings", str(kc))  # no auto-lock
-        self.security("unlock-keychain", "-p", "", str(kc))
+        # Best effort: unlocking a file named login.keychain-db is refused
+        # ("passphrase not correct") on the runners, though it is unlocked.
+        self.security("unlock-keychain", "-p", "", str(kc), check=False)
         done = self.security("default-keychain", check=False)
         default = done.stdout.strip().strip('"')
         if done.returncode != 0 or Path(default).resolve() != kc.resolve():
@@ -385,6 +387,10 @@ class Box:
                 f"the box keychain is not the default under its HOME: "
                 f"default-keychain -> {done.returncode} {default!r} {done.stderr.strip()!r}; "
                 f"list-keychains -> {search.stdout.strip()!r} {search.stderr.strip()!r}")
+        # A write and a read with no dialog, or fail here, fast and plainly.
+        self.security("add-generic-password", "-a", "probe", "-s", "aswap-e2e-probe", "-w", "ok")
+        read = self.security("find-generic-password", "-a", "probe", "-s", "aswap-e2e-probe", "-w")
+        assert read.stdout.strip() == "ok", "the box keychain did not read back a probe item"
         self.keychain = kc
 
     def live_credentials(self) -> dict | None:
