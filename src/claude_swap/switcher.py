@@ -123,6 +123,19 @@ KEYRING_SERVICE = "claude-code"
 # SECURITY_SERVICE and CLAUDE_CODE_KEYCHAIN_SERVICE now live in credentials.py
 # (storage concerns); re-exported above for migrations.py and the test suite.
 
+# Replace budget for the files ``_write_json`` publishes by rename, which in
+# practice means ``~/.claude.json``. Every running Claude Code re-reads that
+# file, and on Windows a rename onto a file ANY process has open fails with
+# ERROR_ACCESS_DENIED (Node opens with FILE_SHARE_DELETE; it does not help).
+# With ~35 sessions reading a ~470 KB config, the default ~0.75 s budget ran
+# out mid-switch (2026-10-27, twice), rolling the switch back. 60 attempts,
+# backoff capped at 0.1 s: ~5.4 s worst case, probing every 0.1 s for a gap
+# between readers. A switch makes this wait under Claude Code's config lock
+# (``~/.claude.json.lock``), which aswap touches every 3 s, so the lock never
+# goes stale (10 s) during it.
+_CONFIG_REPLACE_ATTEMPTS = 60
+_CONFIG_REPLACE_MAX_DELAY = 0.1
+
 # Setup-tokens are inference-only server-side; wider scopes trigger 403s
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
 SETUP_TOKEN_SCOPES = ("user:inference",)
@@ -711,7 +724,20 @@ class ClaudeAccountSwitcher:
         # making callers roll back around committed metadata).
         if sys.platform != "win32":
             os.chmod(temp_path, 0o600)
-        replace_with_retry(temp_path, path)
+        try:
+            replace_with_retry(
+                temp_path,
+                path,
+                attempts=_CONFIG_REPLACE_ATTEMPTS,
+                max_delay=_CONFIG_REPLACE_MAX_DELAY,
+            )
+        except BaseException:
+            # Don't leave a full copy of the config (and its keys) beside it.
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #
