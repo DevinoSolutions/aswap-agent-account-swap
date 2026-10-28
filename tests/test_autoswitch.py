@@ -7202,3 +7202,22 @@ class TestConsumeFirstEndingFirst:
         assert _perishable_ts(inputs, "2", {"seven_day": {}}, 100.0) == 500.0
         assert _perishable_ts(inputs, "2", {"seven_day": {}}, 600.0) is None
         assert _perishable_ts({"2": {"anchorNext": 500.0, "endsAt": 300.0}}, "2", None, 100.0) == 300.0
+
+
+class TestNeedsLoginSlots:
+    def test_auto_never_rotates_onto_a_slot_that_needs_login(self, harness):
+        """A slot whose session profile holds a wiped credential is kept but
+        skipped, even when its last measurement makes it the best target."""
+        data = harness.switcher._get_sequence_data()
+        data["accounts"]["2"]["needsLogin"] = {
+            "since": 1.0, "warnedAt": 1.0, "storeFp": "sha256:abc",
+        }
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+
+        outcome = harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(0), "3": _usage(40),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.to_ref["number"] == 3

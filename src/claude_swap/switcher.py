@@ -85,6 +85,7 @@ from claude_swap.printer import (
     ide_short_name,
     muted,
     warning,
+    yellowed,
 )
 from claude_swap.paths import (
     get_backup_root,
@@ -131,7 +132,10 @@ _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
 # times before giving up — and NEVER act on a blob that did not parse.
 _TORN_READ_ATTEMPTS = 3
 # A wiped profile stays wiped until the user logs in again, and the adoption
-# pass runs every few seconds: warn once per slot per hour, not 3,000 times.
+# pass runs every few seconds in every surface's process: warn when the slot
+# enters "needs login", then remind once per slot per hour, not 3,000 times.
+# The reminder clock is persisted on the slot (see `_note_profile_login`);
+# this in-memory map is only the fallback when that write fails.
 _WIPED_WARN_INTERVAL_S = 3600.0
 _wiped_warned_at: dict[str, float] = {}
 _TORN_READ_DELAY_S = 0.05
@@ -1964,6 +1968,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    needs_login=self._needs_login_from_data(seq_data, n),
                     billing=billing.get(n),
                     weekly=weekly.get(n),
                 )
@@ -2195,10 +2200,12 @@ class ClaudeAccountSwitcher:
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
 
-        Excludes slots without usable stored backups and slots the user has
-        disabled (``aswap disable``). Disabled slots stay managed and remain
-        valid explicit ``aswap switch <num|email>`` targets — they are only
-        held out of automatic rotation and the usage-aware strategies.
+        Excludes slots without usable stored backups, slots the user has
+        disabled (``aswap disable``) and slots that need a login (their
+        session profile holds a wiped credential). Both kinds stay managed
+        and remain valid explicit ``aswap switch <num|email>`` targets — they
+        are only held out of automatic rotation and the usage-aware
+        strategies.
         """
         data = self._get_sequence_data() or {}
         return [
@@ -2206,6 +2213,7 @@ class ClaudeAccountSwitcher:
             for num in data.get("sequence", [])
             if self._account_is_switchable(str(num))
             and not self._disabled_from_data(data, str(num))
+            and not self._needs_login_from_data(data, str(num))
         ]
 
     @staticmethod
@@ -2213,6 +2221,31 @@ class ClaudeAccountSwitcher:
         """Whether a slot is flagged out of rotation in already-loaded data."""
         record = data.get("accounts", {}).get(str(account_num))
         return bool(record and record.get("disabled"))
+
+    @staticmethod
+    def _needs_login_from_data(data: dict, account_num: str) -> bool:
+        """Whether a slot is waiting for a re-login (see ``_note_profile_login``).
+
+        A mark whose ``storeFp`` was cleared is resolved: the stored
+        credential was replaced while the profile still held the husk.
+        """
+        record = data.get("accounts", {}).get(str(account_num))
+        mark = record.get("needsLogin") if record else None
+        return isinstance(mark, dict) and bool(mark.get("storeFp"))
+
+    def is_account_needs_login(self, account_num: str) -> bool:
+        """Whether a slot is waiting for its owner to log in again."""
+        data = self._get_sequence_data() or {}
+        return self._needs_login_from_data(data, str(account_num))
+
+    def needs_login_account_numbers(self) -> list[str]:
+        """Managed slots waiting for a re-login, in sequence order."""
+        data = self._get_sequence_data() or {}
+        return [
+            str(num)
+            for num in data.get("sequence", [])
+            if self._needs_login_from_data(data, str(num))
+        ]
 
     def is_account_disabled(self, account_num: str) -> bool:
         """Whether a slot is currently held out of rotation."""
@@ -3196,6 +3229,7 @@ class ClaudeAccountSwitcher:
         session_dir = self._session_dir(account_num, email)
         blob, parsed_ok = self._settled_profile_read(session_dir)
         if blob is None:
+            self._note_profile_login(account_num, baseline, wiped=False)
             return None, PROFILE_SYNC_NO_PROFILE
         if not parsed_ok:
             self._logger.info(
@@ -3205,17 +3239,9 @@ class ClaudeAccountSwitcher:
             )
             return None, PROFILE_SYNC_UNREADABLE
         if oauth.is_wiped_credential(blob):
-            now = time.monotonic()
-            if now - _wiped_warned_at.get(str(account_num), float("-inf")) < _WIPED_WARN_INTERVAL_S:
-                return None, PROFILE_SYNC_WIPED
-            _wiped_warned_at[str(account_num)] = now
-            self._logger.warning(
-                "Account %s's session profile holds a wiped credential "
-                "(Claude Code's invalid_grant reaction); refusing to write it "
-                "into the store. The slot needs a re-login.",
-                account_num,
-            )
+            self._note_profile_login(account_num, baseline, wiped=True)
             return None, PROFILE_SYNC_WIPED
+        self._note_profile_login(account_num, baseline, wiped=False)
         prof_oauth = oauth.extract_oauth_data(blob) or {}
         if not (prof_oauth.get("accessToken") and prof_oauth.get("refreshToken")):
             return None, PROFILE_SYNC_INCOMPLETE
@@ -3252,6 +3278,109 @@ class ClaudeAccountSwitcher:
         ):
             return None, PROFILE_SYNC_NOT_NEWER
         return blob, PROFILE_SYNC_ADOPTED
+
+    def _note_profile_login(
+        self, account_num: str, baseline: str, *, wiped: bool
+    ) -> None:
+        """Keep the slot's "needs login" mark in step with its profile.
+
+        A wiped profile (Claude Code's ``invalid_grant`` husk) is a normal
+        state, not an incident: the slot is kept, held out of rotation and
+        shown as "needs login" until its owner logs in again. The mark lives
+        on the slot's own record in sequence.json — ``needsLogin: {since,
+        warnedAt, storeFp}`` — because every surface (``list``, ``auto``, the
+        TUI, the statusline) runs this pass in its own process, and a warning
+        throttled in one process's memory still repeated several times a
+        minute across them.
+
+        Transitions, each logged once:
+
+        * wiped, no mark          -> mark, WARNING
+        * wiped, store unchanged  -> hourly WARNING reminder
+        * wiped, store replaced   -> resolved (``storeFp`` cleared), INFO: an
+          ``aswap add --slot N`` landed while a live pane still holds the husk
+        * not wiped, any mark     -> mark dropped, INFO if it was unresolved
+
+        ``storeFp`` is the stored credential's fingerprint (a hash, never the
+        token). Caller holds ``self.lock_file`` — both callers of
+        ``_profile_credential_to_adopt`` do — so the roster write here is
+        serialized with every other one. Never raises: bookkeeping must not
+        break the adoption pass, which falls back to an in-memory throttle.
+        """
+        num = str(account_num)
+        try:
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(num)
+            if not isinstance(record, dict):
+                return
+            mark = record.get("needsLogin")
+            mark = mark if isinstance(mark, dict) else None
+            now = time.time()
+            if not wiped:
+                if mark is None:
+                    return
+                record.pop("needsLogin", None)
+                self._write_needs_login(data)
+                if mark.get("storeFp"):
+                    self._logger.info(
+                        "Account %s logged in again; back in rotation.", num
+                    )
+                return
+            store_fp = oauth.credential_fingerprint(baseline)
+            if mark is None:
+                record["needsLogin"] = {
+                    "since": now, "warnedAt": now, "storeFp": store_fp,
+                }
+                self._write_needs_login(data)
+                self._logger.warning(
+                    "Account %s's session profile holds a wiped credential "
+                    "(Claude Code's invalid_grant reaction); refusing to write "
+                    "it into the store. The slot is kept as 'needs login' and "
+                    "stays out of rotation until its owner logs in again.",
+                    num,
+                )
+                return
+            held_fp = mark.get("storeFp")
+            if not held_fp:
+                return  # resolved; quiet until the profile is re-seeded
+            if held_fp != store_fp:
+                mark["storeFp"] = None
+                self._write_needs_login(data)
+                self._logger.info(
+                    "Account %s logged in again (stored credential replaced); "
+                    "back in rotation.", num,
+                )
+                return
+            warned = mark.get("warnedAt")
+            if (
+                isinstance(warned, (int, float))
+                and now - warned < _WIPED_WARN_INTERVAL_S
+            ):
+                return
+            mark["warnedAt"] = now
+            self._write_needs_login(data)
+            self._logger.warning(
+                "Account %s still needs a re-login; it stays out of rotation "
+                "until then.", num,
+            )
+        except Exception:
+            self._logger.debug(
+                "Could not record account %s's login state.", num, exc_info=True
+            )
+            if not wiped:
+                return
+            mono = time.monotonic()
+            if mono - _wiped_warned_at.get(num, float("-inf")) < _WIPED_WARN_INTERVAL_S:
+                return
+            _wiped_warned_at[num] = mono
+            self._logger.warning(
+                "Account %s's session profile holds a wiped credential; the "
+                "slot needs a re-login.", num,
+            )
+
+    def _write_needs_login(self, data: dict) -> None:
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
 
     def _live_profile_owns(
         self, account_num: str, email: str, candidate_fp: str | None
@@ -3366,14 +3495,32 @@ class ClaudeAccountSwitcher:
         store, not a session profile, and ``_fetch_active_usage`` owns it.
 
         Cheap by construction: slots whose profile directory was never
-        created return ``no-profile`` after one ``exists()`` check.
+        created return ``no-profile`` after one ``exists()`` check — unless
+        the slot carries a "needs login" mark, which a vanished profile clears.
+
+        An ACTIVE slot carrying the mark is cleared once the live login holds
+        real tokens: the owner logged in again on the main login.
         """
+        try:
+            accounts = (self._get_sequence_data() or {}).get("accounts", {})
+            marked = {
+                str(n) for n, rec in accounts.items()
+                if isinstance(rec, dict) and rec.get("needsLogin")
+            }
+        except Exception:
+            marked = set()
         results: dict[str, str] = {}
-        for num, email, _org_name, org_uuid, is_active, _creds, _alias in accounts_info:
+        for num, email, _org_name, org_uuid, is_active, creds, _alias in accounts_info:
             if is_active:
+                if str(num) in marked and creds and not oauth.is_wiped_credential(creds):
+                    try:
+                        with FileLock(self.lock_file):
+                            self._note_profile_login(str(num), creds, wiped=False)
+                    except LockError:
+                        pass  # next pass
                 continue
             session_dir = self._session_dir(str(num), email)
-            if not session_dir.exists():
+            if not session_dir.exists() and str(num) not in marked:
                 continue
             results[str(num)] = self.sync_profile_credential(
                 str(num), email, org_uuid or ""
@@ -5744,6 +5891,7 @@ class ClaudeAccountSwitcher:
             if str(n) != str(current_num)
             and self._account_is_switchable(str(n))
             and not self._disabled_from_data(data, str(n))
+            and not self._needs_login_from_data(data, str(n))
         ]
         if not others:
             return None, "none"
@@ -5953,6 +6101,7 @@ class ClaudeAccountSwitcher:
                     last_good_usage=entry.last_good,
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
+                    needs_login=self._needs_login_from_data(seq_data, str(num)),
                     profile_path=str(self._session_dir(str(num), email)),
                     usage_deferred_reason=self._usage_deferred_reason(
                         str(num), email, entry
@@ -6209,6 +6358,8 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            if self._needs_login_from_data(seq_data, str(num)):
+                markers += f" {yellowed('(needs login)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             bills = billing_text(billing.get(str(num)))
             week = weekly_text(weekly.get(str(num)))
@@ -6387,9 +6538,37 @@ class ClaudeAccountSwitcher:
             )
             for line in _usage_entry_lines(entry):
                 print(f"  {line}")
+            hold = self._manual_hold_line(account_num)
+            if hold:
+                print(f"  {hold}")
+            needs = self.needs_login_account_numbers()
+            if needs:
+                names = ", ".join(f"Account-{n}" for n in needs)
+                print(f"  {yellowed(f'Needs login: {names}')}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
         return None
+
+    def _manual_hold_line(self, account_num: str) -> str | None:
+        """``auto: holding Account-N ... until HH:MM`` while a hand switch holds
+        off auto's optional moves (see ``autoswitch.OPTIONAL_TRIGGERS``)."""
+        # Imported here: autoswitch imports this module.
+        from claude_swap.autoswitch import STATE_FILENAME, clock_label, manual_hold_until
+
+        try:
+            state = json.loads(statedb.read_text(self.backup_dir / STATE_FILENAME))
+        except (OSError, ValueError):
+            return None
+        settings = load_settings(self.backup_dir)
+        until = manual_hold_until(
+            state, account_num, settings.manual_hold_minutes, time.time()
+        )
+        if until is None or not settings.enabled:
+            return None
+        return dimmed(
+            f"auto: holding Account-{account_num} (switched by hand) until "
+            f"{clock_label(until)}"
+        )
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""
@@ -6751,6 +6930,12 @@ class ClaudeAccountSwitcher:
                     warnings.append(f"Skipped Account-{candidate} (disabled)")
                 else:
                     print(f"{accent('Skipping')} Account-{candidate} (disabled)")
+                continue
+            if self._needs_login_from_data(data, candidate):
+                if json_output:
+                    warnings.append(f"Skipped Account-{candidate} (needs login)")
+                else:
+                    print(f"{accent('Skipping')} Account-{candidate} (needs login)")
                 continue
             if not self._account_is_switchable(candidate):
                 if json_output:

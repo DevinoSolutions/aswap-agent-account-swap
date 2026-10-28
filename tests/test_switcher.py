@@ -8620,6 +8620,28 @@ class TestDisableEnableAccount:
         assert "Skipping Account-2 (disabled)" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
+    def test_rotation_skips_a_slot_that_needs_login(self, temp_home, capsys):
+        """active=1, slot 2's profile holds a wiped credential — bare switch
+        must land on 3, and say why it skipped 2."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["needsLogin"] = {
+            "since": 1.0, "warnedAt": 1.0, "storeFp": "sha256:abc",
+        }
+        s._write_json(s.sequence_file, data)
+        capsys.readouterr()
+        self._make_live(temp_home, "a@example.com", 1)
+
+        with patch.object(s, "list_accounts"):
+            s.switch()
+
+        out = capsys.readouterr().out
+        assert "Skipping Account-2 (needs login)" in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
     def test_best_strategy_ignores_disabled_candidate(self, temp_home):
         """The only other switchable account is disabled → no candidate."""
         s = self._setup(temp_home)

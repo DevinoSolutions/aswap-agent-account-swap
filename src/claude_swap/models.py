@@ -140,6 +140,7 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    needs_login: bool = False  # profile holds a wiped credential; out of rotation
     billing: dict | None = None  # billing.billing_view: estimated next renewal
     weekly: dict | None = None  # weekly_anchor.weekly_view: remembered weekly reset
 

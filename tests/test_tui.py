@@ -82,6 +82,7 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
+    needs_login: bool = False,
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -94,6 +95,7 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
+        needs_login=needs_login,
     )
 
 
@@ -848,6 +850,25 @@ class TestDashboard:
             assert "● active" in panel  # still the active card
             # both the active card and the mini row carry the marker
             assert panel.count("(disabled)") == 2
+
+    async def test_needs_login_marker_on_active_card_and_mini(self, tmp_path):
+        # A slot whose session profile holds a wiped credential is kept and
+        # shown, marked so the owner knows to log in again.
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, needs_login=True),
+                make_account(2, needs_login=True),
+                make_account(3),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.widgets import AccountsPanel
+
+            panel = app.screen.query_one(AccountsPanel).render().plain
+            assert panel.count("(needs login)") == 2
 
     async def test_active_card_skips_absent_window_and_shows_scoped(self, tmp_path):
         fake = FakeSwitcher(

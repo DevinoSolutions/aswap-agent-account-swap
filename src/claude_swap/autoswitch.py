@@ -22,7 +22,11 @@ whose refresh token is dead gets quarantined instead of activated. When the
 active account's own usage becomes unreadable for ``unhealthy_ticks``
 consecutive ticks, the engine fails over to any healthy candidate.
 
-Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
+A switch made outside the engine holds off its optional moves for
+``manual_hold_minutes`` (see ``OPTIONAL_TRIGGERS``).
+
+Cooldown, quarantine and the manual hold persist in
+``<backup_root>/autoswitch_state.json``
 (so cron-driven ``aswap auto --once`` ticks behave across processes), mutated
 read-modify-write under a dedicated file lock.
 """
@@ -199,6 +203,51 @@ LANDING_BURN_WINDOW_S = 30 * 60.0
 # picking up the new credentials, with margin. Makes a threshold close to
 # 100 safe, so less of each account is left behind.
 LIMIT_GUARD_S = 3 * 60.0
+
+# Triggers that only OPTIMISE where the work runs; nothing breaks if they
+# wait. After a switch made outside the engine (by hand: `aswap switch`, the
+# TUI, an in-app `/login`) these hold off for `manual_hold_minutes`. Every
+# other trigger protects the session and still fires during the hold:
+#
+#   at-limit    the active account is at its limit
+#   proactive   over the threshold, or the limit guard projects 100% within
+#               LIMIT_GUARD_S (the all-above soonest-recovery escape is a
+#               proactive move too: the active is over the threshold there)
+#   failover    the active account's usage has been unreadable for a while
+#
+# Measured 2026-10-27: a hand switch to account 3 at 11:06 was undone at
+# 11:10 by consume-first (3 at 73% -> 13 at 85%).
+OPTIONAL_TRIGGERS = frozenset({"consume-first"})
+# A held-off optional move is logged at most this often (the hold itself is
+# logged once, when it starts); the NoSwitchEvent still goes out every tick.
+HOLD_NOTE_INTERVAL_S = 15 * 60.0
+
+
+def manual_hold_until(
+    state: dict, current: str | None, minutes: float, now: float
+) -> float | None:
+    """When the manual hold on ``current`` ends, or None when none is in force.
+
+    Reads the ``manualHold`` record of the autoswitch state file. A hold on
+    any other account, an expired one, or ``minutes <= 0`` is no hold.
+    """
+    hold = state.get("manualHold") if isinstance(state, dict) else None
+    if not isinstance(hold, dict) or current is None or minutes <= 0:
+        return None
+    since = hold.get("since")
+    if (
+        str(hold.get("account")) != str(current)
+        or isinstance(since, bool)
+        or not isinstance(since, (int, float))
+    ):
+        return None
+    until = since + minutes * 60.0
+    return until if now < until else None
+
+
+def clock_label(ts: float) -> str:
+    """Local wall-clock ``HH:MM`` for a hold's end."""
+    return datetime.fromtimestamp(ts).strftime("%H:%M")
 
 
 def tier_capacity(tier: object) -> float:
@@ -827,6 +876,18 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # Manual hold. ``_last_seen`` is the active account of the previous
+        # tick — the fallback for spotting a hand switch before the state file
+        # records one, and a dry run's own view; ``_stored_seen`` is the
+        # state file's ``lastSeenActive`` as of that tick; ``_dry_hold`` is a
+        # dry run's hold (never written); ``manual_hold`` is (account, until)
+        # as of the last tick, for frontends; ``_hold_noted`` throttles the
+        # suppression log.
+        self._last_seen: str | None = None
+        self._stored_seen: object = None
+        self._dry_hold: dict | None = None
+        self.manual_hold: tuple[str, float] | None = None
+        self._hold_noted: tuple[tuple[str, float], float] | None = None
         self._warmup: WarmupEngine | None = None
         self._next_warmup_at: float | None = None
         if settings.warmup_five_hour:
@@ -1100,6 +1161,7 @@ class AutoSwitchEngine:
         self._live_active = False
         self._time_to_limit = None
         self._limit_guard = False
+        self.manual_hold = None
         settings = self.settings
         self._caps = {
             num: tier_capacity(inputs["tier"])
@@ -1184,6 +1246,8 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
+
+        hold_until = self._manual_hold_until(state, current)
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
@@ -1311,7 +1375,7 @@ class AutoSwitchEngine:
         # about the CHOICE, so it belongs where the choice is made rather than
         # in this census of what exists. See `_no_return_account` for the
         # incident, the scoping, and the release.
-        api_key_candidates = (
+        metered_candidates = (
             [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
             if settings.include_api_key_accounts
             else []
@@ -1339,7 +1403,7 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
-        if not oauth_candidates and not api_key_candidates:
+        if not oauth_candidates and not metered_candidates:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -1434,6 +1498,12 @@ class AutoSwitchEngine:
             now=decided_now,
         )
 
+        if trigger in OPTIONAL_TRIGGERS and ordered and hold_until is not None:
+            # Decided on the provisional ranking, before phase 2 below: a
+            # held move must not spend the escalated fetches it would need.
+            self._note_held_move(current, ordered[0], trigger, hold_until)
+            return TickOutcome.NO_ACTION
+
         if trigger == "consume-first" and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
@@ -1465,11 +1535,11 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if not ordered and metered_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
-            ordered = api_key_candidates
+            ordered = metered_candidates
 
         if not ordered:
             if not any_known:
@@ -1634,6 +1704,103 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    # -- manual hold ------------------------------------------------------------
+
+    def _manual_hold_until(self, state: dict, current: str) -> float | None:
+        """Notice a switch made outside this engine; when its hold ends.
+
+        ``lastSeenActive`` in the state file is the account the engines last
+        saw active; ``_perform`` moves it along with every engine switch. A
+        live login anywhere else got there by hand — ``aswap switch``, the
+        TUI, an in-app ``/login`` — so a new hold starts on it, restarting
+        any older one. State written before that key existed falls back to
+        where a hold or the engine last put the work, then to the previous
+        tick. Everything lives in the state file, so the hold survives an
+        ``aswap auto`` restart and a cron ``--once`` honours it too.
+
+        A dry run writes nothing: it keeps its own view in memory, and takes
+        the file's again only when a live engine elsewhere moves it.
+        """
+        minutes = self.settings.manual_hold_minutes
+        stored = state.get("lastSeenActive")
+        if self.dry_run and self._last_seen is not None and stored == self._stored_seen:
+            known = self._last_seen
+        else:
+            known = stored
+        self._stored_seen = stored
+        hold = self._dry_hold if self.dry_run else None
+        if hold is None and isinstance(state.get("manualHold"), dict):
+            hold = state["manualHold"]
+        if known is None:
+            known = hold.get("account") if hold else state.get("lastSwitchTo")
+        if known is None:
+            known = self._last_seen
+        self._last_seen = current
+        if known is None or str(known) != str(current):
+            hold = self._see_active(current, hold, known is not None, minutes)
+        if minutes <= 0 or hold is None:
+            return None  # no clock read: tests script the tick's clock order
+        until = manual_hold_until(
+            {"manualHold": hold}, current, minutes, self.clock()
+        )
+        self.manual_hold = (current, until) if until is not None else None
+        return until
+
+    def _see_active(
+        self, current: str, hold: dict | None, by_hand: bool, minutes: float
+    ) -> dict | None:
+        """Record a newly seen active account; start a hold if ``by_hand``."""
+        start = by_hand and minutes > 0
+        new_hold = {"account": str(current), "since": self.clock()} if start else None
+        if self.dry_run:
+            if new_hold is not None:
+                self._dry_hold = hold = new_hold
+        else:
+
+            def record(state: dict) -> None:
+                nonlocal hold, start
+                if str(state.get("lastSeenActive")) == str(current):
+                    # A sibling engine (the TUI's, a cron --once) noted this
+                    # very switch between our read and this lock: keep its
+                    # record so the hold neither restarts nor logs twice.
+                    held = state.get("manualHold")
+                    hold = held if isinstance(held, dict) else None
+                    start = False
+                    return
+                state["lastSeenActive"] = str(current)
+                if new_hold is not None:
+                    state["manualHold"] = hold = new_hold
+
+            self._mutate_state(record)
+        if start:
+            _logger.info(
+                "Manual switch to %s; holding it for %s min unless it nears "
+                "its limit", current, f"{minutes:g}",
+            )
+        return hold
+
+    def _note_held_move(
+        self, current: str, target: str, trigger: str, until: float
+    ) -> None:
+        label = clock_label(until)
+        self._emit(
+            NoSwitchEvent(
+                reason="manual-hold",
+                detail=(
+                    f"account {current} was picked by hand; optional moves "
+                    f"held until {label}"
+                ),
+            )
+        )
+        key, now = (current, until), self.clock()
+        noted = self._hold_noted
+        if noted is None or noted[0] != key or now - noted[1] >= HOLD_NOTE_INTERVAL_S:
+            self._hold_noted = (key, now)
+            _logger.info(
+                "Manual hold: staying on account %s (%s would move to %s); "
+                "held until %s", current, trigger, target, label,
+            )
 
     def _no_return_account(
         self,
@@ -2625,7 +2792,12 @@ class AutoSwitchEngine:
             # nulls then runs the wrong legs. Record it directly so the
             # reader never has to guess.
             state["leftTrigger"] = trigger
+            # The engine moved the work, so a hold on a hand-picked account
+            # is over; the next hand switch starts a new one.
+            state.pop("manualHold", None)
+            state["lastSeenActive"] = number
             atomic_write_json(self.state_path, state)
+        self.manual_hold = None
 
         # Why, next to the switcher's own "Switched from account X to Y" line:
         # without it a log cannot tell an engine move from a manual one.

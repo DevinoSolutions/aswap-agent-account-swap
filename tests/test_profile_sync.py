@@ -26,6 +26,7 @@ import pytest
 from claude_swap import cli, oauth
 from claude_swap import session as session_mod
 from claude_swap.session import session_dir_for, stale_marker_for
+from tests import statefiles
 from claude_swap.switcher import (
     PROFILE_SYNC_ADOPTED,
     PROFILE_SYNC_BUSY,
@@ -193,9 +194,8 @@ class TestWhichCopyWins:
 
         from claude_swap import switcher as sw_mod
 
-        monkeypatch.setattr(sw_mod, "_wiped_warned_at", {})
         now = [1000.0]
-        monkeypatch.setattr(sw_mod.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(sw_mod.time, "time", lambda: now[0])
         _hydrate(switcher, WIPED_CREDS)
         with caplog.at_level(logging.WARNING):
             for step in (0.0, 5.0, sw_mod._WIPED_WARN_INTERVAL_S):
@@ -203,7 +203,8 @@ class TestWhichCopyWins:
                 assert switcher.sync_profile_credential(NUM, EMAIL, ORG_UUID) == (
                     PROFILE_SYNC_WIPED
                 )
-        assert caplog.text.count("wiped credential") == 2
+        assert caplog.text.count("wiped credential") == 1
+        assert caplog.text.count("still needs a re-login") == 1
 
     def test_a_wiped_profile_is_refused_even_when_it_looks_newer(self, switcher):
         """Expiry cannot buy a wiped blob its way in."""
@@ -679,6 +680,175 @@ class TestTheDeferralIsVisible:
         )
 
         assert row["usageDeferredReason"] is None
+
+
+class TestNeedsLogin:
+    """A wiped profile is a normal, explicit state: "needs login".
+
+    The slot is kept (the owner logs in later), held out of rotation, shown
+    as such, and warned about once on entry plus an hourly reminder — across
+    processes, because `list`, `auto`, the TUI and the statusline each run
+    the adoption pass in their own process. A fresh credential clears it.
+    """
+
+    def _wipe(self, switcher) -> None:
+        _hydrate(switcher, WIPED_CREDS)
+        assert switcher.sync_profile_credential(NUM, EMAIL, ORG_UUID) == (
+            PROFILE_SYNC_WIPED
+        )
+
+    def test_a_wiped_profile_marks_the_slot(self, switcher):
+        assert switcher.needs_login_account_numbers() == []
+        self._wipe(switcher)
+
+        assert switcher.needs_login_account_numbers() == [NUM]
+        assert switcher.is_account_needs_login(NUM) is True
+
+    def test_a_needs_login_slot_is_out_of_rotation(self, switcher):
+        assert NUM in switcher.switchable_account_numbers()
+        self._wipe(switcher)
+
+        assert NUM not in switcher.switchable_account_numbers()
+
+    def test_warned_once_across_processes(self, switcher, caplog):
+        """A second process (fresh switcher, fresh module memory) must not
+        repeat the warning the first one already gave."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            self._wipe(switcher)
+            other = ClaudeAccountSwitcher()
+            for _ in range(3):
+                assert other.sync_profile_credential(NUM, EMAIL, ORG_UUID) == (
+                    PROFILE_SYNC_WIPED
+                )
+        assert caplog.text.count("wiped credential") == 1
+
+    def test_a_fresh_login_in_the_profile_clears_it(self, switcher, caplog):
+        import logging
+
+        self._wipe(switcher)
+        caplog.clear()
+        _hydrate(switcher, PROFILE_NEWER)  # the owner logged in again
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            switcher.sync_profile_credential(NUM, EMAIL, ORG_UUID)
+            switcher.sync_profile_credential(NUM, EMAIL, ORG_UUID)
+
+        assert switcher.needs_login_account_numbers() == []
+        assert NUM in switcher.switchable_account_numbers()
+        assert caplog.text.count("logged in again") == 1
+        assert all(CANARY not in r.getMessage() for r in caplog.records)
+        assert CANARY not in statefiles.read_text(switcher.sequence_file)
+
+    def test_a_re_added_store_credential_clears_it(self, switcher, caplog):
+        """`aswap add --slot N` replaces the stored credential; a live pane may
+        keep the husk until it restarts, but the slot itself is usable."""
+        import logging
+
+        self._wipe(switcher)
+        caplog.clear()
+        switcher._store._write_account_credentials(
+            NUM, EMAIL, _creds("re-added-a", "re-added-r", NEWER_EXPIRES)
+        )
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            for _ in range(3):
+                switcher.sync_profile_credential(NUM, EMAIL, ORG_UUID)
+
+        assert switcher.needs_login_account_numbers() == []
+        assert NUM in switcher.switchable_account_numbers()
+        assert caplog.text.count("logged in again") == 1
+        assert "wiped credential" not in caplog.text
+
+    def test_a_removed_profile_credential_clears_it(self, switcher):
+        self._wipe(switcher)
+        (_profile(switcher) / ".credentials.json").unlink()
+
+        assert switcher.sync_profile_credential(NUM, EMAIL, ORG_UUID) == (
+            PROFILE_SYNC_NO_PROFILE
+        )
+        assert switcher.needs_login_account_numbers() == []
+
+    def test_a_torn_read_keeps_the_state(self, switcher):
+        """Unreadable is "I could not tell", never "fresh login"."""
+        profile = _profile(switcher)
+        self._wipe(switcher)
+        (profile / ".credentials.json").write_text("{", encoding="utf-8")
+
+        assert switcher.sync_profile_credential(NUM, EMAIL, ORG_UUID) == (
+            PROFILE_SYNC_UNREADABLE
+        )
+        assert switcher.needs_login_account_numbers() == [NUM]
+
+    def test_list_marks_the_slot(self, switcher, capsys):
+        self._wipe(switcher)
+        capsys.readouterr()
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome({"five_hour": {"pct": 1.0}}),
+        ), patch.object(switcher, "_read_credentials", return_value=""):
+            switcher.list_accounts()
+
+        out = capsys.readouterr().out
+        line = next(ln for ln in out.splitlines() if ln.strip().startswith(f"{NUM}:"))
+        assert "(needs login)" in line
+
+    def test_json_list_marks_the_slot_ineligible(self, switcher):
+        self._wipe(switcher)
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome({"five_hour": {"pct": 1.0}}),
+        ), patch.object(switcher, "_read_credentials", return_value=""):
+            payload = switcher.list_accounts(json_output=True)
+
+        row = next(a for a in payload["accounts"] if a["number"] == int(NUM))
+        assert row["needsLogin"] is True
+        assert row["eligible"] is False
+        assert row["ineligibleReason"] == "needs_login"
+
+    def test_the_tui_snapshot_carries_it(self, switcher):
+        self._wipe(switcher)
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome({"five_hour": {"pct": 1.0}}),
+        ), patch.object(switcher, "_read_credentials", return_value=""):
+            snap = switcher.accounts_snapshot()
+
+        acc = next(a for a in snap.accounts if a.number == NUM)
+        assert acc.needs_login is True
+
+    def test_a_vanished_profile_directory_clears_it(self, switcher):
+        """The pass skips slots without a profile directory — but not a
+        marked one, or the mark would outlive the profile forever."""
+        import shutil
+
+        self._wipe(switcher)
+        shutil.rmtree(_profile(switcher))
+
+        switcher.sync_profiles_into_store(
+            [(int(NUM), EMAIL, "Org Two", ORG_UUID, False, STORE_CREDS, "")]
+        )
+
+        assert switcher.needs_login_account_numbers() == []
+
+    def test_logging_in_on_the_main_login_clears_it(self, switcher):
+        """The slot became the active login with real tokens: the owner
+        logged in again there, not in the pane."""
+        self._wipe(switcher)
+
+        switcher.sync_profiles_into_store(
+            [(int(NUM), EMAIL, "Org Two", ORG_UUID, True, PROFILE_NEWER, "")]
+        )
+
+        assert switcher.needs_login_account_numbers() == []
+
+    def test_an_active_slot_with_a_wiped_live_login_keeps_it(self, switcher):
+        self._wipe(switcher)
+
+        switcher.sync_profiles_into_store(
+            [(int(NUM), EMAIL, "Org Two", ORG_UUID, True, WIPED_CREDS, "")]
+        )
+
+        assert switcher.needs_login_account_numbers() == [NUM]
 
 
 class TestWipedClassifier:
