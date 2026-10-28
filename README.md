@@ -291,12 +291,38 @@ aswap alias 2 dev               # Give an account a short alias (usable anywhere
 aswap alias 2 --unset           # Remove an account's alias
 aswap alias                     # List all aliases
 aswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
+aswap renumber                  # Renumber every account to 1..N (see "Account numbers" below)
 aswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
 aswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `aswap add`)
 aswap tui                       # Interactive dashboard (also: bare `aswap`)
 aswap watch                     # Dashboard, opened on the live watch page
 aswap upgrade                   # Upgrade aswap to the latest version
 aswap purge                     # Remove all aswap data
+```
+
+### Account numbers
+
+A new account takes the lowest free number, so removing account 2 and adding another puts the new one at 2. A reused number starts clean: it does not inherit the removed account's alias, cached usage, gate or billing data, quarantine, manual hold or session profile.
+
+Numbers can still drift, for example after removing accounts added before this behaviour, or when two machines added the same accounts in a different order. `aswap renumber` packs them back to 1..N:
+
+```bash
+aswap renumber --dry-run        # Show old -> new; change nothing
+aswap renumber                  # Keep the current list order and close the gaps (asks first)
+aswap renumber --by-email       # Order by email, then organization: same numbers on every machine
+aswap renumber --yes --json     # Non-interactive; --json needs --yes or --dry-run
+```
+
+Everything that belongs to an account moves with it: credentials and config backups, alias, session profile, cached usage, gate and billing data, and the auto-switch state (quarantine, manual hold, last switch). Each step is an ordinary `aswap move` that commits on its own, and a snapshot of `state.db` is taken first. If the run is interrupted, the list is still consistent, and running `aswap renumber` again finishes it. The printed snapshot stamp undoes the whole run: `aswap backup restore --all --at STAMP`. Codex accounts have their own numbering and are not renumbered.
+
+A running `aswap auto` (or the TUI) can stay up. Renumbering waits for any switch or token refresh in progress, and the engine follows the new numbers on its next poll. A switch it decided on the old numbers is refused rather than sent to whoever now holds that number (`no switch: roster-changed`), and the next poll decides again. `aswap renumber` refuses to run while an `aswap run` session is live, because that session's profile would move under it.
+
+Safe sequence on a machine in daily use:
+
+```bash
+aswap renumber --by-email --dry-run   # check the mapping
+aswap renumber --by-email             # confirm; note the snapshot stamp it prints
+aswap list                            # same accounts, numbered 1..N; the active one unchanged
 ```
 
 ## Tips

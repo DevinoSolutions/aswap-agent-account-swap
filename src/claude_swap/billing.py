@@ -286,6 +286,15 @@ class BillingCache:
             and (row.get("organizationUuid") or "") == (org_uuid or "")
         )
 
+    def rekey(self, moves: dict[str, tuple[str, tuple[str, str]]]) -> None:
+        """Carry rows to the accounts' new slot numbers after a move/renumber
+        (``moves``: old -> (new, identity)); see ``renumber.rekey_rows``."""
+        from claude_swap.renumber import rekey_rows
+
+        rows, changed = rekey_rows(self._load(), moves)
+        if changed:
+            self._save(rows)
+
     def records(self, identities: dict[str, tuple[str, str]]) -> dict[str, dict | None]:
         """The cached record for each slot whose identity still matches."""
         rows = self._load()

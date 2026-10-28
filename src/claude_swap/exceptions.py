@@ -37,6 +37,20 @@ class SwitchError(ClaudeSwitchError):
     pass
 
 
+class RosterChangedError(SwitchError):
+    """The slot a caller chose now holds a different account.
+
+    Slot numbers can change under a running process (``aswap renumber``,
+    ``move``, ``swap``, or a removed number reused by a new account). A switch
+    that names the account it expects (``switch_to(..., expect=...)``) raises
+    this instead of activating whoever sits at that number now. Nothing has
+    been mutated when it raises; the caller re-reads the roster and decides
+    again.
+    """
+
+    pass
+
+
 class SessionError(ClaudeSwitchError):
     """Error setting up or launching a session-mode profile."""
 

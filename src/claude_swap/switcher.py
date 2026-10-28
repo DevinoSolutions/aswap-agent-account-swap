@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -23,6 +24,7 @@ from claude_swap.exceptions import (
     ConfigError,
     CredentialReadError,
     LockError,
+    RosterChangedError,
     SessionError,
     SwitchError,
     ValidationError,
@@ -71,7 +73,7 @@ from claude_swap.weekly_anchor import (
     weekly_text,
     weekly_view,
 )
-from claude_swap import statedb
+from claude_swap import renumber, statedb
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
@@ -494,7 +496,7 @@ class ClaudeAccountSwitcher:
 
         # Slot -> monotonic time its plan was last re-read because live usage
         # contradicted a cached lapse; see note_live_usage.
-        self._live_rechecked: dict[str, float] = {}
+        self._live_rechecked: dict[tuple[str, str], float] = {}
         # Live-login observations (identity + credential fingerprint) the
         # profile endpoint said belong to someone else: never adopted, and not
         # probed again until the login moves. See adopt_live_login.
@@ -1294,6 +1296,169 @@ class ClaudeAccountSwitcher:
         ]
         return sorted(rows, key=lambda r: int(r[0]))
 
+    # -- slot renumbering: locks, commit, and the stores that follow a move ----
+
+    # Renumbering waits behind a switch or a refresh POST (each bounded at
+    # ~10 s) rather than failing on the default 10 s lock timeout.
+    _ROSTER_LOCK_TIMEOUT_S = 60.0
+
+    def _record_numbers(self) -> set[str]:
+        data = self._get_sequence_data() or {}
+        return set(renumber.record_numbers(data.get("accounts", {})))
+
+    def _engine_state_lock(self, timeout: float | None = None) -> FileLock:
+        """The auto-switch engine's state lock (autoswitch.py ``_state_lock``)."""
+        return FileLock(
+            self.backup_dir / renumber.ENGINE_STATE_LOCKNAME,
+            timeout=self._ROSTER_LOCK_TIMEOUT_S if timeout is None else timeout,
+        )
+
+    @contextlib.contextmanager
+    def _roster_change_locks(self, targets=lambda numbers: ()):
+        """Hold every lock a slot renumbering needs, in everyone else's order.
+
+        1. The auto-switch engine's state lock. The engine holds it across
+           its recheck -> switch -> record, so a renumber never lands between
+           an engine decision and its switch, and the engine's
+           read-modify-write of its state never overwrites the remap that
+           ``_commit_roster`` makes.
+        2. The per-slot consume locks of every number involved, ascending. A
+           refresh POST for an account holds its slot's consume lock from
+           re-read to persist; moving the account mid-POST would land the
+           successor under the old number and leave the account with a spent
+           grant (and a second gate under the new number could POST the same
+           grant again).
+        3. The account lock.
+
+        That is the order the engine (state -> account) and the consume gate
+        (consume -> account) already use, so no cycle is possible.
+        ``targets(numbers)`` adds the destination numbers a move needs on top
+        of the roster's own. The covered set is computed before locking; once
+        the account lock is held the roster is re-read, and if a number
+        appeared that is not covered (a concurrent ``add``) everything is
+        released and taken again.
+        """
+        timeout = self._ROSTER_LOCK_TIMEOUT_S
+        for _attempt in range(5):
+            numbers = self._record_numbers()
+            covered = numbers | {str(n) for n in targets(numbers)}
+            stack = contextlib.ExitStack()
+            try:
+                stack.enter_context(self._engine_state_lock())
+                for num in sorted(covered, key=int):
+                    stack.enter_context(
+                        FileLock(
+                            self.credentials_dir / f".consume-{num}.lock",
+                            timeout=timeout,
+                        )
+                    )
+                stack.enter_context(FileLock(self.lock_file, timeout=timeout))
+            except BaseException:
+                stack.close()
+                raise
+            with stack:
+                now = self._record_numbers()
+                if now | {str(n) for n in targets(now)} <= covered:
+                    yield
+                    return
+        raise LockError(
+            "The account list kept changing while renumbering; nothing was "
+            "changed. Retry."
+        )
+
+    def _commit_roster(self, data: dict, moved: dict[str, str]) -> None:
+        """The commit point of a move or swap.
+
+        Writes the roster and rewrites the auto-switch engine's slot numbers
+        (``moved``: old -> new) in ONE database transaction, so a crash can
+        never leave the engine's quarantine, manual hold or anti-flap bar
+        pointing at whoever took the account's old number.
+        """
+        hit = statedb.locate(self.sequence_file)
+        txn = hit[0].transaction() if hit is not None else contextlib.nullcontext()
+        with txn:
+            self._write_json(self.sequence_file, data)
+            self._remap_engine_state(moved)
+
+    def _read_engine_state(self) -> dict | None:
+        """The engine's state document, None when absent or unreadable.
+
+        Unreadable is "nothing to remap", never an error: a damaged state
+        file must not block every move (the engine rebuilds it, and the
+        snapshot heal restores it).
+        """
+        path = self.backup_dir / renumber.ENGINE_STATE_FILENAME
+        try:
+            state = json.loads(statedb.read_text(path))
+        except (OSError, ValueError):
+            return None
+        return state if isinstance(state, dict) else None
+
+    def _remap_engine_state(self, moved: dict[str, str]) -> None:
+        from claude_swap.settings import atomic_write_json
+
+        state = self._read_engine_state()
+        if state is not None and renumber.remap_engine_state(state, moved):
+            atomic_write_json(self.backup_dir / renumber.ENGINE_STATE_FILENAME, state)
+
+    def _forget_engine_slot(self, num: str, email: str) -> None:
+        """Drop the engine's references to a slot whose account left it.
+
+        Best effort, after the roster write: a reused number must not inherit
+        the removed account's quarantine, manual hold or anti-flap bar. Takes
+        the engine's state lock; the caller must not hold the account lock
+        (the engine takes state -> account).
+        """
+        from claude_swap.settings import atomic_write_json
+
+        try:
+            with self._engine_state_lock(timeout=30.0):
+                state = self._read_engine_state()
+                if state is not None and renumber.forget_engine_slot(state, num, email):
+                    atomic_write_json(
+                        self.backup_dir / renumber.ENGINE_STATE_FILENAME, state
+                    )
+        except Exception as e:
+            self._logger.warning(
+                "Could not clear auto-switch state for freed slot %s: %s", num, e
+            )
+
+    def _rekey_slot_caches(
+        self, moves: dict[str, tuple[str, tuple[str, str]]]
+    ) -> None:
+        """Carry the usage, gate and billing rows to the accounts' new numbers.
+
+        ``moves``: old number -> (new number, (email, organization uuid)).
+        These caches are identity-guarded, so a row left behind can never be
+        served to the wrong account; it would only be lost, and a renumbered
+        roster would then re-poll every account at once. Best effort, after
+        the commit.
+        """
+        for name, store in (
+            ("usage", self._usage_store),
+            ("gate", self._gate_store),
+            ("billing", self._billing),
+        ):
+            try:
+                store.rekey(moves)
+            except Exception as e:
+                self._logger.warning(
+                    "Could not carry the %s cache across a renumber: %s", name, e
+                )
+
+    @staticmethod
+    def _record_identity(record: dict) -> tuple[str, str]:
+        return (record.get("email", ""), record.get("organizationUuid", "") or "")
+
+    def roster_identities(self) -> dict[str, tuple[str, str]]:
+        """Every account's number -> (email, organization uuid), right now."""
+        data = self._get_sequence_data() or {}
+        return {
+            num: self._record_identity(record)
+            for num, record in (data.get("accounts") or {}).items()
+            if str(num).isdigit() and isinstance(record, dict)
+        }
+
     def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
         """Exchange two accounts' slot numbers (list order / numeric targets).
 
@@ -1303,16 +1468,17 @@ class ClaudeAccountSwitcher:
         ``sequence`` (kept sorted, so rotation and ``aswap list`` order
         follow the new numbers), ``activeAccountNumber``, and each slot's
         session profile directory (history preserved). Directory mappings key on
-        (email, org) and are unaffected. Usage-cache rows key on the slot
-        number but carry the account identity, so a swapped row fails the
-        identity check and self-heals on the next poll. Auto-switch
-        quarantine entries also key on the slot number and are not moved,
-        but self-heal on the next pass: the stale entry fails its
-        email/fingerprint check and is released, and a dead account under
-        its new number is re-caught by freshen-before-activate.
+        (email, org) and are unaffected. The auto-switch engine's slot
+        numbers (quarantine, manual hold, last switch) are rewritten in the
+        same transaction as the roster (``_commit_roster``), and the usage,
+        gate and billing cache rows follow their accounts right after
+        (``_rekey_slot_caches``; they are identity-guarded, so a row left
+        behind is only lost, never misattributed).
 
-        The whole resolve-validate-mutate span runs under the account lock
-        (like switch and the usage-refresh persist). The ``sequence.json``
+        The whole resolve-validate-mutate span runs under the roster-change
+        locks (``_roster_change_locks``: the engine's state lock, the slots'
+        consume locks, then the account lock that switch and the usage-
+        refresh persist take). The ``sequence.json``
         write is the commit point: a failure before it rolls both slots back
         (via durable staged copies when the backup keys overlap), and after
         it only best-effort cleanup of stale keys remains.
@@ -1327,7 +1493,7 @@ class ClaudeAccountSwitcher:
         # refresh persist (which take the same lock) can never interleave
         # with the relocation.
         self._refuse_session_shell()
-        with FileLock(self.lock_file):
+        with self._roster_change_locks():
             return self._swap_accounts_locked(first, second)
 
     def _read_backup_or_abort(self, account_num: str, email: str) -> str:
@@ -1455,8 +1621,9 @@ class ClaudeAccountSwitcher:
             elif active == int_b:
                 data["activeAccountNumber"] = int_a
             data["lastUpdated"] = get_timestamp()
-            # The commit point: _write_json's rename publishes the swap.
-            self._write_json(self.sequence_file, data)
+            # The commit point: the roster write (and the engine's slot
+            # numbers, in the same transaction) publishes the swap.
+            self._commit_roster(data, {num_a: num_b, num_b: num_a})
         except BaseException:
             self._rollback_swap(
                 num_a, email_a, creds_a, config_a,
@@ -1486,6 +1653,10 @@ class ClaudeAccountSwitcher:
         if creds_b:
             self._store.delete_previous_backup(num_a, email_b)
         self._discard_staging(staging)
+        self._rekey_slot_caches({
+            num_a: (num_b, self._record_identity(record_a)),
+            num_b: (num_a, self._record_identity(record_b)),
+        })
 
         self._logger.info(
             f"Swapped slots: {num_a} ({email_a}) <-> {num_b} ({email_b})"
@@ -1718,11 +1889,10 @@ class ClaudeAccountSwitcher:
           like ``swap account <occupant>``; the displaced account takes the
           vacated slot, so nothing is ever lost.
 
-        Slot numbers may be sparse (``remove`` leaves gaps, ``add`` grows from
-        the max), so any positive number up to 99 — or the current highest
-        slot, if a table already grew past that — is a legal target. The cap
-        exists because ``add`` numbers from the max: a stray huge target would
-        inflate every future account number.
+        Slot numbers may be sparse (``remove`` leaves gaps until ``add`` or
+        ``renumber`` fills them), so any positive number up to 99 — or the
+        current highest slot, if a table already grew past that — is a legal
+        target. The cap keeps a typo from parking an account at slot 4000.
 
         Returns ``(source_num, target_num, swapped)`` where ``swapped`` is True
         when an occupant was displaced.
@@ -1743,7 +1913,7 @@ class ClaudeAccountSwitcher:
         # the mutation (via the *_locked helpers — FileLock is non-reentrant):
         # a slot number resolved outside the lock could be renumbered by a
         # concurrent swap/move and end up moving the wrong account.
-        with FileLock(self.lock_file):
+        with self._roster_change_locks(targets=lambda _numbers: (target,)):
             self._get_sequence_data_migrated()
 
             num_src = self._resolve_account_identifier(account)
@@ -1756,17 +1926,15 @@ class ClaudeAccountSwitcher:
             if not data.get("accounts", {}).get(num_src):
                 raise AccountNotFoundError(f"Account-{num_src} does not exist")
 
-            # `add` numbers new accounts from the highest slot, so a stray huge
-            # target would inflate every future account number.
+            # A stray huge target would park the account far past the rest
+            # (``aswap renumber`` packs the numbers back to 1..N).
             max_slot = max(
                 (int(n) for n in data.get("accounts", {}) if n.isdigit()), default=0
             )
             cap = max(99, max_slot)
             if int(target) > cap:
                 raise ValidationError(
-                    f"Target slot {target} is out of range (1-{cap}): new accounts "
-                    f"are numbered from the highest slot, so a large target would "
-                    f"inflate future account numbers"
+                    f"Target slot {target} is out of range (1-{cap})"
                 )
 
             if num_src == target:
@@ -1861,8 +2029,9 @@ class ClaudeAccountSwitcher:
             if data.get("activeAccountNumber") == int_src:
                 data["activeAccountNumber"] = int_target
             data["lastUpdated"] = get_timestamp()
-            # The commit point: _write_json's rename publishes the move.
-            self._write_json(self.sequence_file, data)
+            # The commit point: the roster write (and the engine's slot
+            # numbers, in the same transaction) publishes the move.
+            self._commit_roster(data, {num_src: target})
         except BaseException:
             # Pre-commit failure: the records still point at num_src and its
             # keys are untouched — drop any strays written under the target
@@ -1893,8 +2062,189 @@ class ClaudeAccountSwitcher:
             # Any .prev retained while overwriting a stale target key holds
             # that stale material, not this account's history.
             self._store.delete_previous_backup(target, email)
+        self._rekey_slot_caches({num_src: (target, self._record_identity(record))})
 
         self._logger.info(f"Moved slot: {num_src} ({email}) -> {target}")
+
+    # -- renumber -----------------------------------------------------------
+
+    @staticmethod
+    def _renumber_rows(accounts: dict, by_email: bool) -> list[dict]:
+        """Every account's old and new number, in new-number order."""
+        rows = []
+        for old, new in renumber.plan(accounts, by_email).items():
+            record = accounts.get(old) or {}
+            rows.append({
+                "from": int(old),
+                "to": int(new),
+                "email": record.get("email", ""),
+                "organizationUuid": record.get("organizationUuid", "") or "",
+            })
+        return sorted(rows, key=lambda r: r["to"])
+
+    def renumber_preview(self, by_email: bool = False) -> dict:
+        """What ``aswap renumber`` would do right now; changes nothing.
+
+        ``accounts`` lists every account with its old and new number;
+        ``moves`` the individual relocations/swaps it would make.
+        """
+        if not statedb.exists(self.sequence_file):
+            raise ConfigError("No accounts are managed yet")
+        data = self._get_sequence_data_migrated() or {}
+        accounts = {
+            k: v for k, v in data.get("accounts", {}).items() if str(k).isdigit()
+        }
+        steps = renumber.simulate(accounts, by_email)
+        return {
+            "order": "email" if by_email else "list",
+            "changed": bool(steps),
+            "accounts": self._renumber_rows(accounts, by_email),
+            "moves": [
+                {"from": int(s.source), "to": int(s.target), "swapped": s.swapped}
+                for s in steps
+            ],
+        }
+
+    def _snapshot_before_renumber(self) -> str | None:
+        """Snapshot the state database first, like the hourly snapshots.
+
+        Returns the stamp holding the pre-renumber state (the latest one when
+        nothing changed since it). Raises when no snapshot can be taken:
+        renumbering touches every account, so it does not run without a way
+        back (``aswap backup restore --all --at STAMP``).
+        """
+        from claude_swap.snapshots import SnapshotStore
+
+        try:
+            store = SnapshotStore(self.backup_dir)
+            stamp = store.take()
+            if stamp is None:
+                stamps = store.stamps()
+                stamp = stamps[-1] if stamps else None
+        except Exception as e:
+            raise ConfigError(
+                f"Could not take a safety snapshot before renumbering ({e}); "
+                "nothing was changed."
+            ) from e
+        return stamp
+
+    def _normalize_roster_locked(self) -> None:
+        """Make ``sequence`` list exactly the records, ``activeAccountNumber``
+        name a record (or nothing), before the moves start.
+
+        Moves rewrite both by number; a stale entry for a number with no
+        record would otherwise be renumbered onto an account that moves into
+        that number. Caller holds the account lock.
+        """
+        data = self._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        numbers = [int(n) for n in renumber.record_numbers(accounts)]
+        changed = False
+        if data.get("sequence") != numbers:
+            data["sequence"] = numbers
+            changed = True
+        active = data.get("activeAccountNumber")
+        if active is not None and str(active) not in accounts:
+            identity = self._get_current_account()
+            slot = self._find_account_slot(data, *identity) if identity else None
+            data["activeAccountNumber"] = int(slot) if slot else None
+            changed = True
+        if changed:
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+
+    def renumber_accounts(
+        self,
+        by_email: bool = False,
+        expected: list[dict] | None = None,
+        snapshot: bool = True,
+    ) -> dict:
+        """Renumber every Claude account to 1..N in one locked operation.
+
+        The order is the current list order (ascending slot number), or with
+        ``by_email`` lowercase email then organization uuid, so two machines
+        holding the same accounts number them the same way.
+
+        Each step is an ordinary ``move`` (relocate into a free number, or
+        swap with the occupant), executed by the same ``*_locked`` helpers
+        ``aswap move`` and ``aswap swap`` use — backups, configs, aliases,
+        session profiles, the engine's slot numbers and the usage/gate/billing
+        caches all follow — and each one commits on its own. A crash between
+        steps leaves a consistent roster, and running ``renumber`` again
+        finishes the job (see ``renumber.py`` for why the plan recomputed
+        from any intermediate roster is the same plan).
+
+        ``expected`` is the ``accounts`` list of a preview the user confirmed;
+        when the roster no longer produces it (an account was added, removed
+        or moved in between), nothing is changed and RosterChangedError is
+        raised. A safety snapshot is taken first (``snapshot=True``).
+
+        Codex accounts (``aswap codex``) have their own numbering and are not
+        touched.
+        """
+        self._refuse_session_shell()
+        preview = self.renumber_preview(by_email)
+        if expected is not None and preview["accounts"] != expected:
+            raise RosterChangedError(
+                "The accounts changed since the preview; nothing was renumbered. "
+                "Run `aswap renumber` again."
+            )
+        result = {**preview, "snapshot": None}
+        if not preview["changed"]:
+            return result
+        if snapshot:
+            result["snapshot"] = self._snapshot_before_renumber()
+
+        done: list[renumber.Step] = []
+        total = len(preview["moves"])
+        with self._roster_change_locks(
+            targets=lambda numbers: range(1, len(numbers) + 1)
+        ):
+            data = self._get_sequence_data_migrated() or {}
+            accounts = {
+                k: v for k, v in data.get("accounts", {}).items() if k.isdigit()
+            }
+            if self._renumber_rows(accounts, by_email) != preview["accounts"]:
+                raise RosterChangedError(
+                    "The accounts changed while renumbering was starting; "
+                    "nothing was renumbered. Run `aswap renumber` again."
+                )
+            # Everything a step could refuse on, checked before the first
+            # step rather than discovered halfway: a live `aswap run` session
+            # (its profile would move under it) and an unreadable backup.
+            for num in renumber.record_numbers(accounts):
+                email = accounts[num].get("email", "")
+                self._ensure_no_live_session(num, email, "`aswap renumber`")
+                self._read_backup_or_abort(num, email)
+            self._normalize_roster_locked()
+            try:
+                while (step := renumber.next_step(accounts, by_email)) is not None:
+                    if len(done) > len(accounts):
+                        raise ConfigError("renumbering did not converge")
+                    if step.swapped:
+                        self._swap_accounts_locked(step.source, step.target)
+                    else:
+                        self._relocate_locked(step.source, step.target)
+                    done.append(step)
+                    data = self._get_sequence_data() or {}
+                    accounts = {
+                        k: v for k, v in data.get("accounts", {}).items() if k.isdigit()
+                    }
+            except Exception as e:
+                self._logger.error(
+                    "Renumber stopped after %d of %d moves: %s", len(done), total, e
+                )
+                raise ConfigError(
+                    f"Renumbering stopped after {len(done)} of {total} move(s): {e}. "
+                    "Every finished move is complete and the account list is "
+                    "consistent; run `aswap renumber` again to finish."
+                ) from e
+
+        self._logger.info(
+            "Renumbered %d account(s) to 1..%d (%s order) in %d move(s)",
+            len(accounts), len(accounts), result["order"], len(done),
+        )
+        return result
 
     def slot_for_directory(self, directory: str | Path) -> tuple[str | None, str | None]:
         """Resolve a directory to its mapped account slot, for `aswap run`.
@@ -2090,19 +2440,21 @@ class ClaudeAccountSwitcher:
         """
         num = str(num)
         now = time.monotonic()
-        if now - self._live_rechecked.get(num, float("-inf")) < LIVE_RECHECK_S:
-            return
         account = (self._get_sequence_data_migrated() or {}).get("accounts", {}).get(num)
         if not isinstance(account, dict) or not account.get("email"):
             return
         identity = (account["email"], account.get("organizationUuid") or "")
+        # Throttled per account, not per number: after a renumber the number
+        # may name someone else, who must not inherit the wait.
+        if now - self._live_rechecked.get(identity, float("-inf")) < LIVE_RECHECK_S:
+            return
         try:
             record = self._billing.records({num: identity}).get(num)
         except Exception:
             return
         if not looks_lapsed(record):
             return
-        self._live_rechecked[num] = now
+        self._live_rechecked[identity] = now
         info = [i for i in self._build_accounts_info() if str(i[0]) == num]
         if not info:
             return
@@ -3036,7 +3388,16 @@ class ClaudeAccountSwitcher:
                 "lists them, `--purge` drops one)"
             )
         for entry_id, meta in manifest.items():
-            if meta.get("configSlot") != account_num:
+            # ``configSlot`` is the number the account had when the entry
+            # was stashed; a renumber/move may since have given it another.
+            # The consumed-generation fingerprint names the lineage itself,
+            # so a match adopts whatever number the account has now. Entries
+            # stashed under another number that do not match are that
+            # number's business and are left alone.
+            if (
+                meta.get("configSlot") != account_num
+                and meta.get("consumedFp") != cur_fp
+            ):
                 continue
             if meta.get("consumedFp") != cur_fp:
                 if meta.get("reason") == "consume-gate-cas-conflict":
@@ -3841,13 +4202,21 @@ class ClaudeAccountSwitcher:
         return self._read_json(self.sequence_file, strict=True)
 
     def _get_next_account_number(self) -> int:
-        """Get next account number."""
+        """The number a new account takes: the lowest free slot >= 1.
+
+        Numbers used to only grow (highest + 1), so every removal left a
+        permanent hole. A freed number is now reused, which is safe because
+        nothing keyed by a slot number trusts the number alone: backups,
+        configs and session profiles key on (number, email); the usage, gate
+        and billing caches check the row's (email, organization) on every
+        read; directory mappings, weekly anchors and billing sessions key on
+        identity; and ``remove`` drops the engine's quarantine, manual-hold
+        and anti-flap references to the number (``_forget_engine_slot``).
+        """
         data = self._get_sequence_data()
         if not data or not data.get("accounts"):
             return 1
-
-        account_nums = [int(k) for k in data["accounts"].keys()]
-        return max(account_nums, default=0) + 1
+        return renumber.lowest_free_number(data["accounts"])
 
     def _get_current_account(self) -> tuple[str, str] | None:
         """Get current account identity (email, organization_uuid) from .claude.json.
@@ -4266,20 +4635,34 @@ class ClaudeAccountSwitcher:
             except PermissionError:
                 raise ConfigError("Permission denied reading Claude config")
 
-            self._write_account_credentials(
-                account_num, current_email, current_creds, reason="relogin"
-            )
-            self._write_account_config(account_num, current_email, current_config)
-            self._usage_store.clear_dead_token(
-                [account_num], {account_num: (current_email, current_org_uuid)}
-            )
+            # Under the account lock, and the slot looked up again inside it:
+            # a renumber or move from another process may have moved this
+            # account since it was found above.
+            with FileLock(self.lock_file):
+                seq = self._get_sequence_data()
+                account_num = (
+                    self._find_account_slot(seq, current_email, current_org_uuid)
+                    or account_num
+                )
+                if account_num not in seq.get("accounts", {}):
+                    raise ConfigError(
+                        "The account was removed while it was being updated; "
+                        "run `aswap add` again."
+                    )
+                self._write_account_credentials(
+                    account_num, current_email, current_creds, reason="relogin"
+                )
+                self._write_account_config(account_num, current_email, current_config)
+                self._usage_store.clear_dead_token(
+                    [account_num], {account_num: (current_email, current_org_uuid)}
+                )
 
-            if alias is not None:
-                seq["accounts"][account_num]["alias"] = alias
+                if alias is not None:
+                    seq["accounts"][account_num]["alias"] = alias
 
-            seq["activeAccountNumber"] = int(account_num)
-            seq["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, seq)
+                seq["activeAccountNumber"] = int(account_num)
+                seq["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, seq)
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
@@ -4384,54 +4767,67 @@ class ClaudeAccountSwitcher:
         organization_uuid = oauth_data.get("organizationUuid", "") or ""
         organization_name = oauth_data.get("organizationName", "") or ""
 
-        # Now safe to perform destructive cleanup (new account data is in memory)
+        # The writes run under the account lock, so a concurrent renumber,
+        # move or auto-add can never put another account on the number this
+        # add takes. An auto-assigned number is (re)chosen here, inside it.
+        old_email = ""
+        with FileLock(self.lock_file):
+            if slot is None:
+                account_num = str(self._get_next_account_number())
+
+            # Now safe to perform destructive cleanup (new account data is in memory)
+            if displace_slot:
+                d_num, d_email, d_org = displace_slot
+                self._delete_account_files(d_num, d_email)
+                data = self._get_sequence_data()
+                if int(d_num) in data["sequence"]:
+                    data["sequence"].remove(int(d_num))
+                del data["accounts"][d_num]
+                self._write_json(self.sequence_file, data)
+                self._prune_mappings(d_email, d_org)
+
+            if migrate_from:
+                data = self._get_sequence_data()
+                old_email = data["accounts"][migrate_from].get("email", "")
+                self._delete_account_files(migrate_from, old_email)
+                if int(migrate_from) in data["sequence"]:
+                    data["sequence"].remove(int(migrate_from))
+                del data["accounts"][migrate_from]
+                self._write_json(self.sequence_file, data)
+
+            # Store backups
+            self._write_account_credentials(
+                account_num, current_email, current_creds, reason="relogin"
+            )
+            self._write_account_config(account_num, current_email, current_config)
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (current_email, organization_uuid)}
+            )
+
+            # Update sequence.json
+            data = self._get_sequence_data()
+            data["accounts"][account_num] = {
+                "email": current_email,
+                "uuid": account_uuid,
+                "organizationUuid": organization_uuid,
+                "organizationName": organization_name,
+                "added": get_timestamp(),
+            }
+            carried_alias = alias if alias is not None else existing_alias
+            if carried_alias:
+                data["accounts"][account_num]["alias"] = carried_alias
+            if int(account_num) not in data["sequence"]:
+                data["sequence"].append(int(account_num))
+                data["sequence"].sort()
+            data["activeAccountNumber"] = int(account_num)
+            data["lastUpdated"] = get_timestamp()
+
+            self._write_json(self.sequence_file, data)
+        # Outside the account lock (the engine takes its state lock first).
         if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
-            data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
-            self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
+            self._forget_engine_slot(displace_slot[0], displace_slot[1])
         if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        # Store backups
-        self._write_account_credentials(
-            account_num, current_email, current_creds, reason="relogin"
-        )
-        self._write_account_config(account_num, current_email, current_config)
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (current_email, organization_uuid)}
-        )
-
-        # Update sequence.json
-        data = self._get_sequence_data()
-        data["accounts"][account_num] = {
-            "email": current_email,
-            "uuid": account_uuid,
-            "organizationUuid": organization_uuid,
-            "organizationName": organization_name,
-            "added": get_timestamp(),
-        }
-        carried_alias = alias if alias is not None else existing_alias
-        if carried_alias:
-            data["accounts"][account_num]["alias"] = carried_alias
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["activeAccountNumber"] = int(account_num)
-        data["lastUpdated"] = get_timestamp()
-
-        self._write_json(self.sequence_file, data)
+            self._forget_engine_slot(migrate_from, old_email)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
@@ -4652,6 +5048,27 @@ class ClaudeAccountSwitcher:
         )
         return ("refreshed", slot)
 
+    def _placeholder_token_email(self, label: str, start: int) -> str:
+        """``{label}-{n}@token.local`` for the first n >= ``start`` nobody uses.
+
+        "Nobody" covers the roster and the identity-keyed history in the
+        weekly-anchor store, so a placeholder never names another account or
+        inherits a removed one's records.
+        """
+        taken: set[str] = set()
+        data = self._get_sequence_data() or {}
+        for record in (data.get("accounts") or {}).values():
+            taken.add(str(record.get("email") or "").lower())
+        try:
+            for key in self._anchors.rows():
+                taken.add(str(key).split("|", 1)[0].lower())
+        except Exception:  # noqa: BLE001 - history is advisory here
+            pass
+        n = max(1, int(start))
+        while f"{label}-{n}@token.local" in taken:
+            n += 1
+        return f"{label}-{n}@token.local"
+
     def add_account_from_token(
         self,
         token: str,
@@ -4701,12 +5118,16 @@ class ClaudeAccountSwitcher:
 
         # Synthesize a placeholder email when one isn't provided. These tokens
         # have no real email metadata, so requiring users to invent one is
-        # noise; the slot number gives every default account a unique key.
+        # noise. The placeholder starts from the slot number but must be a
+        # fresh identity: numbers are reused (lowest free) and renumbered, so
+        # ``setup-token-3`` may already be another account, now at slot 1,
+        # or a removed one whose identity-keyed history (weekly anchors,
+        # billing) would otherwise be inherited.
         if not email:
-            if slot is None:
-                slot = self._get_next_account_number()
-            label = "api-key" if is_api_key else "setup-token"
-            email = f"{label}-{slot}@token.local"
+            email = self._placeholder_token_email(
+                "api-key" if is_api_key else "setup-token",
+                slot if slot is not None else self._get_next_account_number(),
+            )
 
         # Don't silently overwrite/convert an existing account of the other kind:
         # identity is matched on (email, org) only, so an api-key and an OAuth
@@ -4742,19 +5163,30 @@ class ClaudeAccountSwitcher:
                 raise ConfigError(
                     f"Existing account metadata for {email} is inconsistent"
                 )
-            self._write_account_credentials(
-                account_num, email, credentials, reason="relogin"
-            )
-            self._write_account_config(account_num, email, config)
-            # A refreshed credential invalidates any dead-token quarantine on this
-            # slot (mirrors ``add_account``); otherwise the stale strike row keeps
-            # the account stuck at "re-login needed" and it never fetches the new
-            # token. Token accounts are always personal, so org is "".
-            self._usage_store.clear_dead_token(
-                [account_num], {account_num: (email, "")}
-            )
-            seq["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, seq)
+            # Looked up again under the account lock: a renumber or move from
+            # another process may have moved the account since.
+            with FileLock(self.lock_file):
+                seq = self._get_sequence_data()
+                account_num = self._find_account_slot(seq, email, "") or account_num
+                if account_num not in seq.get("accounts", {}):
+                    raise ConfigError(
+                        "The account was removed while it was being updated; "
+                        "run `aswap add` again."
+                    )
+                self._write_account_credentials(
+                    account_num, email, credentials, reason="relogin"
+                )
+                self._write_account_config(account_num, email, config)
+                # A refreshed credential invalidates any dead-token quarantine on
+                # this slot (mirrors ``add_account``); otherwise the stale strike
+                # row keeps the account stuck at "re-login needed" and it never
+                # fetches the new token. Token accounts are always personal, so
+                # org is "".
+                self._usage_store.clear_dead_token(
+                    [account_num], {account_num: (email, "")}
+                )
+                seq["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, seq)
             kind_label = "API key" if is_api_key else "token"
             self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
             print(
@@ -4809,52 +5241,64 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
+        old_email = ""
+        # Writes under the account lock; an auto-assigned number is chosen
+        # again inside it so a concurrent add or renumber cannot take it.
+        with FileLock(self.lock_file):
+            if slot is None:
+                account_num = str(self._get_next_account_number())
+
+            if displace_slot:
+                d_num, d_email, d_org = displace_slot
+                self._delete_account_files(d_num, d_email)
+                data = self._get_sequence_data()
+                if int(d_num) in data["sequence"]:
+                    data["sequence"].remove(int(d_num))
+                del data["accounts"][d_num]
+                self._write_json(self.sequence_file, data)
+                self._prune_mappings(d_email, d_org)
+
+            if migrate_from:
+                data = self._get_sequence_data()
+                old_email = data["accounts"][migrate_from].get("email", "")
+                self._delete_account_files(migrate_from, old_email)
+                if int(migrate_from) in data["sequence"]:
+                    data["sequence"].remove(int(migrate_from))
+                del data["accounts"][migrate_from]
+                self._write_json(self.sequence_file, data)
+
+            self._write_account_credentials(
+                account_num, email, credentials, reason="relogin"
+            )
+            self._write_account_config(account_num, email, config)
+            # Reusing/overwriting a slot with a fresh credential lifts any
+            # dead-token quarantine carried by that slot's prior lineage
+            # (mirrors ``add_account``).
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (email, "")}
+            )
+
+            data = self._get_sequence_data()
+            record = {
+                "email": email,
+                "uuid": "",
+                "organizationUuid": "",
+                "organizationName": "",
+                "added": get_timestamp(),
+            }
+            if is_api_key:
+                record["kind"] = "api_key"
+            data["accounts"][account_num] = record
+            if int(account_num) not in data["sequence"]:
+                data["sequence"].append(int(account_num))
+                data["sequence"].sort()
+            data["lastUpdated"] = get_timestamp()
+
+            self._write_json(self.sequence_file, data)
         if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
-            data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
-            self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
+            self._forget_engine_slot(displace_slot[0], displace_slot[1])
         if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        self._write_account_credentials(
-            account_num, email, credentials, reason="relogin"
-        )
-        self._write_account_config(account_num, email, config)
-        # Reusing/overwriting a slot with a fresh credential lifts any dead-token
-        # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (email, "")}
-        )
-
-        data = self._get_sequence_data()
-        record = {
-            "email": email,
-            "uuid": "",
-            "organizationUuid": "",
-            "organizationName": "",
-            "added": get_timestamp(),
-        }
-        if is_api_key:
-            record["kind"] = "api_key"
-        data["accounts"][account_num] = record
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["lastUpdated"] = get_timestamp()
-
-        self._write_json(self.sequence_file, data)
+            self._forget_engine_slot(migrate_from, old_email)
         source_label = "API key" if is_api_key else "token"
         self._logger.info(f"Added account {account_num} from {source_label}: {email}")
         if migrate_from:
@@ -4949,6 +5393,10 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
+        # The number is free for the next `add`: drop the engine's quarantine,
+        # manual hold and anti-flap references to it, so the account that
+        # takes it next starts clean.
+        self._forget_engine_slot(account_num, email)
 
         # The weekly reset anchor is memory, not slot state: keep it so a
         # later re-add (or the resubscribe planner) still knows the schedule.
@@ -7470,14 +7918,44 @@ class ClaudeAccountSwitcher:
             if json_output else None
         )
 
+    def _check_expected(
+        self, data: dict, target_account: str, expect: tuple[str, str] | None
+    ) -> None:
+        """Raise RosterChangedError unless ``target_account`` holds ``expect``.
+
+        ``expect`` is the (email, organization uuid) the caller chose the
+        number for. A long-lived caller (the auto-switch engine) reads the
+        roster, decides, then switches; a renumber, move or swap from another
+        process in between would otherwise make it activate whoever sits at
+        that number now.
+        """
+        if expect is None:
+            return
+        record = (data or {}).get("accounts", {}).get(str(target_account))
+        if record is None or self._record_identity(record) != (
+            expect[0], expect[1] or ""
+        ):
+            raise RosterChangedError(
+                f"Account-{target_account} is no longer {expect[0]}: the "
+                "roster changed (renumber, move or swap); re-read it and retry"
+            )
+
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        expect: tuple[str, str] | None = None,
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+
+        ``expect`` (email, organization uuid) names the account the caller
+        means; when the number now holds someone else, RosterChangedError is
+        raised and nothing changes (checked again under the account lock).
         """
         if not statedb.exists(self.sequence_file):
             raise ConfigError("No accounts are managed yet")
@@ -7525,6 +8003,8 @@ class ClaudeAccountSwitcher:
             )
 
         data = self._get_sequence_data()
+        if expect is not None:
+            self._check_expected(data, target_account, expect)
         if target_account not in data.get("accounts", {}):
             raise AccountNotFoundError(f"Account-{target_account} does not exist")
 
@@ -7576,6 +8056,7 @@ class ClaudeAccountSwitcher:
             emit_output=not json_output,
             force_activate=force,
             provenance=provenance,
+            **({"expect": expect} if expect is not None else {}),
         )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
@@ -7959,8 +8440,12 @@ class ClaudeAccountSwitcher:
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        expect: tuple[str, str] | None = None,
     ) -> dict:
         """Perform the actual account switch with transaction support.
+
+        ``expect`` (see ``switch_to``) is re-checked under the account lock,
+        before anything is written.
 
         Returns ``{"from": ref|None, "to": ref, "warnings": [...]}``, capturing the
         left/landed identities under the lock so callers don't reconstruct ``from``
@@ -8029,6 +8514,11 @@ class ClaudeAccountSwitcher:
         # here is local I/O — no network while locks are held.
         with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
             data = self._get_sequence_data()
+            self._check_expected(data, target_account, expect)
+            if target_account not in data.get("accounts", {}):
+                raise AccountNotFoundError(
+                    f"Account-{target_account} does not exist"
+                )
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]

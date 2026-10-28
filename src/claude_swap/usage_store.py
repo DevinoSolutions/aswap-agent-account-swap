@@ -882,6 +882,16 @@ class UsageStore:
             and row.get("organizationUuid", "") == identity[1]
         )
 
+    def rekey(self, moves: dict[str, tuple[str, Identity]]) -> None:
+        """Carry rows to the accounts' new slot numbers after a move/renumber
+        (``moves``: old -> (new, identity)); see ``renumber.rekey_rows``."""
+        from claude_swap.renumber import rekey_rows
+
+        with self._lock():
+            rows, changed = rekey_rows(self._read_rows(), moves)
+            if changed:
+                self._write_rows(rows)
+
     def _fresh_row(self, identity: Identity) -> dict:
         return {"email": identity[0], "organizationUuid": identity[1]}
 
