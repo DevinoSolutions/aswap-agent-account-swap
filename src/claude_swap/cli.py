@@ -749,6 +749,8 @@ Examples:
   aswap auto --dry-run             # log decisions, never actually switch
 
 Defaults live in settings.json in the backup root; flags override them.
+A running loop picks up `aswap config set` changes within one tick, no
+restart; a setting given as a flag keeps its flag value until restart.
         """,
     )
     parser.add_argument(
@@ -825,7 +827,7 @@ Defaults live in settings.json in the backup root; flags override them.
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.printer import accent, yellowed
-    from claude_swap.settings import load_settings, merged_with_cli
+    from claude_swap.settings import cli_overrides, load_settings, merged_with_cli
 
     def jsonl_emit(event: AutoSwitchEvent) -> None:
         print(json.dumps(event.to_json()), flush=True)
@@ -856,6 +858,9 @@ Defaults live in settings.json in the backup root; flags override them.
             settings,
             jsonl_emit if args.json else human_emit,
             dry_run=args.dry_run,
+            # Flags hold for the life of the process; every other key
+            # follows `aswap config` changes from the next tick on.
+            pinned=cli_overrides(args),
         )
 
         if settings.warmup_five_hour and not args.dry_run and not args.json:
@@ -1068,6 +1073,13 @@ Examples:
   aswap config path                         # where the settings are stored
   aswap config export settings.json         # write them out to hand-edit
   aswap config import settings.json         # validate and load them back
+
+Changes apply to a running `aswap auto` within one tick (default 60s), no
+restart. A key `aswap auto` was started with as a flag (--threshold,
+--interval, --cooldown, --model, --strategy, --include-api-key-accounts)
+keeps the flag's value until that process restarts. A stored value that
+fails validation is ignored by a running `aswap auto`, which keeps its
+last good value and logs a warning.
         """,
     )
     parser.add_argument(

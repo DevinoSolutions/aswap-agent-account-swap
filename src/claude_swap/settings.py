@@ -617,6 +617,65 @@ def import_settings(backup_root: Path, raw) -> dict:
     return clean
 
 
+def settings_fingerprint(backup_root: Path) -> float | None:
+    """When the settings document was last written; None when there is none.
+
+    The state database keeps ``updated_at`` strictly increasing per document
+    (and a symlinked settings file reports its mtime), so a running engine
+    can tell "changed since I last looked" with one indexed lookup instead
+    of re-reading and re-parsing the document every tick.
+    """
+    try:
+        return statedb.mtime(settings_path(backup_root))
+    except OSError:  # absent (FileNotFoundError) or unreadable
+        return None
+
+
+def reload_autoswitch_settings(
+    backup_root: Path, previous: AutoSwitchSettings
+) -> tuple[AutoSwitchSettings, list[str]]:
+    """Re-read the ``autoswitch`` section for an engine that is already running.
+
+    Returns the new settings and one message per value that was refused.
+
+    Strict where :func:`load_settings` forgives: every stored value goes
+    through the validation ``aswap config set``/``import`` use, and a value
+    that fails it keeps ``previous``'s value for that key instead of being
+    clamped or reset to its default. A running engine therefore never moves
+    onto a value nobody chose — a hand edit or a half-applied import can only
+    leave it where it was. A key that is absent means its default (that is
+    what ``aswap config unset`` asks for). A document that cannot be read or
+    parsed at all keeps ``previous`` whole.
+    """
+    try:
+        raw = _read_raw_for_write(settings_path(backup_root))
+    except ConfigError as e:
+        return previous, [f"{e}; keeping the current settings"]
+    section = raw.get("autoswitch", {})
+    if not isinstance(section, dict):
+        return previous, [
+            "settings 'autoswitch' is not a JSON object; keeping the current settings"
+        ]
+    values: dict = {}
+    problems: list[str] = []
+    for spec in SETTING_SPECS.values():
+        if spec.section != "autoswitch":
+            continue
+        if spec.json_key not in section or (
+            # Older writers stored an unset model as null.
+            spec.kind == "string" and section[spec.json_key] is None
+        ):
+            values[spec.field] = spec.default
+            continue
+        try:
+            values[spec.field] = _parse_json_setting(spec, section[spec.json_key])
+        except ConfigError as e:
+            kept = getattr(previous, spec.field)
+            values[spec.field] = kept
+            problems.append(f"{e}; keeping {format_setting_value(kept)}")
+    return AutoSwitchSettings(**values), problems
+
+
 def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, bool]]:
     """(spec, effective value, explicitly set?) per key, in registry order.
 
@@ -638,8 +697,13 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     return rows
 
 
-def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
-    """Overlay non-None CLI overrides (argparse Namespace) onto settings."""
+def cli_overrides(args) -> dict:
+    """The AutoSwitchSettings fields a command line set: {field: value}.
+
+    A running ``aswap auto`` keeps these for its whole life — a flag is an
+    explicit choice for that process, so a later ``aswap config set`` of the
+    same key must not quietly undo it.
+    """
     overrides = {}
     for attr, field in (
         ("threshold", "threshold"),
@@ -652,6 +716,12 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         value = getattr(args, attr, None)
         if value is not None:
             overrides[field] = value
+    return overrides
+
+
+def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
+    """Overlay non-None CLI overrides (argparse Namespace) onto settings."""
+    overrides = cli_overrides(args)
     if not overrides:
         return settings
     return _clamped(dataclasses.replace(settings, **overrides))

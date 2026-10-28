@@ -944,11 +944,12 @@ class TestAutoCommand:
         tick_outcome = None  # set per test (TickOutcome)
 
         def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                     state_path=None, clock=None):
+                     state_path=None, clock=None, pinned=()):
             self.switcher = switcher
             self.settings = settings
             self.on_event = on_event
             self.dry_run = dry_run
+            self.pinned = set(pinned)
             type(self).instances.append(self)
 
         def tick(self):
@@ -1015,6 +1016,14 @@ class TestAutoCommand:
         assert engine.settings.threshold == 60.0     # CLI wins
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
         assert engine.settings.warmup_five_hour is True
+
+    def test_flags_are_pinned_against_live_reloads(self, temp_home):
+        # A running engine follows `aswap config set` for every key except
+        # the ones its command line set.
+        self._run(["--once", "--threshold", "60", "--strategy", "best"], temp_home)
+        assert self.FakeEngine.instances[-1].pinned == {"threshold", "strategy"}
+        self._run(["--once"], temp_home)
+        assert self.FakeEngine.instances[-1].pinned == set()
 
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)
