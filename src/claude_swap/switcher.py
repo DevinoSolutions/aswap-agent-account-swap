@@ -25,7 +25,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace
+from claude_swap import gate, oauth, pace
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -206,12 +206,16 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
             marker = _pace_marker(w, fetched_at) if label != "5h" else ""
             if w.get("resetAgoS") is not None:
                 marker += f"  (reset {oauth.ago_text(w['resetAgoS'])} ago, was {w.get('wasPct') or 0:.0f}%)"
+            # The rate-limit gate's own answer next to the endpoint's number,
+            # e.g. "100% (open, gate 99%)" (see gate.py).
+            note = gate.window_note(w)
+            pct_text = f"{w['pct']:>3.0f}%" + (f" ({note})" if note else "")
             cell = oauth.fresh_reset_strings(w)
             if cell:
                 countdown, clock = cell
-                rows.append((label, f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}"))
+                rows.append((label, f"{pct_text}   resets {clock:<12}  in {countdown}{marker}"))
             else:
-                rows.append((label, f"{w['pct']:>3.0f}%{marker}"))
+                rows.append((label, f"{pct_text}{marker}"))
     reset_credits = usage.get("reset_credits")
     if isinstance(reset_credits, dict) and isinstance(
         reset_credits.get("available"), int
@@ -423,6 +427,8 @@ class ClaudeAccountSwitcher:
             self.backup_dir / "cache", on_measure=self._observe_usage,
             on_forbidden=self._observe_forbidden,
         )
+        # Rate-limit gate answers (gate.py), next to the usage they qualify.
+        self._gate_store = gate.GateStore(self.backup_dir / "cache")
         self._billing = BillingCache(
             self.backup_dir / "cache", sessions=self._sessions, anchors=self._anchors
         )
@@ -5651,10 +5657,107 @@ class ClaudeAccountSwitcher:
                 ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
 
-        return {
-            num: with_sentinel(entries[num], sentinels.get(num))
-            for num in info_by_num
+        gates = self._gate_rows(identities)
+        now = store.clock()
+        out: dict[str, UsageEntry] = {}
+        for num in info_by_num:
+            entry = with_sentinel(entries[num], sentinels.get(num))
+            if num in gates and entry.last_good is not None:
+                # Display only: a fresh gate answer rides on the windows it
+                # qualifies (`7d: 100% (open, gate 99%)`). Decisions read the
+                # gate store themselves, with their own freshness rules.
+                shown = gate.annotate(entry.last_good, gates[num], now)
+                if shown is not entry.last_good:
+                    entry = dataclasses.replace(entry, last_good=shown)
+            out[num] = entry
+        return out
+
+    def _gate_rows(self, identities: dict[str, tuple[str, str]]) -> dict[str, dict]:
+        try:
+            return self._gate_store.records(identities)
+        except Exception:
+            self._logger.debug("Gate records unreadable", exc_info=True)
+            return {}
+
+    def gate_records(self) -> dict[str, dict]:
+        """Stored rate-limit gate answers per slot (see gate.py); never raises."""
+        data = self._get_sequence_data() or {}
+        identities = {
+            str(num): (acc.get("email", ""), acc.get("organizationUuid", "") or "")
+            for num, acc in (data.get("accounts") or {}).items()
+            if isinstance(acc, dict)
         }
+        return self._gate_rows(identities)
+
+    def _gate_access_token(
+        self, info: tuple[int, str, str, str, bool, str, str]
+    ) -> str | None:
+        """The access token the usage poll would send for this slot, if it is
+        still valid — strictly read-only.
+
+        The same source the usage fetch picks (the live login for the active
+        slot; an inactive slot's session profile when it is the slot's own and
+        unexpired, else its backup), and no refresh of any kind: an expired
+        token waits for the usage poll, which owns rotation. The probe only
+        ever runs on accounts the poll has just read, so this rarely skips.
+        """
+        num, email, _, org_uuid, is_active, creds, _alias = info
+        sources: list[str] = []
+        if not is_active:
+            from claude_swap.session import (
+                read_session_credentials,
+                session_identity_drifted,
+            )
+
+            session_dir = self._session_dir(str(num), email)
+            session_creds = read_session_credentials(session_dir)
+            if session_creds and not session_identity_drifted(
+                session_dir, email, org_uuid
+            ):
+                sources.append(session_creds)
+        sources.append(creds)
+        for source in sources:
+            data = oauth.extract_oauth_data(source or "")
+            access = data.get("accessToken") if data else None
+            if access and not oauth.is_oauth_token_expired(data.get("expiresAt")):
+                return access
+        return None
+
+    def probe_gates(self, numbers: list[str], now: float) -> dict[str, dict]:
+        """Probe the rate-limit gate of these slots in parallel and store the
+        answers; returns the stored rows (see gate.py). Never raises."""
+        try:
+            infos = {str(i[0]): i for i in self._build_accounts_info()}
+            jobs = [
+                (num, infos[num])
+                for num in numbers
+                if num in infos and self._account_kind(num) != "api_key"
+            ]
+            if not jobs:
+                return {}
+
+            def run(job) -> tuple[str, gate.GateOutcome]:
+                num, info = job
+                try:
+                    access = self._gate_access_token(info)
+                    if access is None:
+                        return num, gate.GateOutcome(None, error="token-expired")
+                    return num, gate.request_gate(access, now)
+                except Exception as e:  # recorded, so it is throttled too
+                    return num, gate.GateOutcome(None, error=type(e).__name__)
+
+            with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+                outcomes = dict(executor.map(run, jobs))
+            identities = {num: (info[1], info[3] or "") for num, info in jobs}
+            for num, outcome in outcomes.items():
+                if outcome.error is not None:
+                    self._logger.debug(
+                        "Gate probe for account %s failed: %s", num, outcome.error
+                    )
+            return self._gate_store.record(outcomes, identities, now)
+        except Exception:
+            self._logger.warning("Gate probe pass failed", exc_info=True)
+            return {}
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?
