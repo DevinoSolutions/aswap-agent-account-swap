@@ -365,21 +365,26 @@ class Box:
     def _create_keychain(self) -> None:
         """macOS: a fresh, unlocked default keychain for this box alone.
 
-        ``security`` finds the user's keychain list and default keychain
-        through ``$HOME``, so with the box's HOME neither exists and the first
-        write would block on a dialog. Registering one under the box's HOME
-        gives every box (and every aswap process it runs) its own Keychain,
-        so parallel tests and a developer's login keychain never meet."""
-        kc = self.home / "Library" / "Keychains" / "aswap-e2e.keychain-db"
+        With no keychain preferences of its own, ``security`` falls back to
+        ``~/Library/Keychains/login.keychain-db``, resolved through
+        ``$HOME``: under the box's HOME there is none, and the first write
+        blocks on a dialog. Creating that file in the box (and leaving the
+        user-domain preferences alone, which live outside HOME) gives every
+        box, and every aswap process it runs, its own Keychain, so parallel
+        tests and a developer's real login keychain never meet."""
+        kc = self.home / "Library" / "Keychains" / "login.keychain-db"
         kc.parent.mkdir(parents=True)
         self.security("create-keychain", "-p", "", str(kc))
         self.security("set-keychain-settings", str(kc))  # no auto-lock
         self.security("unlock-keychain", "-p", "", str(kc))
-        self.security("list-keychains", "-d", "user", "-s", str(kc))
-        self.security("default-keychain", "-d", "user", "-s", str(kc))
-        default = self.security("default-keychain").stdout.strip().strip('"')
-        if Path(default).resolve() != kc.resolve():
-            raise AssertionError(f"box keychain not the default for its HOME: {default!r}")
+        done = self.security("default-keychain", check=False)
+        default = done.stdout.strip().strip('"')
+        if done.returncode != 0 or Path(default).resolve() != kc.resolve():
+            search = self.security("list-keychains", check=False)
+            raise AssertionError(
+                f"the box keychain is not the default under its HOME: "
+                f"default-keychain -> {done.returncode} {default!r} {done.stderr.strip()!r}; "
+                f"list-keychains -> {search.stdout.strip()!r} {search.stderr.strip()!r}")
         self.keychain = kc
 
     def live_credentials(self) -> dict | None:
@@ -418,8 +423,8 @@ class Box:
     def cleanup(self) -> None:
         for proc in self.autos:
             proc.kill()
-        if getattr(self, "keychain", None):
-            self.security("delete-keychain", str(self.keychain), check=False)
+        # A box's keychain is a file under its HOME and goes with tmp_path;
+        # `security delete-keychain` would edit the user's real search list.
 
     def collect_artifacts(self) -> None:
         """Copy aswap's own logs next to the transcript and request log."""

@@ -63,7 +63,7 @@ The fake's request log (`fake-requests.jsonl`) records method, path, status and 
 
 ### macOS
 
-On macOS, aswap and Claude Code keep credentials in the Keychain, and the e2e tests use the real one. `security` locates the user's keychains through `$HOME`, so each test creates its own unlocked keychain under its temporary HOME and registers it there as the default; every `aswap` process the test starts uses that keychain and nothing else. Your login keychain is never read or written, and the test keychain is deleted afterwards.
+On macOS, aswap and Claude Code keep credentials in the Keychain, and the e2e tests use the real one. With no keychain preferences of its own, `security` falls back to `~/Library/Keychains/login.keychain-db` resolved through `$HOME`, so each test creates an unlocked `login.keychain-db` under its temporary HOME; every `aswap` process the test starts uses that keychain and nothing else. Your own login keychain and keychain settings are never read or written.
 
 ### Running the fake on its own
 
