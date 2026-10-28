@@ -40,7 +40,7 @@ import math
 import random
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -56,7 +56,16 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    SETTING_SPECS,
+    AutoSwitchSettings,
+    atomic_write_json,
+    format_setting_value,
+    load_settings,
+    parse_model_names,
+    reload_autoswitch_settings,
+    settings_fingerprint,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 from claude_swap.warmup import (
@@ -116,6 +125,14 @@ LIVE_MIN_TICK_S = scaled(5.0)
 # How often a running engine heals damaged state files and checks whether a
 # snapshot is due (snapshots themselves are hourly; see snapshots.py).
 MAINTAIN_INTERVAL_S = scaled(300.0)
+# How often a sleeping engine looks for a settings change (one indexed
+# lookup of the settings document's ``updated_at``). A change ends the sleep,
+# so ``aswap config set`` reaches a running ``aswap auto`` within this long
+# even while it waits out an exhausted account's reset.
+SETTINGS_WATCH_S = scaled(10.0)
+_AUTOSWITCH_SPECS = tuple(
+    spec for spec in SETTING_SPECS.values() if spec.section == "autoswitch"
+)
 
 # Idle-hold cap (elapsed, not ticks — the hold itself slows the cadence to
 # NO_RESET_FALLBACK_S): an owned-and-expired token normally means Claude Code
@@ -635,6 +652,45 @@ class ConfigWarningEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class SettingsReloadedEvent(AutoSwitchEvent):
+    """A running engine picked up a settings change (``aswap config set``,
+    ``unset`` or ``import``) and uses it from this tick on.
+
+    ``changes`` holds ``(key, old, new)`` per setting whose effective value
+    moved; ``pinned`` holds ``(key, stored, kept)`` per setting whose stored
+    value changed but that a command-line flag (or the TUI's session
+    threshold) holds for this process. Only setting values are reported."""
+
+    kind: ClassVar[str] = "settings-reloaded"
+    changes: tuple[tuple[str, object, object], ...] = ()
+    pinned: tuple[tuple[str, object, object], ...] = ()
+
+    def _fields(self) -> dict:
+        return {
+            "changes": [
+                {"key": key, "old": old, "new": new}
+                for key, old, new in self.changes
+            ],
+            "pinned": [
+                {"key": key, "stored": stored, "kept": kept}
+                for key, stored, kept in self.pinned
+            ],
+        }
+
+    def human(self) -> str:
+        parts = [
+            f"{key} {format_setting_value(old)} -> {format_setting_value(new)}"
+            for key, old, new in self.changes
+        ]
+        parts += [
+            f"{key} stays {format_setting_value(kept)} (set for this run; "
+            f"stored {format_setting_value(stored)} applies after a restart)"
+            for key, stored, kept in self.pinned
+        ]
+        return "settings reloaded: " + "; ".join(parts)
+
+
+@dataclass(frozen=True)
 class WarmupAutoEvent(AutoSwitchEvent):
     """One guarded five-hour warm-up decision emitted by ``aswap auto``."""
 
@@ -837,9 +893,26 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        pinned: Iterable[str] = (),
     ):
         self.switcher = switcher
         self.settings = settings
+        # Live settings (see ``_reload_settings``): the settings document's
+        # fingerprint as last read, its autoswitch section as last read, and
+        # the fields this process keeps whatever the document says --
+        # ``pinned`` (command-line flags) plus any field the caller passed
+        # differently from the document (a TUI session threshold, a caller's
+        # own settings). Fingerprint first: a write racing these reads is
+        # then seen again next tick rather than missed.
+        self._settings_fp = settings_fingerprint(switcher.backup_dir)
+        self._stored_settings, _problems = reload_autoswitch_settings(
+            switcher.backup_dir, load_settings(switcher.backup_dir)
+        )
+        self._pinned: set[str] = set(pinned) | {
+            spec.field
+            for spec in _AUTOSWITCH_SPECS
+            if getattr(settings, spec.field) != getattr(self._stored_settings, spec.field)
+        }
         self._maintained_at = float("-inf")
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
@@ -1189,6 +1262,7 @@ class AutoSwitchEngine:
         self._time_to_limit = None
         self._limit_guard = False
         self.manual_hold = None
+        self._reload_settings()
         settings = self.settings
         self._caps = {
             num: tier_capacity(inputs["tier"])
@@ -3220,6 +3294,7 @@ class AutoSwitchEngine:
         state) are fixed at construction. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
+        self._pinned.add("threshold")  # a stored change must not undo it
         self.switcher.set_poll_policy_inputs(threshold, self._models)
 
     def apply_warmup_enabled(self, enabled: bool) -> None:
@@ -3227,13 +3302,112 @@ class AutoSwitchEngine:
         if enabled == self.settings.warmup_five_hour:
             return
         self.settings = replace(self.settings, warmup_five_hour=enabled)
+        self._restart_warmup(enabled)
+        self._wake.set()
+
+    def _restart_warmup(self, enabled: bool) -> None:
         if self._warmup is not None:
             self._warmup.stop()
         self._warmup = None
         self._next_warmup_at = None
         if enabled:
             self._enable_warmup()
-        self._wake.set()
+
+    # -- live settings ----------------------------------------------------------
+
+    def _settings_changed(self) -> bool:
+        return settings_fingerprint(self.switcher.backup_dir) != self._settings_fp
+
+    def _reload_settings(self) -> None:
+        """Pick up an ``aswap config`` change made while this engine runs.
+
+        Runs at the top of every tick, before the tick snapshots
+        ``self.settings``, so a whole tick decides on one set of values. Costs
+        one indexed lookup unless the settings document was written since the
+        last look; then its autoswitch section is re-read strictly (see
+        ``reload_autoswitch_settings``) and every key whose stored value
+        changed is applied, except the pinned ones. Never raises: a failed
+        reload keeps the settings the engine already has.
+
+        What a change does NOT reset: the manual hold (it lives in the state
+        file; a new ``manualHoldMinutes`` re-times the hold already running,
+        and 0 ends it), cooldown and quarantine state, the burn-rate history,
+        the unhealthy-tick count, gate verdicts and the usage cache. A
+        ``model`` change does restart the burn samples -- they measured the
+        old axes -- and the one-shot model-name check; an ``autoAddAccounts``
+        change forgets the half-confirmed login observation, so a login is
+        still adopted only after two polls under the new value.
+        """
+        try:
+            fp = settings_fingerprint(self.switcher.backup_dir)
+            if fp == self._settings_fp:
+                return
+            stored, problems = reload_autoswitch_settings(
+                self.switcher.backup_dir, self._stored_settings
+            )
+            self._settings_fp = fp
+        except Exception:
+            _logger.debug("settings reload failed", exc_info=True)
+            return
+        for message in problems:
+            _logger.warning("settings reload: %s", message)
+            self._emit(ConfigWarningEvent(message=message))
+        previous_stored, self._stored_settings = self._stored_settings, stored
+        updates: dict = {}
+        changes: list[tuple[str, object, object]] = []
+        pinned: list[tuple[str, object, object]] = []
+        for spec in _AUTOSWITCH_SPECS:
+            new = getattr(stored, spec.field)
+            if new == getattr(previous_stored, spec.field):
+                continue
+            current = getattr(self.settings, spec.field)
+            if spec.field in self._pinned:
+                pinned.append((spec.dotted, new, current))
+            elif new != current:
+                updates[spec.field] = new
+                changes.append((spec.dotted, current, new))
+        if not changes and not pinned:
+            return
+        old = self.settings
+        if updates:
+            self.settings = replace(old, **updates)
+            self._settings_applied(old, self.settings)
+        event = SettingsReloadedEvent(changes=tuple(changes), pinned=tuple(pinned))
+        _logger.info("%s", event.human())
+        self._emit(event)
+
+    def _settings_applied(
+        self, old: AutoSwitchSettings, new: AutoSwitchSettings
+    ) -> None:
+        """Carry a reloaded value into the state derived from it."""
+        if new.model != old.model:
+            self._models = parse_model_names(new.model)
+            self._model_check_done = not self._models
+            self._burn = BurnTracker()
+        if new.threshold != old.threshold or new.model != old.model:
+            self.switcher.set_poll_policy_inputs(new.threshold, self._models)
+        if new.auto_add_accounts != old.auto_add_accounts:
+            self._live_login_seen = None
+            self._auto_add_hinted = False
+        if new.warmup_five_hour != old.warmup_five_hour:
+            self._restart_warmup(new.warmup_five_hour)
+
+    def _sleep(self, delay: float) -> None:
+        """Wait ``delay`` seconds, ending early on wake/stop or a settings change.
+
+        Sliced by count, not against a deadline, so a test that stubs the
+        wait still finishes in a bounded number of slices.
+        """
+        slices = max(1, math.ceil(delay / SETTINGS_WATCH_S))
+        step = delay / slices
+        for _ in range(slices):
+            if self._wake.wait(step) or self._stop.is_set():
+                return
+            try:
+                if self._settings_changed():
+                    return  # the next tick applies it
+            except Exception:
+                pass
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
@@ -3332,4 +3506,4 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
-            self._wake.wait(delay)
+            self._sleep(delay)

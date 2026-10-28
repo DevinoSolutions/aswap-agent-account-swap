@@ -21,9 +21,12 @@ from claude_swap.settings import (
     load_profile_settings,
     load_settings,
     load_ui_settings,
+    cli_overrides,
     merged_with_cli,
+    reload_autoswitch_settings,
     save_settings,
     set_setting,
+    settings_fingerprint,
     settings_path,
     unset_setting,
 )
@@ -373,6 +376,103 @@ class TestMergedWithCli:
     def test_strategy_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
         assert merged.strategy == "consume-first"
+
+
+class TestReloadAutoswitchSettings:
+    """The strict re-read a running ``aswap auto`` applies mid-run."""
+
+    def _write(self, root: Path, section) -> None:
+        settings_path(root).write_text(
+            json.dumps({"schemaVersion": 1, "autoswitch": section})
+        )
+
+    def test_valid_values_are_taken(self, tmp_path: Path):
+        self._write(tmp_path, {"threshold": 72, "autoAddAccounts": False})
+        loaded, problems = reload_autoswitch_settings(tmp_path, AutoSwitchSettings())
+        assert problems == []
+        assert loaded.threshold == 72.0
+        assert loaded.auto_add_accounts is False
+
+    def test_an_absent_key_is_its_default_not_the_previous_value(self, tmp_path: Path):
+        # `aswap config unset` removes the key: that asks for the default.
+        self._write(tmp_path, {})
+        previous = AutoSwitchSettings(threshold=72.0, strategy="consume-first")
+        loaded, problems = reload_autoswitch_settings(tmp_path, previous)
+        assert problems == []
+        assert loaded == AutoSwitchSettings()
+
+    def test_missing_document_is_all_defaults(self, tmp_path: Path):
+        loaded, problems = reload_autoswitch_settings(
+            tmp_path, AutoSwitchSettings(threshold=72.0)
+        )
+        assert (loaded, problems) == (AutoSwitchSettings(), [])
+
+    @pytest.mark.parametrize("key, bad", [
+        ("threshold", 120),        # out of range: load would clamp to 99.9
+        ("threshold", "80"),       # a quoted number
+        ("autoAddAccounts", "false"),  # truthy string
+        ("strategy", "fastest"),   # not a choice
+        ("unhealthyTicks", 2.5),   # not an integer
+        ("intervalSeconds", True),
+    ])
+    def test_an_invalid_value_keeps_the_previous_one(self, tmp_path: Path, key, bad):
+        spec = SETTING_SPECS[f"autoswitch.{key}"]
+        previous = AutoSwitchSettings(
+            threshold=72.0, auto_add_accounts=False, strategy="consume-first",
+            unhealthy_ticks=7, interval_seconds=120.0,
+        )
+        self._write(tmp_path, {key: bad, "cooldownSeconds": 5})
+        loaded, problems = reload_autoswitch_settings(tmp_path, previous)
+        assert getattr(loaded, spec.field) == getattr(previous, spec.field)
+        assert loaded.cooldown_seconds == 5.0  # the valid key still applies
+        assert len(problems) == 1
+        assert problems[0].startswith(f"autoswitch.{key} ")
+        assert "keeping" in problems[0]
+
+    def test_a_null_model_is_the_default(self, tmp_path: Path):
+        # save_settings writes every key, an unset model as null.
+        self._write(tmp_path, {"model": None})
+        loaded, problems = reload_autoswitch_settings(
+            tmp_path, AutoSwitchSettings(model="Fable")
+        )
+        assert loaded.model is None
+        assert problems == []
+
+    def test_an_unparseable_document_keeps_everything(self, tmp_path: Path):
+        previous = AutoSwitchSettings(threshold=72.0)
+        settings_path(tmp_path).write_text("{not json")
+        loaded, problems = reload_autoswitch_settings(tmp_path, previous)
+        assert loaded is previous
+        assert len(problems) == 1 and "keeping the current settings" in problems[0]
+
+    def test_a_non_object_section_keeps_everything(self, tmp_path: Path):
+        previous = AutoSwitchSettings(threshold=72.0)
+        self._write(tmp_path, [1, 2])
+        loaded, problems = reload_autoswitch_settings(tmp_path, previous)
+        assert loaded is previous
+        assert problems
+
+
+class TestSettingsFingerprint:
+    def test_absent_is_none(self, tmp_path: Path):
+        assert settings_fingerprint(tmp_path) is None
+
+    def test_follows_the_document_write_time(self, tmp_path: Path):
+        import os
+
+        set_setting(tmp_path, "autoswitch.threshold", "80")
+        first = settings_fingerprint(tmp_path)
+        assert first is not None
+        os.utime(settings_path(tmp_path), (first + 5, first + 5))
+        assert settings_fingerprint(tmp_path) == first + 5
+
+
+class TestCliOverrides:
+    def test_only_given_flags(self):
+        assert cli_overrides(_args()) == {}
+        assert cli_overrides(_args(threshold=70.0, include_api_key_accounts=False)) == {
+            "threshold": 70.0, "include_api_key_accounts": False,
+        }
 
 
 class TestAtomicWriteThroughSymlink:
