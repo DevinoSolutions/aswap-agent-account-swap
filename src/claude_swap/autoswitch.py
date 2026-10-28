@@ -46,6 +46,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
+from claude_swap.endpoints import scaled  # test-only clock scale (1.0 outside tests)
 from claude_swap import gate, live_usage, oauth, poll_policy, snapshots, statedb
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
@@ -103,25 +104,25 @@ FRESHEN_BUFFER_MS = 10 * 60 * 1000
 # cadence: providers can grant quota before the previously reported reset, and
 # a long engine sleep must not suppress the fetch that discovers it.
 MAX_SLEEP_S = poll_policy.EXHAUSTED_INTERVAL_S
-NO_RESET_FALLBACK_S = 300.0
+NO_RESET_FALLBACK_S = scaled(300.0)
 # Tick cadence while the statusline feeds live usage for the active account
 # (see live_usage). Reading those files is free — the usage-endpoint budget
 # is untouched — so the engine can react within seconds when many parallel
 # sessions burn the active account faster than any poll interval.
-LIVE_TICK_S = 20.0
+LIVE_TICK_S = scaled(20.0)
 # Floor for the faster live ticks taken while the active account closes on
 # its limit.
-LIVE_MIN_TICK_S = 5.0
+LIVE_MIN_TICK_S = scaled(5.0)
 # How often a running engine heals damaged state files and checks whether a
 # snapshot is due (snapshots themselves are hourly; see snapshots.py).
-MAINTAIN_INTERVAL_S = 300.0
+MAINTAIN_INTERVAL_S = scaled(300.0)
 
 # Idle-hold cap (elapsed, not ticks — the hold itself slows the cadence to
 # NO_RESET_FALLBACK_S): an owned-and-expired token normally means Claude Code
 # is idle and will self-heal on next use, but a *dead* refresh token with an
 # active user would look identical forever, so after this long the engine
 # falls back to normal unhealthy counting.
-IDLE_HOLD_MAX_S = 30 * 60.0
+IDLE_HOLD_MAX_S = scaled(30 * 60.0)
 
 # Anti-flap margin for the every-account-above-threshold escape, measured on
 # the axis that escape ranks by: a target must come back at least this much
@@ -229,7 +230,7 @@ RUNWAY_MARGIN_S = 5 * 60.0
 OPTIONAL_TRIGGERS = frozenset({"consume-first"})
 # A held-off optional move is logged at most this often (the hold itself is
 # logged once, when it starts); the NoSwitchEvent still goes out every tick.
-HOLD_NOTE_INTERVAL_S = 15 * 60.0
+HOLD_NOTE_INTERVAL_S = scaled(15 * 60.0)
 
 
 def manual_hold_until(

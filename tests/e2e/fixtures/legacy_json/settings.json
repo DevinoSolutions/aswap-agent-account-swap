@@ -1,0 +1,6 @@
+{
+  "autoswitch": {
+    "threshold": 85.0,
+    "manualHoldMinutes": 15.0
+  }
+}

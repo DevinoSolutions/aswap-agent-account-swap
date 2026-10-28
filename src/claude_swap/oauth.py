@@ -11,11 +11,15 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from claude_swap import endpoints
 from claude_swap.printer import warning as print_warning
 
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
+# The default; requests resolve it per call through ``endpoints`` so
+# ``ASWAP_API_BASE_URL`` can point them at a local test server.
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+OAUTH_TOKEN_PATH = "/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 _logger = logging.getLogger("claude-swap")
@@ -165,7 +169,7 @@ def try_refresh_oauth_credentials(
         }).encode()
 
         req = urllib.request.Request(
-            OAUTH_TOKEN_URL,
+            endpoints.oauth_base() + OAUTH_TOKEN_PATH,
             data=body,
             headers={
                 "Content-Type": "application/json",
@@ -255,7 +259,7 @@ def refresh_oauth_credentials(credentials: str) -> str | None:
 
 def request_profile_data(access_token: str) -> dict:
     """Request the raw ``/api/oauth/profile`` payload (account + organization)."""
-    url = "https://api.anthropic.com/api/oauth/profile"
+    url = endpoints.api_base() + "/api/oauth/profile"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -469,7 +473,7 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
 
 def request_usage_data(access_token: str) -> dict:
     """Request raw utilization data from the Anthropic usage API."""
-    url = "https://api.anthropic.com/api/oauth/usage"
+    url = endpoints.api_base() + "/api/oauth/usage"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": OAUTH_BETA_HEADER,

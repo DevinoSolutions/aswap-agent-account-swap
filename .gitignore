@@ -11,3 +11,6 @@ wheels/
 
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
+
+# e2e test artifacts (tests/e2e; ASWAP_E2E_ARTIFACTS overrides)
+.e2e-artifacts/

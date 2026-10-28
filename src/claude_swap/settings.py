@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap import statedb
+from claude_swap.endpoints import scaled  # test-only clock scale (1.0 outside tests)
 from claude_swap.exceptions import ConfigError
 from claude_swap.fsutil import replace_with_retry
 
@@ -166,7 +167,8 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Switch when the binding 5h/7d window reaches this pct",
         ),
         SettingSpec(
-            "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
+            "autoswitch", "intervalSeconds", "interval_seconds", "float",
+            scaled(15.0), 3600.0,
             help="Poll interval for the aswap auto loop, in seconds",
         ),
         SettingSpec(

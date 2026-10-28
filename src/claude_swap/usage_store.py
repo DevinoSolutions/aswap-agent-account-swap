@@ -36,6 +36,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from claude_swap.endpoints import scaled  # test-only clock scale (1.0 outside tests)
 from claude_swap import statedb
 from claude_swap.locking import FileLock
 from claude_swap import oauth
@@ -56,13 +57,13 @@ SCHEMA_VERSION = 2
 # SERVE_TTL_S (re-exported from poll_policy — fresher than this → serve
 # without fetching) doubles as the per-account sustained-rate governor: see
 # poll_policy's module docstring for the measured budget it must stay under.
-STALE_OK_S = 300.0  # trusted for switch decisions; older → headroom unknown
+STALE_OK_S = scaled(300.0)  # trusted for switch decisions; older → headroom unknown
 # Covers the bounded refresh + usage path, the full inventory's stagger, and
 # executor queueing, so another surface cannot reclaim a request that is still
 # in flight. A crashed collector waiting 90s remains below the provider-safe
 # polling interval.
-CLAIM_TTL_S = 90.0  # in-flight claim window: skip just-claimed accounts
-LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
+CLAIM_TTL_S = scaled(90.0)  # in-flight claim window: skip just-claimed accounts
+LEGACY_CLAIM_TTL_S = scaled(10.0)  # additive-schema overlap with older collectors
 
 # Floor on how fresh a row may be and still be re-fetched on demand
 # (``aswap usage refresh --max-age``). The cadence gate exists to keep the
@@ -70,7 +71,7 @@ LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
 # hatch must be a door, not a hole, so nothing may ask for a number newer
 # than this. Paired with a global one-sweep-per-MIN_FORCED_AGE_S stamp, so a
 # looping caller cannot melt the endpoint either.
-MIN_FORCED_AGE_S = 30.0
+MIN_FORCED_AGE_S = scaled(30.0)
 
 
 def _live_claim(
@@ -98,7 +99,7 @@ def _live_claim(
 # (escalate-all, unhealthy ticks, verified failover) takes back over. The
 # ceiling deliberately overrides even a Retry-After longer than itself —
 # trust must never be server-controlled and unbounded.
-TRUST_MAX_AGE_S = 3600.0
+TRUST_MAX_AGE_S = scaled(3600.0)
 
 # A usage-endpoint 429 is a polling throttle, not a change in the account's
 # real model quota: the endpoint budgets *usage requests* (scope is
@@ -116,11 +117,11 @@ TRUST_MAX_AGE_S = 3600.0
 # Fallback ceiling for 429-stale data that carries no resets_at (older stored
 # rows): still bounded so it can't be trusted forever. Non-429 failures always
 # use TRUST_MAX_AGE_S (a timeout/network error is no evidence last_good holds).
-RATE_LIMIT_TRUST_MAX_AGE_S = 7200.0
+RATE_LIMIT_TRUST_MAX_AGE_S = scaled(7200.0)
 
 # Failure backoff when the server sent no Retry-After: 30s · 2^(n-1), capped.
-BACKOFF_BASE_S = 30.0
-BACKOFF_CAP_S = 600.0
+BACKOFF_BASE_S = scaled(30.0)
+BACKOFF_CAP_S = scaled(600.0)
 # Exponent clamp: a permanently failing account increments its failure count
 # forever, and 2**n stops converting to float at n >= 1024 (OverflowError).
 # The curve already saturates at BACKOFF_CAP_S by shift 5, so any cap above
@@ -208,7 +209,7 @@ BACKOFF_MAX_SHIFT = 32
 # +3.0s (included, a lapse inside the band). Either reading sizes the
 # constant identically — both put the band edge at +887s, so
 # RETRY_AFTER_MARGIN_S = 900 clears it with 13s to spare under both.
-RETRY_AFTER_MARGIN_S = 900.0
+RETRY_AFTER_MARGIN_S = scaled(900.0)
 # Bounds Retry-After + MARGIN_S, so a pathological header still cannot park an
 # account for hours. Sized to clear the measured shape: 40 of 41 observed
 # blocks opened at exactly 3600 (re-measured 2026-08-03, method above), and
@@ -221,7 +222,7 @@ RETRY_AFTER_MARGIN_S = 900.0
 # more there than preserving a margin derived from hour-scale blocks. If real
 # blocks ever open above 3600, raise this with the shape rather than letting
 # the cap silently shorten the margin.
-RETRY_AFTER_FLOOR_CAP_S = 4500.0
+RETRY_AFTER_FLOOR_CAP_S = scaled(4500.0)
 
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
 # e.g. "Refresh token not found or invalid") can never recover on its own —

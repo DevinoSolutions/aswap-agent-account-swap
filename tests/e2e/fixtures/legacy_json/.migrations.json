@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "applied": {
+    "windows_keyring_to_files": "2026-10-01T09:00:00Z",
+    "macos_keyring_to_security": "2026-10-01T09:00:00Z"
+  }
+}

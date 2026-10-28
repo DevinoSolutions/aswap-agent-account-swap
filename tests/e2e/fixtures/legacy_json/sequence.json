@@ -1,0 +1,24 @@
+{
+  "activeAccountNumber": 1,
+  "lastUpdated": "2026-10-20T09:00:00Z",
+  "sequence": [
+    1,
+    2
+  ],
+  "accounts": {
+    "1": {
+      "email": "legacy-one@e2e.test",
+      "uuid": "acct-legacy-0001",
+      "organizationUuid": "org-legacy-0001",
+      "organizationName": "Legacy One Org",
+      "added": "2026-10-01T09:00:00Z"
+    },
+    "2": {
+      "email": "legacy-two@e2e.test",
+      "uuid": "acct-legacy-0002",
+      "organizationUuid": "org-legacy-0002",
+      "organizationName": "Legacy Two Org",
+      "added": "2026-10-01T09:00:00Z"
+    }
+  }
+}
