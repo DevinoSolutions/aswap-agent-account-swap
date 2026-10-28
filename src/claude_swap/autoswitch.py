@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import live_usage, oauth, poll_policy, snapshots, statedb
+from claude_swap import gate, live_usage, oauth, poll_policy, snapshots, statedb
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -203,6 +203,15 @@ LANDING_BURN_WINDOW_S = 30 * 60.0
 # picking up the new credentials, with margin. Makes a threshold close to
 # 100 safe, so less of each account is left behind.
 LIMIT_GUARD_S = 3 * 60.0
+
+# A proactive move must buy meaningfully more time than it leaves: the
+# target's runway (at the same peak burn the landing check uses) at least
+# RUNWAY_RATIO times the active's, or RUNWAY_MARGIN_S longer. Otherwise the
+# engine rides the active to its limit and lets the at-limit escape move it.
+# Measured 2026-10-27: the limit guard cycled 1 -> 14 -> 23 -> 1 every
+# 10-60 s, each move "target runway ~1 min; limit projected in 0.7 min".
+RUNWAY_RATIO = 2.0
+RUNWAY_MARGIN_S = 5 * 60.0
 
 # Triggers that only OPTIMISE where the work runs; nothing breaks if they
 # wait. After a switch made outside the engine (by hand: `aswap switch`, the
@@ -872,6 +881,15 @@ class AutoSwitchEngine:
         self._time_to_limit: float | None = None
         self._limit_guard = False
         self._collected_at = 0.0
+        # Rate-limit gate (gate.py): this tick's stored/live answers, the
+        # verdict each one gave, the verdict last logged per account, and the
+        # active's raw statusline readings. ``_runway_refused`` is the
+        # active's runway when the last ranking refused targets on it.
+        self._gate_recs: dict[str, dict] = {}
+        self._gate_verdicts: dict[str, str] = {}
+        self._gate_logged: dict[str, str] = {}
+        self._live_now: list[dict] = []
+        self._runway_refused: float | None = None
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -1226,6 +1244,7 @@ class AutoSwitchEngine:
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
+        headroom = self._gate_pass(current, usage, quarantined)
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1279,11 +1298,25 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        # Riding an open gate: the endpoint says 100% but the API still serves
+        # this account. Neither the limit guard nor the burn projection mean
+        # anything on an estimated half point; the next closed gate (re-probed
+        # every few minutes) is the at-limit escape.
+        riding = self._gate_verdicts.get(current) == gate.OPEN
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            self._burn.record(self._collected_at, current, utilization, self._cap(current))
+            # Burn is measured on the endpoint's own numbers, never the gate's
+            # estimate, so a gate flip is not read as burn or as a rollover.
+            value = usage.get(current)
+            raw = oauth.account_headroom(
+                value if isinstance(value, dict) else None, self._models
+            )
+            self._burn.record(
+                self._collected_at, current,
+                100.0 - raw if raw is not None else utilization, self._cap(current),
+            )
             self._burn_rate = self._burn.rate()
             if self._burn_rate:
                 self._last_burn_rate = self._burn_rate
@@ -1295,6 +1328,7 @@ class AutoSwitchEngine:
             # next tick can react: move now, as if over the threshold.
             self._limit_guard = (
                 utilization < settings.threshold
+                and not riding
                 and active_headroom > 0
                 and self._time_to_limit is not None
                 and self._time_to_limit <= LIMIT_GUARD_S
@@ -1309,6 +1343,10 @@ class AutoSwitchEngine:
                             detail=(
                                 f"{pct_label(utilization)}% < "
                                 f"{pct_label(settings.threshold)}%"
+                                + (
+                                    "; usage API says 100% but the gate is "
+                                    "open, riding it" if riding else ""
+                                )
                             ),
                         )
                     )
@@ -1534,7 +1572,7 @@ class AutoSwitchEngine:
                 fetch={current, *candidates}
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
-            headroom = _headroom_by_account(usage, self._models)
+            headroom = self._apply_gates(current, usage, self._collected_at)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
             ordered, any_known, active_reset_ts = _rank(
@@ -1566,6 +1604,22 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
+            if trigger == "proactive" and self._runway_refused is not None:
+                # Every target runs out about as fast as the active account:
+                # moving would only start the same race somewhere else (and
+                # the next tick would move again). Ride the active to its
+                # limit; the at-limit escape moves the work when it is spent.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="riding-active",
+                        detail=(
+                            f"no target outlasts account {current}'s "
+                            f"~{self._runway_refused / 60:.1f} min at the peak "
+                            "burn; riding it to the limit"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if trigger == "consume-first":
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
@@ -2383,6 +2437,22 @@ class AutoSwitchEngine:
         short: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
         any_known = False
+        # The runway rule (RUNWAY_RATIO / RUNWAY_MARGIN_S): a proactive move
+        # away from an account that still works must land somewhere that
+        # lasts meaningfully longer at the same peak burn. Escapes (at-limit,
+        # failover) take whatever works; with everything above the threshold
+        # (`all_above`) both ranking axes below carry their own anti-flap
+        # margins (RECOVERY_HYSTERESIS_S, HORIZON_HEADROOM_RATIO) and the
+        # question is when quota returns, so the rule stays out of it.
+        active_runway = (
+            self._runway_s(current, active_headroom, landing=True)
+            if trigger == "proactive"
+            and active_headroom is not None
+            and active_headroom > 0
+            else None
+        )
+        runway_refused = False
+        self._runway_refused = None
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
@@ -2507,6 +2577,16 @@ class AutoSwitchEngine:
             else:
                 key = (-h * cap,)
             runway = self._runway_s(num, h, landing=True)
+            if (
+                active_runway is not None
+                and runway is not None
+                and not all_above
+                and runway < min(
+                    active_runway * RUNWAY_RATIO, active_runway + RUNWAY_MARGIN_S
+                )
+            ):
+                runway_refused = True
+                continue
             if runway is not None and runway < MIN_LANDING_RUNWAY_S:
                 if trigger == "consume-first":
                     continue  # a voluntary move that would not last
@@ -2519,7 +2599,149 @@ class AutoSwitchEngine:
         ranked = qualifying + short
         if not ranked:
             ranked = sorted(fallback, key=lambda t: t[0])
+        if runway_refused and not ranked:
+            self._runway_refused = active_runway
         return [num for _, num in ranked], any_known, active_reset_ts
+
+    # -- rate-limit gate --------------------------------------------------------
+
+    def _apply_gates(
+        self, current: str, usage: dict[str, dict | str | None], now: float
+    ) -> dict[str, float | None]:
+        """Per-account decision headroom with fresh gate answers folded in.
+
+        See ``gate.apply``: a fresh ``rejected`` is at the limit whatever the
+        endpoint reads, a fresh open gate lifts an endpoint 100% to
+        ``gate.OPEN_HEADROOM``. The active account's answer must be fresher
+        (``gate.ACTIVE_FRESH_S``): it is the one burning its last point.
+        Sentinel values are left alone (an expired token idles, it does not
+        escape). Records each verdict for this tick in ``_gate_verdicts``.
+        """
+        headroom = _headroom_by_account(usage, self._models)
+        self._gate_verdicts = {}
+        for num, record in self._gate_recs.items():
+            value = usage.get(num)
+            if not isinstance(value, dict):
+                continue
+            h, verdict = gate.apply(
+                value, record, self._models, now,
+                gate.ACTIVE_FRESH_S if num == current else gate.FRESH_S,
+            )
+            if verdict is not None:
+                headroom[num] = h
+                self._gate_verdicts[num] = verdict
+        return headroom
+
+    def _gate_pass(
+        self,
+        current: str,
+        usage: dict[str, dict | str | None],
+        quarantined: set[str],
+    ) -> dict[str, float | None]:
+        """Probe the rate-limit gate where it can change this tick's decision,
+        and return the gated headroom.
+
+        Throttled hard (numbers in gate.py): only accounts the endpoint reads
+        at 100% on 5h/7d, none whose full window resets within minutes, at
+        most ``MAX_PROBES_PER_TICK`` per tick and one per account per
+        ``PROBE_INTERVAL_S`` -- except the active account while it rides an
+        open gate, re-probed every ``RIDE_REPROBE_S``. A fresh statusline
+        reading of the active account is the same headers for free, so it
+        replaces the active's probe. Candidates are probed only when the
+        active is at its limit and no candidate has measured headroom: that
+        is the at-limit escape, the one decision an open full account can
+        change. Dry runs and observe-only mode never probe.
+        """
+        # The collection's own clock read: no extra one per tick.
+        now = self._collected_at
+        try:
+            self._gate_recs = dict(self.switcher.gate_records())
+        except Exception:
+            _logger.debug("gate records unavailable", exc_info=True)
+            self._gate_recs = {}
+        live = gate.from_live(self._live_now) if self._live_now else None
+        if live is not None:
+            stored = gate.gate_of(self._gate_recs.get(current)) or {}
+            if (stored.get("probedAt") or 0.0) < live["gate"]["probedAt"]:
+                self._gate_recs[current] = live
+        headroom = self._apply_gates(current, usage, now)
+        probe = getattr(self.switcher, "probe_gates", None)
+        if self.dry_run or not self.settings.enabled or probe is None:
+            self._log_gate_verdicts(usage)
+            return headroom
+
+        budget = gate.MAX_PROBES_PER_TICK
+        value = usage.get(current)
+        if live is None and isinstance(value, dict):
+            record = self._gate_recs.get(current)
+            closed = (gate.gate_of(record) or {}).get("status") == gate.REJECTED
+            interval = gate.PROBE_INTERVAL_S if closed else gate.RIDE_REPROBE_S
+            if gate.due(value, record, self._models, now, interval):
+                self._gate_recs.update(probe([current], now))
+                budget -= 1
+                headroom = self._apply_gates(current, usage, now)
+
+        active_h = headroom.get(current)
+        if budget > 0 and active_h is not None and active_h <= 0:
+            candidates = [
+                n
+                for n in self.switcher.switchable_account_numbers()
+                if n != current
+                and n not in quarantined
+                and self.switcher.account_kind_for(n) != "api_key"
+            ]
+            if not any((headroom.get(n) or 0.0) > 0 for n in candidates):
+
+                def last_attempt(n: str) -> float:
+                    at = (self._gate_recs.get(n) or {}).get("attemptedAt")
+                    return at if isinstance(at, (int, float)) else float("-inf")
+
+                full = sorted(
+                    (
+                        n
+                        for n in candidates
+                        if isinstance(usage.get(n), dict)
+                        and gate.due(usage[n], self._gate_recs.get(n), self._models, now)
+                    ),
+                    # Biggest tier first (half a point of 20x is four times
+                    # one of 5x), then the longest unprobed.
+                    key=lambda n: (-self._cap(n), last_attempt(n)),
+                )[:budget]
+                if full:
+                    self._gate_recs.update(probe(full, now))
+                    headroom = self._apply_gates(current, usage, now)
+        self._log_gate_verdicts(usage)
+        return headroom
+
+    def _log_gate_verdicts(self, usage: dict[str, dict | str | None]) -> None:
+        """One INFO line when the gate changes what an account counts as."""
+        for num, verdict in self._gate_verdicts.items():
+            if self._gate_logged.get(num) == verdict:
+                continue
+            self._gate_logged[num] = verdict
+            seen = gate.gate_of(self._gate_recs.get(num)) or {}
+            pcts = [
+                w["pct"]
+                for key in ("five_hour", "seven_day")
+                if isinstance(w := seen.get(key), dict)
+                and isinstance(w.get("pct"), (int, float))
+            ]
+            gate_pct = f"{max(pcts):.0f}%" if pcts else "?"
+            if verdict == gate.OPEN:
+                value = usage.get(num)
+                endpoint = binding_pct(
+                    value if isinstance(value, dict) else None, self._models
+                )
+                _logger.info(
+                    "Account %s: usage API says %s%% but the gate is open (%s); "
+                    "keeping it usable",
+                    num, f"{endpoint:.0f}" if endpoint is not None else "100", gate_pct,
+                )
+            else:
+                _logger.info(
+                    "Account %s: the gate is closed (%s); treating it as at its limit",
+                    num, gate_pct,
+                )
 
     # -- adaptive usage scheduling ---------------------------------------------
 
@@ -2577,6 +2799,7 @@ class AutoSwitchEngine:
         active_pre = pre.get(current)
         live = self._live_readings(current, pre, now)
         self._live_active = bool(live)
+        self._live_now = live
         # The active account is nominated when never fetched, poll-due per its
         # persisted plan, or (no plan yet) past the normal cadence floor. The
         # collector's reserve() honors due-ness even inside the serve TTL, so

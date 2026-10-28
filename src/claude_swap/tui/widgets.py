@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, ListView, Static
 
-from claude_swap import oauth, pace
+from claude_swap import gate, oauth, pace
 from claude_swap.billing import billing_text
 from claude_swap.weekly_anchor import weekly_text
 from claude_swap.json_output import USAGE_API_KEY
@@ -158,6 +158,11 @@ def usage_rows(
                 if marker:
                     suffix = f"{suffix}  {marker}" if suffix else marker
                     suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
+            note = gate.window_note(window)
+            if note:
+                # Leads the suffix: it qualifies the percentage itself.
+                suffix = f"({note})  {suffix}" if suffix else f"({note})"
+                suffix_full = f"({note})  {suffix_full}" if suffix_full else f"({note})"
             rows.append((label, float(window["pct"]), suffix, suffix_full))
     for window in last_good.get("scoped") or []:
         pct = float(window["pct"])
@@ -347,6 +352,12 @@ def mini_account_text(
         color = palette.severity(pct)
         text.append(f"{label} ", style=palette.muted)
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+        note = gate.window_note(window)
+        if note:
+            text.append(
+                f" ({note})",
+                style=palette.sev_crit if note == gate.BLOCKED else palette.muted,
+            )
         if pct >= 100:
             reset = data.reset_text(window, now)
             if reset:
