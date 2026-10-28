@@ -47,9 +47,10 @@ import secrets
 import threading
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import ClassVar
 from urllib.parse import urlsplit
 
 # What Claude Code's OAuth tokens look like, so any code that sniffs the
@@ -63,7 +64,7 @@ DEFAULT_TIER = "default_claude_max_5x"
 
 
 def iso(ts: float) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    return datetime.fromtimestamp(ts, tz=UTC).isoformat()
 
 
 def token_id(token: str | None) -> str | None:
@@ -245,7 +246,7 @@ class Account:
 
     # -- control ------------------------------------------------------------------
 
-    _PATCHABLE = {
+    _PATCHABLE: ClassVar[dict[str, type]] = {
         "five_hour": float, "seven_day": float, "five_hour_reset": float,
         "seven_day_reset": float, "tier": str, "org_type": str,
         "subscription_status": str, "access_ttl_s": float, "scoped": list,
@@ -374,7 +375,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- routes -----------------------------------------------------------------
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path.startswith("/__control/"):
             return self._control_get(path)
@@ -388,7 +389,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._claude_ai(path)
         self._json(404, {"type": "error", "error": {"type": "not_found_error", "message": path}})
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         path = urlsplit(self.path).path
         body = self._body()
         if path.startswith("/__control/"):

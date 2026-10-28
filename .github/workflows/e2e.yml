@@ -51,10 +51,10 @@ jobs:
           "$bin" --version
           echo "ASWAP_E2E_BIN=$bin" >> "$GITHUB_ENV"
 
-      # aswap and Claude Code keep credentials in the login Keychain on
-      # macOS. Give the job a throwaway, unlocked default keychain (by
-      # absolute path, so it is found from the tests' temporary HOMEs too)
-      # so no `security` call can block on an unlock dialog.
+      # aswap and Claude Code keep credentials in the Keychain on macOS. Each
+      # test creates its own unlocked keychain under its temporary HOME
+      # (tests/e2e/conftest.py); this one only makes sure nothing that runs
+      # with the runner's real HOME can block on an unlock dialog either.
       - name: Temporary keychain (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -64,8 +64,6 @@ jobs:
           security unlock-keychain -p "" "$kc"
           security list-keychains -d user -s "$kc"
           security default-keychain -d user -s "$kc"
-          security default-keychain
-          HOME="$(mktemp -d)" security default-keychain || true
 
       - name: Run e2e tests
         shell: bash

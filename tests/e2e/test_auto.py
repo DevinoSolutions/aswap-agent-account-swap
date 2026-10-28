@@ -10,6 +10,7 @@ evidence a burn rate needs.
 
 from __future__ import annotations
 
+import itertools
 import time
 
 from tests.e2e.conftest import wait_until
@@ -159,7 +160,7 @@ def test_gate_keeps_an_open_account_then_escapes_when_it_closes(box):
 
 def test_no_ping_pong_when_everything_is_hot(box):
     now = time.time()
-    accounts, nums = _setup(box, {
+    _accounts, _nums = _setup(box, {
         "alice": {"five_hour": 95, "seven_day": 40, "five_hour_reset": now + 2 * HOUR},
         "bob": {"five_hour": 94, "seven_day": 40, "five_hour_reset": now + 1.5 * HOUR},
     }, active="alice")
@@ -171,7 +172,7 @@ def test_no_ping_pong_when_everything_is_hot(box):
 
 
 def test_usage_429_backs_off_and_keeps_the_last_known_numbers(box):
-    accounts, nums = _setup(box, {
+    accounts, _nums = _setup(box, {
         "alice": {"five_hour": 10, "seven_day": 10},
         "bob": {"five_hour": 20, "seven_day": 30},
     }, active="alice")
@@ -193,7 +194,7 @@ def test_usage_429_backs_off_and_keeps_the_last_known_numbers(box):
     )
     time.sleep(10)
     refused = [r["t"] for r in bob_usage_requests() if r["status"] == 429]
-    gaps = [b - a for a, b in zip(refused, refused[1:])]
+    gaps = [b - a for a, b in itertools.pairwise(refused)]
     assert gaps, "no retry at all within 10s"
     assert min(gaps) >= 2.9, f"retried before Retry-After elapsed: gaps {gaps}"
     # The last-known numbers are still what aswap shows and decides on.

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 import sys
 import time
 import unicodedata
@@ -28,7 +27,7 @@ def _slots(box):
 
 
 def test_a_new_login_is_added_without_aswap_add(box):
-    (alice,), auto = _start(box, "alice")
+    (_alice,), _auto = _start(box, "alice")
     bob = box.account("bob", five_hour=33, seven_day=44)
     bob_tokens = box.login(bob["email"])
 
@@ -52,7 +51,7 @@ def test_a_half_written_login_is_never_added_under_the_wrong_identity(box):
     """``/login`` writes ``~/.claude.json`` and the credential separately.
     Between the two, the config names bob while the credential is still
     alice's; auto-add must not file alice's tokens under bob."""
-    (alice,), auto = _start(box, "alice")
+    (alice,), _auto = _start(box, "alice")
     alice_rt = box.live_credentials()["refreshToken"]
     bob = box.account("bob")
     bob_tokens = box.login(bob["email"], pause=8.0)
@@ -69,7 +68,7 @@ def test_a_half_written_login_is_never_added_under_the_wrong_identity(box):
 
 
 def test_auto_add_off_leaves_new_logins_alone(box):
-    (alice,), auto = _start(box, "alice", auto_add=False)
+    (alice,), _auto = _start(box, "alice", auto_add=False)
     bob = box.account("bob")
     box.login(bob["email"])
     time.sleep(10)  # many polls on the scaled clock
@@ -87,11 +86,7 @@ def _profile_credentials_writer(box, profile_dir: str):
         service = f"{KEYCHAIN_SERVICE}-{digest}"
 
         def write(blob: str) -> None:
-            subprocess.run(
-                ["/usr/bin/security", "add-generic-password", "-U",
-                 "-a", box.env["USER"], "-s", service, "-X", blob.encode().hex()],
-                check=True, capture_output=True, timeout=30,
-            )
+            box.write_live_credentials(blob, service=service)
         return write
 
     from pathlib import Path

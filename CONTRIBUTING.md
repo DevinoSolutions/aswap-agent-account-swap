@@ -33,7 +33,7 @@ About a minute on a laptop. Each test gets a throwaway `HOME` (and `USERPROFILE`
 |---|---|
 | The `aswap` executable and its subprocesses (`aswap auto` runs in the background while the test calls the CLI) | Claude's HTTP API: `tests/e2e/fake_claude.py` serves usage, profile, OAuth token refresh (with rotation), the `/v1/messages` rate-limit probe and the claude.ai billing endpoints |
 | Files under `HOME`, `state.db` (SQLite), file locks, atomic writes | Claude Code's `/login`: `Box.login` writes `~/.claude/.credentials.json` (or the macOS Keychain item) and `~/.claude.json`'s `oauthAccount` in separate writes, the way Claude Code does |
-| The wall clock, sleeps, signals, `kill -9` | |
+| The wall clock, sleeps, signals, `kill -9` | The `claude` CLI: `tests/e2e/claude_stub.py` is first on PATH and answers `claude auth status` from the profile's `.claude.json`, so a real Claude Code never runs against a test HOME |
 | Sockets and HTTP (aswap's own client, TLS settings aside) | |
 | The macOS Keychain (`security`), a temporary keychain in CI | |
 
@@ -63,7 +63,7 @@ The fake's request log (`fake-requests.jsonl`) records method, path, status and 
 
 ### macOS
 
-On macOS, aswap and Claude Code keep credentials in the Keychain, and the e2e tests use the real one. CI creates a throwaway default keychain first (see `.github/workflows/e2e.yml`). Locally, the tests write items named after each box's unique `USER` and `@e2e.test` emails into your default keychain and delete the live item afterwards; run them under a scratch macOS user, or set up a temporary default keychain the same way the workflow does.
+On macOS, aswap and Claude Code keep credentials in the Keychain, and the e2e tests use the real one. `security` locates the user's keychains through `$HOME`, so each test creates its own unlocked keychain under its temporary HOME and registers it there as the default; every `aswap` process the test starts uses that keychain and nothing else. Your login keychain is never read or written, and the test keychain is deleted afterwards.
 
 ### Running the fake on its own
 

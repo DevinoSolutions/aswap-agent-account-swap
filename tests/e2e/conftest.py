@@ -199,7 +199,27 @@ class Box:
         if sys.platform != "win32":
             env.pop("APPDATA")
             env.pop("LOCALAPPDATA")
+        # Claude Code is simulated: a stub `claude` shadows any real one.
+        stub_bin = self._install_claude_stub(root / "bin")
+        env["PATH"] = os.pathsep.join([str(stub_bin), env.get("PATH", "")])
         self.env = env
+        self.keychain: Path | None = None
+        if sys.platform == "darwin":
+            self._create_keychain()
+
+    @staticmethod
+    def _install_claude_stub(bin_dir: Path) -> Path:
+        bin_dir.mkdir()
+        stub = E2E_DIR / "claude_stub.py"
+        if sys.platform == "win32":
+            (bin_dir / "claude.cmd").write_text(
+                f'@"{sys.executable}" "{stub}" %*\r\n', encoding="utf-8")
+        else:
+            launcher = bin_dir / "claude"
+            launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{stub}" "$@"\n',
+                                encoding="utf-8")
+            launcher.chmod(0o755)
+        return bin_dir
 
     # -- paths ------------------------------------------------------------------
 
@@ -234,7 +254,7 @@ class Box:
         done = subprocess.run(
             cmd, env=self.env, cwd=self.home, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout,
-            input=input if input is not None else "",
+            input=input if input is not None else "", check=False,
         )
         took = time.monotonic() - started
         self.outputs += [done.stdout, done.stderr]
@@ -321,24 +341,51 @@ class Box:
         self.write_live_credentials(blob)
         return t
 
-    def write_live_credentials(self, blob: str) -> None:
+    def write_live_credentials(self, blob: str, service: str = KEYCHAIN_SERVICE) -> None:
         if sys.platform == "darwin":
-            subprocess.run(
-                ["/usr/bin/security", "add-generic-password", "-U",
-                 "-a", self.env["USER"], "-s", KEYCHAIN_SERVICE,
-                 "-X", blob.encode().hex()],
-                check=True, capture_output=True, timeout=30,
-            )
+            self.security("add-generic-password", "-U", "-a", self.env["USER"],
+                          "-s", service, "-X", blob.encode().hex())
         else:
             _atomic_write(self.credentials_path, blob)
 
+    def security(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        """``/usr/bin/security`` as this box's user (its HOME, so its own
+        keychain). Errors name the subcommand only: the arguments can hold a
+        credential."""
+        try:
+            done = subprocess.run(["/usr/bin/security", *args], env=self.env,
+                                  capture_output=True, text=True, timeout=30, check=False)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(f"security {args[0]} timed out after 30s") from None
+        if check and done.returncode != 0:
+            raise AssertionError(
+                f"security {args[0]} exited {done.returncode}: {done.stderr.strip()[-300:]}")
+        return done
+
+    def _create_keychain(self) -> None:
+        """macOS: a fresh, unlocked default keychain for this box alone.
+
+        ``security`` finds the user's keychain list and default keychain
+        through ``$HOME``, so with the box's HOME neither exists and the first
+        write would block on a dialog. Registering one under the box's HOME
+        gives every box (and every aswap process it runs) its own Keychain,
+        so parallel tests and a developer's login keychain never meet."""
+        kc = self.home / "Library" / "Keychains" / "aswap-e2e.keychain-db"
+        kc.parent.mkdir(parents=True)
+        self.security("create-keychain", "-p", "", str(kc))
+        self.security("set-keychain-settings", str(kc))  # no auto-lock
+        self.security("unlock-keychain", "-p", "", str(kc))
+        self.security("list-keychains", "-d", "user", "-s", str(kc))
+        self.security("default-keychain", "-d", "user", "-s", str(kc))
+        default = self.security("default-keychain").stdout.strip().strip('"')
+        if Path(default).resolve() != kc.resolve():
+            raise AssertionError(f"box keychain not the default for its HOME: {default!r}")
+        self.keychain = kc
+
     def live_credentials(self) -> dict | None:
         if sys.platform == "darwin":
-            done = subprocess.run(
-                ["/usr/bin/security", "find-generic-password",
-                 "-a", self.env["USER"], "-s", KEYCHAIN_SERVICE, "-w"],
-                capture_output=True, text=True, timeout=30,
-            )
+            done = self.security("find-generic-password", "-a", self.env["USER"],
+                                 "-s", KEYCHAIN_SERVICE, "-w", check=False)
             raw = done.stdout.strip() if done.returncode == 0 else None
         else:
             try:
@@ -371,15 +418,8 @@ class Box:
     def cleanup(self) -> None:
         for proc in self.autos:
             proc.kill()
-        if sys.platform == "darwin":
-            # The live item outlives HOME. aswap's own per-account items are
-            # keyed by this box's unique emails, so they cannot collide; the
-            # CI keychain they land in is thrown away with the runner.
-            subprocess.run(
-                ["/usr/bin/security", "delete-generic-password",
-                 "-a", self.env["USER"], "-s", KEYCHAIN_SERVICE],
-                capture_output=True, timeout=30,
-            )
+        if getattr(self, "keychain", None):
+            self.security("delete-keychain", str(self.keychain), check=False)
 
     def collect_artifacts(self) -> None:
         """Copy aswap's own logs next to the transcript and request log."""
