@@ -88,11 +88,31 @@ class TestLoadSettings:
 
         assert load_settings(tmp_path).enabled is True
 
+    def test_auto_add_accounts_is_on_by_default(self, tmp_path: Path):
+        assert load_settings(tmp_path).auto_add_accounts is True
+
+    def test_auto_add_accounts_can_be_turned_off(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"autoAddAccounts": False}})
+        )
+
+        assert load_settings(tmp_path).auto_add_accounts is False
+
+    @pytest.mark.parametrize("value", ["false", 0, None])
+    def test_auto_add_accounts_requires_a_json_boolean(self, tmp_path: Path, value):
+        """A hand-edited "false" must not read as true — nor silently as off."""
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"autoAddAccounts": value}})
+        )
+
+        assert load_settings(tmp_path).auto_add_accounts is True
+
     @pytest.mark.parametrize(
         "key,section,loader",
         [
             ("enabled", "autoswitch", lambda p: load_settings(p)),
             ("warmupFiveHour", "autoswitch", lambda p: load_settings(p)),
+            ("autoAddAccounts", "autoswitch", lambda p: load_settings(p)),
             ("persistent", "profiles", lambda p: load_profile_settings(p)),
         ],
     )

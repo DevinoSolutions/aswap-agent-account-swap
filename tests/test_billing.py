@@ -464,3 +464,108 @@ class TestRefreshTierChange:
         with caplog.at_level("INFO", logger="claude-swap"):
             cache.refresh([_info(1)], force=True)
         assert "5x -> 20x" in caplog.text
+
+
+class TestLapseVerdictFlip:
+    """2026-10-27: a re-subscribed account kept showing "subscription
+    canceled". The flip itself must be one INFO line, both ways."""
+
+    def _cache_with(self, tmp_path, **row):
+        cache = billing.BillingCache(tmp_path, clock=_Clock())
+        cache._save({"1": {"email": "a@example.com", "organizationUuid": "org-1",
+                           "nextCheckAt": 9e12, **row}})
+        return cache
+
+    def test_check_tiers_logs_a_revival(self, tmp_path, monkeypatch, no_stagger, caplog):
+        monkeypatch.setattr(oauth, "request_profile_data", lambda tok: _profile("default_claude_max_5x"))
+        cache = self._cache_with(tmp_path, subscriptionStatus="canceled",
+                                 rateLimitTier="default_claude_ai")
+        with caplog.at_level("INFO", logger="claude-swap"):
+            cache.check_tiers([_info(1)])
+        assert "Account 1 (a@example.com) is subscribed again: 5x" in caplog.text
+        assert not billing.looks_lapsed(cache._load()["1"])
+
+    def test_check_tiers_logs_a_lapse(self, tmp_path, monkeypatch, no_stagger, caplog):
+        monkeypatch.setattr(
+            oauth, "request_profile_data",
+            lambda tok: _profile("default_claude_max_5x", status="canceled"),
+        )
+        cache = self._cache_with(tmp_path, subscriptionStatus="active",
+                                 rateLimitTier="default_claude_max_5x")
+        with caplog.at_level("INFO", logger="claude-swap"):
+            cache.check_tiers([_info(1)])
+        assert "Account 1 (a@example.com) subscription lapsed: canceled" in caplog.text
+
+    def test_refresh_logs_a_revival(self, tmp_path, monkeypatch, no_stagger, caplog):
+        monkeypatch.setattr(oauth, "request_profile_data", lambda tok: _profile("default_claude_max_20x"))
+        cache = self._cache_with(tmp_path, subscriptionStatus="canceled",
+                                 rateLimitTier="default_claude_max_20x")
+        with caplog.at_level("INFO", logger="claude-swap"):
+            cache.refresh([_info(1)], force=True)
+        assert caplog.text.count("is subscribed again: 20x") == 1
+
+    def test_no_flip_no_line(self, tmp_path, monkeypatch, no_stagger, caplog):
+        monkeypatch.setattr(
+            oauth, "request_profile_data",
+            lambda tok: _profile("default_claude_max_5x", status="canceled"),
+        )
+        cache = self._cache_with(tmp_path, subscriptionStatus="canceled",
+                                 rateLimitTier="default_claude_max_5x")
+        with caplog.at_level("INFO", logger="claude-swap"):
+            cache.check_tiers([_info(1)])
+        assert "subscribed again" not in caplog.text and "lapsed" not in caplog.text
+
+
+class TestClaimPlanChecks:
+    """Which lapsed rows are due a cheap profile re-read, claimed across
+    processes through the cache row itself (``planCheckedAt``)."""
+
+    IDS = {"1": ("a@example.com", "org-1"), "2": ("b@x", "org-1")}
+
+    def _cache(self, tmp_path, clock, status1="canceled", status2="active"):
+        cache = billing.BillingCache(tmp_path, clock=clock)
+        cache._save({
+            "1": {"email": "a@example.com", "organizationUuid": "org-1",
+                  "subscriptionStatus": status1, "fetchedAt": clock.t - 3600},
+            "2": {"email": "b@x", "organizationUuid": "org-1",
+                  "subscriptionStatus": status2, "fetchedAt": clock.t - 3600},
+        })
+        return cache
+
+    def test_only_lapsed_rows_are_claimed_and_then_held_off(self, tmp_path):
+        clock = _Clock()
+        cache = self._cache(tmp_path, clock)
+        assert cache.claim_plan_checks(self.IDS, min_age=60) == ["1"]
+        # Claimed: a second surface asking right after gets nothing.
+        assert cache.claim_plan_checks(self.IDS, min_age=60) == []
+        clock.t += 61
+        assert cache.claim_plan_checks(self.IDS, min_age=60) == ["1"]
+
+    def test_a_recent_fetch_counts_as_a_check(self, tmp_path):
+        clock = _Clock()
+        cache = self._cache(tmp_path, clock)
+        rows = cache._load()
+        rows["1"]["fetchedAt"] = clock.t - 10
+        cache._save(rows)
+        assert cache.claim_plan_checks(self.IDS, min_age=60) == []
+
+    def test_a_changed_identity_is_not_claimed(self, tmp_path):
+        cache = self._cache(tmp_path, _Clock())
+        assert cache.claim_plan_checks({"1": ("other@x", "org-1")}, min_age=60) == []
+
+    def test_stagger_spreads_slots_but_stays_bounded(self, tmp_path):
+        clock = _Clock()
+        cache = self._cache(tmp_path, clock, status2="canceled")
+        rows = cache._load()
+        for row in rows.values():
+            row["fetchedAt"] = clock.t
+        cache._save(rows)
+        clock.t += billing.LAPSED_RECHECK_S - 1
+        assert cache.claim_plan_checks(
+            self.IDS, min_age=billing.LAPSED_RECHECK_S, stagger=True
+        ) == []
+        clock.t += 1 + billing.LAPSED_STAGGER_S
+        claimed = cache.claim_plan_checks(
+            self.IDS, min_age=billing.LAPSED_RECHECK_S, stagger=True
+        )
+        assert sorted(claimed) == ["1", "2"]

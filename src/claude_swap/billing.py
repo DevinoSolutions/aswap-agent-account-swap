@@ -25,6 +25,7 @@ import logging
 import os
 import tempfile
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,17 @@ EXACT_TTL_S = 6 * 3600
 # A lapsed subscription can be bought again any minute, so its row is
 # re-checked far sooner than an active one.
 LAPSED_TTL_S = 30 * 60
+# 2026-10-27: a re-subscribed account kept its cached "canceled" for the
+# better part of an hour while its usage poll sat in 429 backoff. A row
+# cached as lapsed is re-read from the profile alone (a different endpoint
+# from usage, so its backoff does not apply) this often in the background,
+# each slot pushed back by up to LAPSED_STAGGER_S so they never fire
+# together; on becoming active, a re-read waits only PLAN_RECHECK_MIN_S,
+# which merely folds the several surfaces that notice one switch into one
+# request.
+LAPSED_RECHECK_S = 5 * 60
+LAPSED_STAGGER_S = 60
+PLAN_RECHECK_MIN_S = 60
 FAILURE_RETRY_S = 3600
 # A tier check asked for an off-schedule weekly reading stays open this long;
 # an older one is asked again rather than answered by an unrelated fetch.
@@ -360,6 +372,7 @@ class BillingCache:
             row = {"email": email, "organizationUuid": org}
             if self._matches(previous, email, org):
                 row = {**previous, **row}  # keep last-good data on failure
+            before = dict(row) if self._matches(previous, email, org) else None
             if result["profile"] is not None:
                 _log_tier_change(num, email, row.get("rateLimitTier"), result["profile"]["rateLimitTier"])
                 row.update(result["profile"])
@@ -378,6 +391,7 @@ class BillingCache:
                 row["source"] = "estimate"
             ok = exact is not None or result["profile"] is not None
             if ok:
+                _log_lapse_change(num, email, before, row)
                 ttl = EXACT_TTL_S if exact is not None else SUCCESS_TTL_S
                 status = row.get("subscriptionStatus")
                 if status is not None and status not in _RENEWING_STATUSES:
@@ -447,6 +461,7 @@ class BillingCache:
                 ):
                     row["nextCheckAt"] = 0
                 row.update(fields)
+                _log_lapse_change(num, email, previous, row)
                 rows[num] = row
             out[num] = entry
         try:
@@ -454,6 +469,42 @@ class BillingCache:
         except OSError as e:
             _logger.debug("Billing cache write failed: %r", e)
         return out
+
+    def claim_plan_checks(
+        self,
+        identities: dict[str, tuple[str, str]],
+        min_age: float,
+        stagger: bool = False,
+    ) -> list[str]:
+        """Slots cached as lapsed whose plan was last read ``min_age`` ago or
+        more, stamped as checked now (``planCheckedAt``).
+
+        The stamp is the claim: every surface (``auto``, the TUI, a switch)
+        asks in its own process, and the second one to ask inside the window
+        gets nothing. A profile read by ``refresh`` (``fetchedAt``) counts as a
+        check. ``stagger`` adds a fixed per-slot offset of up to
+        ``LAPSED_STAGGER_S``, so lapsed slots spread out instead of firing in
+        one burst every period. Advisory like the rest of the cache.
+        """
+        rows = self._load()
+        now = self.clock()
+        due: list[str] = []
+        for num, (email, org) in identities.items():
+            row = rows.get(num)
+            if not self._matches(row, email, org) or not looks_lapsed(row):
+                continue
+            last = max(row.get("fetchedAt") or 0, row.get("planCheckedAt") or 0)
+            offset = zlib.crc32(num.encode()) % (LAPSED_STAGGER_S + 1) if stagger else 0
+            if now - last < min_age + offset:
+                continue
+            row["planCheckedAt"] = now
+            due.append(num)
+        if due:
+            try:
+                self._save(rows)
+            except OSError as e:
+                _logger.debug("Billing cache write failed: %r", e)
+        return due
 
     def confirm_tier(self, identity: tuple[str, str]) -> bool:
         """Whether the cached tier was read after an off-schedule weekly reading.
@@ -496,6 +547,22 @@ def _log_tier_change(num: str, email: str, before: object, after: object) -> Non
         _logger.info(
             "Account %s (%s) plan tier changed: %s -> %s",
             num, email, _tier_name(before), _tier_name(after),
+        )
+
+
+def _log_lapse_change(num: str, email: str, before: dict | None, after: dict) -> None:
+    """One INFO line when a fetch flips the lapsed verdict, either way."""
+    if not before or looks_lapsed(before) == looks_lapsed(after):
+        return
+    if looks_lapsed(after):
+        status = after.get("subscriptionStatus")
+        if status is None or status in _RENEWING_STATUSES:
+            status = "free plan"
+        _logger.info("Account %s (%s) subscription lapsed: %s", num, email, status.replace("_", " "))
+    else:
+        _logger.info(
+            "Account %s (%s) is subscribed again: %s",
+            num, email, _tier_name(after.get("rateLimitTier")),
         )
 
 
