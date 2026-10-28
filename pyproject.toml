@@ -66,8 +66,11 @@ pythonpath = ["src"]
 # 1929 passed / 4 skipped every time, three consecutive runs, real account
 # store hash unmoved. `auto` rather than a fixed number so CI runners (2-4
 # cores) and this box both get the cores they have.
-addopts = "-n auto --dist loadgroup"
+# The e2e tier (tests/e2e: the real binary against a fake Claude server) is
+# slower and opt-in: `uv run pytest -m e2e tests/e2e` (see CONTRIBUTING.md).
+addopts = "-n auto --dist loadgroup -m 'not e2e'"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
+    "e2e: end-to-end test running the real aswap binary against tests/e2e/fake_claude.py (opt in with -m e2e)",
 ]

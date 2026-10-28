@@ -1,0 +1,20 @@
+{
+  "numStartups": 40,
+  "installMethod": "native",
+  "autoUpdates": false,
+  "userID": "0000000000000000000000000000000000000000000000000000000000000000",
+  "hasCompletedOnboarding": true,
+  "lastOnboardingVersion": "2.0.0",
+  "projects": {},
+  "oauthAccount": {
+    "accountUuid": "acct-legacy-0001",
+    "emailAddress": "legacy-one@e2e.test",
+    "organizationUuid": "org-legacy-0001",
+    "hasExtraUsageEnabled": false,
+    "billingType": "stripe_subscription",
+    "displayName": "legacy-one",
+    "organizationRole": "admin",
+    "workspaceRole": null,
+    "organizationName": "Legacy One Org"
+  }
+}
