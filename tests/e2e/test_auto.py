@@ -5,12 +5,16 @@ moves the fake's usage/gate from outside, and watches the JSON events and
 the live credential Claude Code would read. Polling runs on the scaled clock
 (``ASWAP_TIME_SCALE``); burn-rate and runway margins stay on the real one, so
 these tests move usage in single steps and finish well inside the minute of
-evidence a burn rate needs.
+evidence the windowed burn rate needs. A single step of more than a couple of
+points is evidence of a pace by itself (``BurnTracker.fast_rate``), which the
+jump tests rely on.
 """
 
 from __future__ import annotations
 
 import itertools
+import json
+import os
 import time
 
 from tests.e2e.conftest import wait_until
@@ -169,6 +173,74 @@ def test_no_ping_pong_when_everything_is_hot(box):
     switches = _quiet_for(auto, 15)
     assert len(switches) <= 1, switches
     assert len(auto.switches()) <= 1
+
+
+def _write_live_reading(box, five_hour, seven_day, seven_day_reset, five_hour_reset):
+    """What Claude Code's statusline writes after a response: the account's
+    unified rate-limit numbers, under ``<backup>/live_usage/<session>.json``."""
+    directory = box.backup_root / "live_usage"
+    directory.mkdir(parents=True, exist_ok=True)
+    tmp = directory / ".e2e-session.tmp"
+    tmp.write_text(json.dumps({
+        "at": time.time() * 1000,
+        "session": "e2e-session",
+        "rate_limits": {
+            "five_hour": {"used_percentage": five_hour, "resets_at": five_hour_reset},
+            "seven_day": {"used_percentage": seven_day, "resets_at": seven_day_reset},
+        },
+    }), encoding="utf-8")
+    os.replace(tmp, directory / "e2e-session.json")
+
+
+# Measured before the fast burn pace: a jump from 50% to 99% under a 99.9%
+# threshold waited out the minute of evidence the windowed burn rate needs
+# (~60 s of real time from the first reading), whatever the tick cadence.
+# Now the first reading that shows the jump fires the limit guard.
+JUMP_SWITCH_BOUND_S = 15.0
+
+
+def test_a_jump_toward_the_limit_switches_on_the_next_usage_poll(box):
+    now = time.time()
+    accounts, nums = _setup(box, {
+        "alice": {"five_hour": 50, "seven_day": 20},
+        "bob": {"five_hour": 10, "seven_day": 20, "seven_day_reset": now + 2 * DAY},
+    }, active="alice", threshold=99.9)
+    auto = box.start_auto()
+    _first_poll(auto)
+    assert _quiet_for(auto, 2) == []
+
+    jumped = time.monotonic()
+    box.fake.set(accounts["alice"]["email"], five_hour=99)
+    sw = auto.wait_switch(nums["bob"], timeout=90)
+    took = time.monotonic() - jumped
+    print(f"jump to switch (usage API): {took:.1f}s")
+    assert sw["trigger"] == "proactive"
+    assert took < JUMP_SWITCH_BOUND_S, f"switched {took:.1f}s after the jump"
+    wait_until(lambda: box.live_email() == accounts["bob"]["email"], 20, "the live login to be bob")
+
+
+def test_a_live_statusline_jump_switches_within_a_tick_or_two(box):
+    now = time.time()
+    alice_week = now + 3 * DAY
+    alice_5h = now + 2 * HOUR
+    accounts, nums = _setup(box, {
+        "alice": {"five_hour": 50, "seven_day": 20,
+                  "seven_day_reset": alice_week, "five_hour_reset": alice_5h},
+        "bob": {"five_hour": 10, "seven_day": 20, "seven_day_reset": now + 5 * DAY},
+    }, active="alice", threshold=99.9)
+    auto = box.start_auto()
+    _first_poll(auto)
+    assert _quiet_for(auto, 2) == []
+
+    # The usage endpoint still says 50%; only the statusline sees the burn.
+    jumped = time.monotonic()
+    _write_live_reading(box, 99, 20, alice_week, alice_5h)
+    sw = auto.wait_switch(nums["bob"], timeout=90)
+    took = time.monotonic() - jumped
+    print(f"jump to switch (live statusline): {took:.1f}s")
+    assert sw["trigger"] == "proactive"
+    assert took < JUMP_SWITCH_BOUND_S, f"switched {took:.1f}s after the jump"
+    assert box.fake.state(accounts["alice"]["email"])["fiveHour"] == 50.0
 
 
 def test_usage_429_backs_off_and_keeps_the_last_known_numbers(box):
