@@ -104,6 +104,7 @@ def replace_with_retry(
     *,
     attempts: int = 10,
     initial_delay: float = 0.002,
+    max_delay: float = 0.25,
 ) -> None:
     """``os.replace``, retried past transient Windows sharing failures.
 
@@ -118,6 +119,13 @@ def replace_with_retry(
     cross-device link) surface on the first attempt. A *persistent* access
     denial (ACLs, read-only target) matches the retried codes and so raises
     only after the attempt budget — a ~0.75 s delay in the worst case.
+
+    That default budget is sized for AV/indexer scans of a file only aswap
+    writes. A file other programs keep reading needs more: on Windows a
+    replace onto a destination that ANY process has open fails with
+    ERROR_ACCESS_DENIED, even when that handle allows FILE_SHARE_DELETE (as
+    Node's, and so Claude Code's, always do). ``max_delay`` caps the backoff
+    so a longer budget probes often enough to land between two readers.
     """
     if attempts < 1:
         raise ValueError("attempts must be >= 1")
@@ -135,4 +143,4 @@ def replace_with_retry(
             if not transient or attempt == attempts - 1:
                 raise
             time.sleep(delay)
-            delay = min(delay * 2, 0.25)
+            delay = min(delay * 2, max_delay)

@@ -299,3 +299,168 @@ class TestReplaceFlushesFirst:
         replace_with_retry(src, tmp_path / "a")
         assert order == ["fsync", "replace"]
         assert (tmp_path / "a").read_text() == "payload"
+
+
+class TestReplaceBackoffCap:
+    def test_max_delay_caps_the_backoff(self, tmp_path, monkeypatch):
+        """A long budget must keep probing often: capped at max_delay, not
+        the default 0.25s, so a gap between two readers is not slept through."""
+        monkeypatch.setattr("claude_swap.fsutil.sys.platform", "win32")
+        sleeps = []
+        monkeypatch.setattr("claude_swap.fsutil.time.sleep", sleeps.append)
+
+        def busy(src, dst):
+            e = OSError(13, "Access is denied")
+            e.winerror = 5
+            raise e
+
+        monkeypatch.setattr("claude_swap.fsutil.os.replace", busy)
+        with pytest.raises(OSError):
+            replace_with_retry(
+                tmp_path / "a", tmp_path / "b", attempts=12, max_delay=0.1
+            )
+        assert len(sleeps) == 11
+        assert max(sleeps) == 0.1
+        assert sleeps[:6] == [0.002, 0.004, 0.008, 0.016, 0.032, 0.064]
+
+    def test_default_cap_is_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("claude_swap.fsutil.sys.platform", "win32")
+        sleeps = []
+        monkeypatch.setattr("claude_swap.fsutil.time.sleep", sleeps.append)
+
+        def busy(src, dst):
+            e = OSError(13, "Access is denied")
+            e.winerror = 5
+            raise e
+
+        monkeypatch.setattr("claude_swap.fsutil.os.replace", busy)
+        with pytest.raises(OSError):
+            replace_with_retry(tmp_path / "a", tmp_path / "b")
+        assert max(sleeps) == 0.25
+        assert sum(sleeps) == pytest.approx(0.754)
+
+
+def _hold_open(path: Path):
+    """Open ``path`` the way Node (and so Claude Code) reads a file:
+    GENERIC_READ with FILE_SHARE_READ|WRITE|DELETE. Returns the handle."""
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = k32.CreateFileW(str(path), 0x80000000, 0x7, None, 3, 0x80, None)
+    if handle in (None, wintypes.HANDLE(-1).value):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return k32, handle
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows rename semantics")
+class TestReplaceOntoAFileAReaderHoldsOpen:
+    """The 2026-10-27 failure, for real: ``~/.claude.json`` held open by a
+    reading Claude Code. Windows refuses a rename onto ANY open file with
+    ERROR_ACCESS_DENIED, share-delete or not, so this is not an AV quirk
+    that clears in milliseconds; it lasts as long as readers keep it open."""
+
+    def test_a_share_delete_reader_still_blocks_os_replace(self, tmp_path):
+        dst = tmp_path / ".claude.json"
+        dst.write_text("{}")
+        src = tmp_path / "new.tmp"
+        src.write_text('{"a": 1}')
+        k32, handle = _hold_open(dst)
+        try:
+            with pytest.raises(PermissionError) as info:
+                os.replace(src, dst)
+            assert info.value.winerror == 5
+        finally:
+            k32.CloseHandle(handle)
+
+    def test_retry_outlasts_a_reader_holding_past_the_default_budget(self, tmp_path):
+        import threading
+
+        dst = tmp_path / ".claude.json"
+        dst.write_text("{}")
+        src = tmp_path / "new.tmp"
+        src.write_text('{"a": 1}')
+        k32, handle = _hold_open(dst)
+        # Longer than the default ~0.75s budget, well inside the config one.
+        timer = threading.Timer(1.5, k32.CloseHandle, args=(handle,))
+        timer.start()
+        try:
+            replace_with_retry(src, dst, attempts=60, max_delay=0.1)
+        finally:
+            timer.join()
+        assert dst.read_text() == '{"a": 1}'
+        assert not src.exists()
+
+
+class TestConfigWriteOutlastsReaders:
+    """``_write_json`` publishes ``~/.claude.json`` by rename. On 2026-10-27 a
+    switch failed twice with ``[WinError 5] Access is denied: '.claude.<pid>
+    .tmp' -> '.claude.json'`` ~0.78s after writing credentials: the default
+    replace budget, exhausted while running Claude Code sessions read the
+    config. The switch then rolled back."""
+
+    def _switcher(self):
+        import logging
+
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+        s._logger = logging.getLogger("test")
+        return s
+
+    def _busy_for(self, monkeypatch, failures: int):
+        monkeypatch.setattr("claude_swap.fsutil.sys.platform", "win32")
+        monkeypatch.setattr("claude_swap.fsutil.time.sleep", lambda s: None)
+        real_replace = os.replace
+        calls = []
+
+        def busy(src, dst):
+            calls.append(1)
+            if len(calls) <= failures:
+                e = PermissionError(13, "Access is denied")
+                e.winerror = 5
+                raise e
+            return real_replace(src, dst)
+
+        monkeypatch.setattr("claude_swap.fsutil.os.replace", busy)
+        return calls
+
+    def test_survives_contention_longer_than_the_default_budget(
+        self, tmp_path, monkeypatch
+    ):
+        config = tmp_path / ".claude.json"
+        config.write_text('{"oauthAccount": {"emailAddress": "old@x.test"}}')
+        # 25 refusals: more than the default 10 attempts allow.
+        calls = self._busy_for(monkeypatch, 25)
+
+        self._switcher()._write_json(
+            config, {"oauthAccount": {"emailAddress": "new@x.test"}}
+        )
+
+        assert len(calls) == 26
+        assert '"new@x.test"' in config.read_text()
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    def test_gives_up_eventually_and_leaves_no_temp_copy(
+        self, tmp_path, monkeypatch
+    ):
+        """A persistent denial still surfaces (and the switch rolls back), and
+        the temp copy of the config is not left beside it."""
+        from claude_swap.switcher import _CONFIG_REPLACE_ATTEMPTS
+
+        config = tmp_path / ".claude.json"
+        config.write_text('{"keep": true}')
+        calls = self._busy_for(monkeypatch, 10_000)
+
+        with pytest.raises(PermissionError):
+            self._switcher()._write_json(config, {"keep": False})
+
+        assert len(calls) == _CONFIG_REPLACE_ATTEMPTS
+        assert config.read_text() == '{"keep": true}'
+        assert list(tmp_path.glob("*.tmp")) == []
