@@ -714,7 +714,10 @@ def _codex_command(argv: list[str]) -> None:
         help="Switch Codex accounts when the active quota nears its limit",
         description=(
             "Watch Codex subscription usage and select a better saved account. "
-            "A running Codex session must be restarted after a switch."
+            "A running Codex session must be restarted after a switch. "
+            "Defaults come from `aswap config` (autoswitch.*); a running loop "
+            "picks up `aswap config set` changes within one tick, no restart, "
+            "while a setting given as a flag keeps its flag value until restart."
         ),
     )
     auto.add_argument("--once", action="store_true", help="Evaluate once and exit")
@@ -743,7 +746,11 @@ def _codex_command(argv: list[str]) -> None:
 
             from claude_swap.codex_autoswitch import CodexAutoSwitchEngine
             from claude_swap.printer import accent, yellowed
-            from claude_swap.settings import load_settings, merged_with_cli
+            from claude_swap.settings import (
+                cli_overrides,
+                load_settings,
+                merged_with_cli,
+            )
 
             def emit(event) -> None:
                 if args.json:
@@ -761,7 +768,13 @@ def _codex_command(argv: list[str]) -> None:
 
             settings = merged_with_cli(load_settings(switcher.backup_dir), args)
             engine = CodexAutoSwitchEngine(
-                switcher, settings, emit, dry_run=args.dry_run
+                switcher,
+                settings,
+                emit,
+                dry_run=args.dry_run,
+                # Flags hold for the life of the process; every other key
+                # follows `aswap config` changes from the next tick on.
+                pinned=cli_overrides(args),
             )
             if args.once:
                 sys.exit(engine.tick().value)
@@ -1192,12 +1205,12 @@ Examples:
   aswap config export settings.json         # write them out to hand-edit
   aswap config import settings.json         # validate and load them back
 
-Changes apply to a running `aswap auto` within one tick (default 60s), no
-restart. A key `aswap auto` was started with as a flag (--threshold,
---interval, --cooldown, --model, --strategy, --include-api-key-accounts)
-keeps the flag's value until that process restarts. A stored value that
-fails validation is ignored by a running `aswap auto`, which keeps its
-last good value and logs a warning.
+Changes apply to a running `aswap auto` or `aswap codex auto` within one
+tick (default 60s), no restart. A key the loop was started with as a flag
+(--threshold, --interval, --cooldown, --model, --strategy,
+--include-api-key-accounts) keeps the flag's value until that process
+restarts. A stored value that fails validation is ignored by a running
+loop, which keeps its last good value and logs a warning.
         """,
     )
     parser.add_argument(

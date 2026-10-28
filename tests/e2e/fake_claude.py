@@ -26,6 +26,11 @@ Served, per account (keyed by bearer token or session cookie):
 ``/api/organizations/{org}/subscription_details``
                                 the claude.ai web endpoints (cookie
                                 ``sessionKey``).
+``GET  /api/codex/usage``       the ChatGPT rate-limit endpoint ``aswap codex``
+                                reads (``codex_usage.py``), for a Codex login
+                                whose ``config.toml`` points ``chatgpt_base_url``
+                                here: the same account's five_hour / seven_day
+                                as ``primary_window`` / ``secondary_window``.
 
 Tests drive the state from outside the aswap processes with a small control
 API under ``/__control/`` (see :class:`FakeClaudeClient`). Every request is
@@ -156,6 +161,23 @@ class Account:
             "extra_usage": {"is_enabled": False, "monthly_limit": None,
                             "used_credits": None, "utilization": None},
             "limits": limits,
+        }
+
+    def codex_usage_body(self) -> dict:
+        """What ChatGPT's ``/api/codex/usage`` returns (see codex_usage.py)."""
+        return {
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": self.five_hour,
+                    "limit_window_seconds": 5 * 3600,
+                    "reset_at": int(self.five_hour_reset),
+                },
+                "secondary_window": {
+                    "used_percent": self.seven_day,
+                    "limit_window_seconds": 7 * 86400,
+                    "reset_at": int(self.seven_day_reset),
+                },
+            },
         }
 
     def profile_body(self) -> dict:
@@ -381,6 +403,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._control_get(path)
         if path == "/api/oauth/usage":
             return self._usage()
+        if path == "/api/codex/usage":
+            return self._codex_usage()
         if path == "/api/oauth/profile":
             return self._profile()
         if path == "/api/organizations" or path == "/api/account" or (
@@ -431,6 +455,15 @@ class _Handler(BaseHTTPRequestHandler):
                     {"Retry-After": str(int(acct.retry_after_s))},
                 )
             body = acct.usage_body()
+        self._log(200, acct)
+        self._json(200, body)
+
+    def _codex_usage(self) -> None:
+        acct = self._authed()
+        if acct is None:
+            return
+        with self.fake.lock:
+            body = acct.codex_usage_body()
         self._log(200, acct)
         self._json(200, body)
 

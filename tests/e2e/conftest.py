@@ -15,6 +15,7 @@ shortens aswap's polling intervals while it talks to a loopback server.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -69,9 +70,11 @@ class AswapFailed(AssertionError):
 
 
 class AutoProc:
-    """A background ``aswap auto --json`` and the events it has printed."""
+    """A background ``aswap auto --json`` (or ``aswap codex auto --json``)
+    and the events it has printed."""
 
-    def __init__(self, box: Box, args: list[str], name: str) -> None:
+    def __init__(self, box: Box, args: list[str], name: str,
+                 command: tuple[str, ...] = ("auto",)) -> None:
         self.box = box
         self.out_path = box.artifacts / f"{name}.stdout.jsonl"
         self.err_path = box.artifacts / f"{name}.stderr.log"
@@ -81,7 +84,7 @@ class AutoProc:
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         self.proc = subprocess.Popen(
-            [*aswap_command(), "auto", "--json", *args],
+            [*aswap_command(), *command, "--json", *args],
             env=box.env, cwd=box.home, stdout=self._out, stderr=self._err,
             stdin=subprocess.DEVNULL, **kwargs,
         )
@@ -178,10 +181,12 @@ class Box:
         appdata = self.home / "AppData"
         env = {
             k: v for k, v in os.environ.items()
-            if not k.startswith(("ASWAP_", "CLAUDE_", "XDG_", "ANTHROPIC_"))
+            if not k.startswith(("ASWAP_", "CLAUDE_", "XDG_", "ANTHROPIC_", "CODEX_"))
         }
         env.update({
             "HOME": str(self.home),
+            # Codex's home inside the box, whatever the developer's env says.
+            "CODEX_HOME": str(self.home / ".codex"),
             "USERPROFILE": str(self.home),
             "APPDATA": str(appdata / "Roaming"),
             "LOCALAPPDATA": str(appdata / "Local"),
@@ -284,6 +289,66 @@ class Box:
         proc = AutoProc(self, list(args), name or f"auto{len(self.autos) + 1}")
         self.autos.append(proc)
         return proc
+
+    def start_codex_auto(self, *args: str, name: str | None = None) -> AutoProc:
+        proc = AutoProc(self, list(args), name or f"codex-auto{len(self.autos) + 1}",
+                        command=("codex", "auto"))
+        self.autos.append(proc)
+        return proc
+
+    # -- Codex --------------------------------------------------------------------
+
+    @property
+    def codex_home(self) -> Path:
+        return Path(self.env["CODEX_HOME"])
+
+    def codex_login(self, email: str) -> dict:
+        """Simulate ``codex login`` (file credential store) for ``email``.
+
+        Writes ``$CODEX_HOME/auth.json`` the way Codex does, with tokens the
+        fake issued, and a ``config.toml`` whose ``chatgpt_base_url`` sends
+        aswap's Codex usage reads to the fake (``/api/codex/usage``). The
+        ``id_token`` carries only display claims (email, account, plan), which
+        is all aswap reads from it.
+        """
+        t = self.fake.login_tokens(email)
+        self.codex_home.mkdir(exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            'cli_auth_credentials_store = "file"\n'
+            f'chatgpt_base_url = "{self.fake_server.url}"\n',
+            encoding="utf-8",
+        )
+
+        def b64(obj: dict) -> str:
+            raw = json.dumps(obj).encode()
+            return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+        id_token = ".".join([
+            b64({"alg": "none", "typ": "JWT"}),
+            b64({
+                "email": t["email"],
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": t["uuid"],
+                    "chatgpt_plan_type": "plus",
+                },
+            }),
+            "e2e",
+        ])
+        _atomic_write(self.codex_home / "auth.json", json.dumps({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": None,
+            "tokens": {
+                "id_token": id_token,
+                "access_token": t["accessToken"],
+                "refresh_token": t["refreshToken"],
+                "account_id": t["uuid"],
+            },
+            "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }, indent=2))
+        return t
+
+    def codex_live_email(self) -> str | None:
+        return self.aswap_json("codex", "status", "--json").get("email")
 
     # -- the account as Claude knows it -----------------------------------------
 
