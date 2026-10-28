@@ -80,3 +80,50 @@ jobs:
           path: ${{ runner.temp }}/e2e-artifacts
           retention-days: 14
           if-no-files-found: ignore
+
+  # The real Claude Code CLI, pointed at the fake, must send the bearer token
+  # of the account aswap switched to (tests/e2e/test_claude_code.py). It
+  # installs the latest Claude Code, which aswap does not control, so a red
+  # run here is a signal to look, not a merge blocker.
+  claude-code:
+    name: e2e with the real Claude Code (ubuntu, allowed to fail)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: uv sync --locked
+
+      - name: Build and install the wheel
+        run: |
+          uv build
+          uv tool install dist/*.whl
+          echo "ASWAP_E2E_BIN=$(uv tool dir --bin)/aswap" >> "$GITHUB_ENV"
+
+      - name: Install Claude Code
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+          echo "ASWAP_E2E_REAL_CLAUDE=$(command -v claude)" >> "$GITHUB_ENV"
+
+      - name: Run the Claude Code e2e test
+        env:
+          ASWAP_E2E_ARTIFACTS: ${{ runner.temp }}/e2e-artifacts
+        run: uv run pytest -m e2e tests/e2e/test_claude_code.py -n 0 -v -rs
+
+      - name: Upload e2e artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-artifacts-claude-code
+          path: ${{ runner.temp }}/e2e-artifacts
+          retention-days: 14
+          if-no-files-found: ignore

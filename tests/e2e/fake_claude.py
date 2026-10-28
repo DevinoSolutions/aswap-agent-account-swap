@@ -387,7 +387,7 @@ class _Handler(BaseHTTPRequestHandler):
             path.startswith("/api/organizations/") and path.endswith("/subscription_details")
         ):
             return self._claude_ai(path)
-        self._json(404, {"type": "error", "error": {"type": "not_found_error", "message": path}})
+        self._not_found(path)
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
@@ -398,6 +398,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._token(body)
         if path == "/v1/messages":
             return self._messages(body)
+        self._not_found(path)
+
+    def _not_found(self, path: str) -> None:
+        self._log(404, None)  # logged: shows what a client asked for that the fake lacks
         self._json(404, {"type": "error", "error": {"type": "not_found_error", "message": path}})
 
     def _authed(self) -> Account | None:

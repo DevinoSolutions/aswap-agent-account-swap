@@ -50,6 +50,7 @@ Nothing inside aswap is patched. Two documented environment variables make this 
 | `ASWAP_E2E_ARTIFACTS` | `.e2e-artifacts/` | Where each test's transcript, `aswap auto` output, aswap's logs and the fake's request log go. Kept only for failed tests. |
 | `ASWAP_E2E_KEEP` | unset | Keep the artifacts of passing tests too. |
 | `ASWAP_E2E_TIME_SCALE` | `0.02` | The `ASWAP_TIME_SCALE` the tests run aswap with. |
+| `ASWAP_E2E_REAL_CLAUDE` | unset | A real Claude Code executable. Enables `test_claude_code.py`, which runs `claude -p` against the fake (`ANTHROPIC_BASE_URL`) after each `aswap switch` and checks it sent that account's token. |
 
 To test the packaged program the way CI does:
 
@@ -80,4 +81,4 @@ ASWAP_API_BASE_URL=http://127.0.0.1:8765 aswap list
 ## CI
 
 - `CI` (`ci.yml`): unit tests on Linux, Windows and macOS × Python 3.12/3.13, plus a build-and-smoke of the wheel.
-- `E2E` (`e2e.yml`): builds the wheel, installs it with `uv tool install` and runs `pytest -m e2e` against it on all three OSes, on every PR, on pushes to `main`, nightly and on demand. On failure the per-test artifacts are uploaded.
+- `E2E` (`e2e.yml`): builds the wheel, installs it with `uv tool install` and runs `pytest -m e2e` against it on all three OSes, on every PR, on pushes to `main`, nightly and on demand. On failure the per-test artifacts are uploaded. A separate `claude-code` job installs the latest Claude Code on Linux and runs `test_claude_code.py`; it is allowed to fail, since aswap does not control Claude Code releases.
