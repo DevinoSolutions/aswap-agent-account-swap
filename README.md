@@ -477,6 +477,17 @@ aswap add-token --email user@example.com     # optional label override
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
 
+### Endpoint overrides
+
+aswap talks to `api.anthropic.com` (usage, profile, the rate-limit probe), `platform.claude.com` (token refresh) and `claude.ai` (`aswap billing`). Two environment variables point those requests somewhere else, e.g. a local stand-in server for testing:
+
+```bash
+ASWAP_API_BASE_URL=http://127.0.0.1:8765 aswap list      # api.anthropic.com + platform.claude.com
+ASWAP_CLAUDE_AI_BASE_URL=http://127.0.0.1:8765 aswap billing status   # claude.ai
+```
+
+The value must be an `https://` URL, or `http://` to `localhost`/`127.0.0.1`/`::1` only; anything else is refused with exit code 2 before a request is sent, because these requests carry your account tokens. Unset means the real hosts. (`ASWAP_TIME_SCALE`, which shortens polling intervals, exists for the end-to-end tests and only applies while `ASWAP_API_BASE_URL` is a loopback address; see [CONTRIBUTING.md](CONTRIBUTING.md).)
+
 **API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
 (the kind Claude Code uses after `/login` with a key) rather than an OAuth
 setup-token. It switches like any other account; since API keys have no subscription
@@ -504,6 +515,10 @@ pipx uninstall aswap
 - Python 3.12+
 - Claude Code and/or Codex CLI
 - A file-backed login for managed Codex accounts
+
+## Contributing
+
+Unit tests run with `uv run pytest`; the end-to-end tier, which drives the real `aswap` binary against a fake Claude server, runs with `uv run pytest -m e2e tests/e2e`. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
