@@ -551,4 +551,6 @@ Unit tests run with `uv run pytest`; the end-to-end tier, which drives the real 
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+GNU Affero General Public License v3.0 or later; see [LICENSE](LICENSE). If you run a modified aswap for other people, including as a network service, you must offer them its source under the same license.
+
+aswap started as a fork of an MIT-licensed project; the code that came from it keeps its MIT notice in [LICENSE-MIT](LICENSE-MIT).
