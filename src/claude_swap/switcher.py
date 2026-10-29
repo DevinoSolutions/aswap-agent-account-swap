@@ -7476,6 +7476,9 @@ class ClaudeAccountSwitcher:
             hold = self._manual_hold_line(account_num)
             if hold:
                 print(f"  {hold}")
+            stalled = self._auto_stalled_line()
+            if stalled:
+                print(f"  {stalled}")
             needs = self.needs_login_account_numbers()
             if needs:
                 names = ", ".join(f"Account-{n}" for n in needs)
@@ -7504,6 +7507,22 @@ class ClaudeAccountSwitcher:
         return dimmed(
             f"auto: holding Account-{account_num} (switched by hand) until "
             f"{clock_label(until)}"
+        )
+
+    def _auto_stalled_line(self) -> str | None:
+        """A warning when the last ``aswap auto`` loop has stopped checking
+        (stuck, or killed without a clean stop), while auto is enabled."""
+        # Imported here: autoswitch imports this module.
+        from claude_swap.autoswitch import clock_label, heartbeat_stalled_since
+
+        now = time.time()
+        since = heartbeat_stalled_since(self.backup_dir, now)
+        if since is None or not load_settings(self.backup_dir).enabled:
+            return None
+        minutes = max(1, int((now - since) // 60))
+        return yellowed(
+            f"auto: no check since {clock_label(since)} ({minutes} min) — "
+            "stuck or stopped; restart `aswap auto`"
         )
 
     def _first_run_setup(self) -> None:

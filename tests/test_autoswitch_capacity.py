@@ -413,6 +413,38 @@ class TestLandingRunway:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_an_escape_skips_a_sooner_account_in_its_last_point(self, temp_home):
+        # 2026-10-29 desktop: 19 hit its limit and the at-limit escape picked
+        # 18 at 99% (soonest weekly reset, so the drain floor let it in) over
+        # 4 at 63%; 18 was refused 53 s later and auto moved again.
+        h = _harness(
+            temp_home, {"1": "5x", "2": "20x", "3": "20x"},
+            strategy="consume-first", threshold=99.9,
+        )
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 50, _R_LATER),
+            "2": _usage7(99, 10, _R_SOON),
+            "3": _usage7(63, 10, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert _switch(h).trigger == "at-limit"
+        assert h.active_number() == 3
+
+    def test_an_escape_still_takes_a_last_point_when_nothing_else_has_room(
+        self, temp_home
+    ):
+        h = _harness(
+            temp_home, {"1": "5x", "2": "20x", "3": "20x"},
+            strategy="consume-first", threshold=99.9,
+        )
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 50, _R_LATER),
+            "2": _usage7(99, 10, _R_SOON),
+            "3": _usage7(100, 10, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
     def test_consume_first_leaves_a_last_point_it_cannot_time(self, temp_home):
         # Half a point left (an open gate behind an endpoint 100 reads the
         # same): somewhere inside its last point, where nothing is visible

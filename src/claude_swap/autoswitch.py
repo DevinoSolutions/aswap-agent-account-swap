@@ -37,6 +37,7 @@ import enum
 import json
 import logging
 import math
+import os
 import random
 import threading
 import time
@@ -295,6 +296,61 @@ def manual_hold_until(
         return None
     until = since + minutes * 60.0
     return until if now < until else None
+
+
+# A running loop stamps this file before every wait, saying when it will
+# check next, so `aswap status` can tell a loop that stopped checking from
+# one that is waiting. Measured 2026-10-29: a desktop `aswap auto` sat alive
+# for 20 minutes at 0.4 s of CPU without one tick or log line, and the active
+# account ran into its limit with every other account free. A plain file,
+# not a state document: it changes every few seconds and losing it is harmless.
+HEARTBEAT_FILENAME = "auto_heartbeat.json"
+# Slack past the announced next check before the loop counts as stalled: a
+# tick spends network round trips (usage fetches, probes) before it stamps.
+HEARTBEAT_GRACE_S = 120.0
+# The first stamp, before any tick has said how long it will wait.
+HEARTBEAT_START_S = 120.0
+
+
+def write_heartbeat(backup_dir: Path, now: float, next_by: float) -> None:
+    """Stamp the heartbeat file; a failed write only costs the status line."""
+    path = Path(backup_dir) / HEARTBEAT_FILENAME
+    tmp = path.with_name(f".{HEARTBEAT_FILENAME}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(
+            json.dumps({"pid": os.getpid(), "at": now, "nextBy": next_by}),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def clear_heartbeat(backup_dir: Path) -> None:
+    """Remove this process's stamp when its loop ends cleanly."""
+    path = Path(backup_dir) / HEARTBEAT_FILENAME
+    try:
+        if json.loads(path.read_text(encoding="utf-8")).get("pid") == os.getpid():
+            path.unlink()
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def heartbeat_stalled_since(backup_dir: Path, now: float) -> float | None:
+    """When the last loop last checked, if its next check is overdue; else None.
+
+    None too when no loop has stamped (never started, or stopped cleanly).
+    A loop that was killed leaves its stamp behind, so it reads as stalled
+    until a new one starts: either way nothing is switching.
+    """
+    try:
+        beat = json.loads(
+            (Path(backup_dir) / HEARTBEAT_FILENAME).read_text(encoding="utf-8")
+        )
+        at, next_by = float(beat["at"]), float(beat["nextBy"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    return at if now > next_by + HEARTBEAT_GRACE_S else None
 
 
 def clock_label(ts: float) -> str:
@@ -3122,6 +3178,19 @@ class AutoSwitchEngine:
                 # Already in its last point: nothing in it can be timed (see
                 # edge.py), so draining it is a gamble on a refusal.
                 runway = 0.0
+            elif (
+                trigger != "consume-first"
+                and not all_above
+                and h <= 100.0 - edge.LAST_POINT_PCT
+            ):
+                # An escape onto a 99% account: the clock leaves a last point
+                # it did not see start at once, so landing there buys a refusal
+                # or a second move. Taken only after every account with more
+                # room. Measured 2026-10-29: an at-limit escape picked a 99%
+                # account (soonest weekly reset) over one at 63% and was
+                # refused 53 s later. (With everything spent the question is
+                # when quota returns, see all_above, so it is fair game there.)
+                runway = 0.0
             if runway is not None and runway < min_runway:
                 if trigger == "consume-first":
                     continue  # a voluntary move that would not last
@@ -3957,29 +4026,41 @@ class AutoSwitchEngine:
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
-        while True:
-            # Clear at the top, not after the wait: a wake() racing a wait
-            # timeout is then never lost — the tick right after this clear
-            # already sees whatever settings that wake announced.
-            self._wake.clear()
-            if self._stop.is_set():
-                return 0
-            try:
-                outcome = self.tick()
-            except Exception as e:  # pragma: no cover - tick() already guards
-                self._emit(
-                    ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
-                )
-                outcome = TickOutcome.ERROR
-            delay = self._next_delay(outcome)
-            if delay > self.settings.interval_seconds * 1.5:
-                until = datetime.now(timezone.utc) + timedelta(seconds=delay)
-                self._emit(
-                    SleepEvent(
-                        seconds=delay,
-                        until=until.isoformat(timespec="seconds").replace(
-                            "+00:00", "Z"
-                        ),
+        beat = not self.dry_run
+        backup_dir = self.switcher.backup_dir
+        if beat:
+            now = time.time()
+            write_heartbeat(backup_dir, now, now + HEARTBEAT_START_S)
+        try:
+            while True:
+                # Clear at the top, not after the wait: a wake() racing a wait
+                # timeout is then never lost — the tick right after this clear
+                # already sees whatever settings that wake announced.
+                self._wake.clear()
+                if self._stop.is_set():
+                    return 0
+                try:
+                    outcome = self.tick()
+                except Exception as e:  # pragma: no cover - tick() already guards
+                    self._emit(
+                        ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
                     )
-                )
-            self._sleep(delay)
+                    outcome = TickOutcome.ERROR
+                delay = self._next_delay(outcome)
+                if delay > self.settings.interval_seconds * 1.5:
+                    until = datetime.now(timezone.utc) + timedelta(seconds=delay)
+                    self._emit(
+                        SleepEvent(
+                            seconds=delay,
+                            until=until.isoformat(timespec="seconds").replace(
+                                "+00:00", "Z"
+                            ),
+                        )
+                    )
+                if beat:
+                    now = time.time()
+                    write_heartbeat(backup_dir, now, now + delay)
+                self._sleep(delay)
+        finally:
+            if beat:
+                clear_heartbeat(backup_dir)
