@@ -75,6 +75,11 @@ class AutoSwitchSettings:
     # The hold's on/off switch, kept apart from its length so turning it off
     # and on again keeps a custom ``manual_hold_minutes``.
     manual_hold: bool = True
+    # Comma-separated accounts (emails or slot numbers) auto uses up first,
+    # in this order, over every other rule: consume-first ordering, the
+    # manual hold, the cooldown. Only the limit moves it off one, and then
+    # onto the next priority account with room. None = no priority.
+    priority: str | None = None
     # A Claude Code `/login` aswap does not manage yet is added to the next
     # free slot by `aswap auto` (and the TUI's engine) once it has been
     # stable for two polls, and a re-login for a managed slot refreshes its
@@ -218,6 +223,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Hold a hand-picked account for manualHoldMinutes (false = off)",
         ),
         SettingSpec(
+            "autoswitch", "priority", "priority", "string",
+            help="Accounts auto uses up first, in order (emails or numbers, comma-separated)",
+        ),
+        SettingSpec(
             "autoswitch", "autoAddAccounts", "auto_add_accounts", "bool",
             help="Let aswap auto add new Claude Code logins (no aswap add)",
         ),
@@ -256,6 +265,19 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
         return ()
     seen: dict[str, str] = {}
     for part in value.split(","):
+        name = part.strip()
+        if name and name.lower() not in seen:
+            seen[name.lower()] = name
+    return tuple(seen.values())
+
+
+def parse_priority(value: str | None) -> tuple[str, ...]:
+    """Split ``autoswitch.priority`` into its accounts, in order, trimmed and
+    case-insensitively deduped (an email's case never matters)."""
+    if not value:
+        return ()
+    seen: dict[str, str] = {}
+    for part in value.replace(" ", ",").split(","):
         name = part.strip()
         if name and name.lower() not in seen:
             seen[name.lower()] = name
