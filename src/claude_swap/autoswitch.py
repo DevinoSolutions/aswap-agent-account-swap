@@ -194,6 +194,13 @@ DEFAULT_CAPACITY = 1.0
 # the least the rate is trusted on.
 BURN_WINDOW_S = 10 * 60.0
 BURN_MIN_SPAN_S = 60.0
+# Readings are whole percentages, and the two sources round differently (the
+# usage endpoint reads one point above the statusline's headers; see gate.py),
+# so any rise between two readings can overstate the real one by just under
+# two points. The limit guard's fast pace (`BurnTracker.fast_rate`) subtracts
+# this much from every rise, which makes it a lower bound on the real pace: a
+# rounding step can never project a limit that is not coming.
+BURN_QUANTUM_PCT = 2.0
 
 # A move that is not an escape must buy at least this long on the target at
 # the current burn rate. Measured 2026-10-25: five switches in 6.5 minutes,
@@ -283,13 +290,26 @@ class BurnTracker:
     Samples are (time, account, binding utilization %, account capacity).
     Only consecutive samples of the same account count, and a drop (a window
     rolled over) is skipped rather than read as negative burn.
+
+    The time is when the number was MEASURED (the usage fetch, or the
+    statusline reading), not when a tick looked at it. A tick re-serving a
+    stored reading adds no evidence and is ignored; a fresh reading after a
+    long gap is credited with the whole gap, so the burn it shows is not
+    squeezed into one tick interval.
     """
 
     def __init__(self) -> None:
         self._samples: list[tuple[float, str, float, float]] = []
 
+    def _is_new(self, sample: tuple[float, str, float, float]) -> bool:
+        last = self._samples[-1] if self._samples else None
+        return last is None or last[1] != sample[1] or sample[0] > last[0]
+
     def record(self, now: float, account: str, used_pct: float, capacity: float) -> None:
-        self._samples.append((now, account, used_pct, capacity))
+        sample = (now, account, used_pct, capacity)
+        if not self._is_new(sample):
+            return  # the same (or an older) reading again: no new evidence
+        self._samples.append(sample)
         self._samples = [s for s in self._samples if now - s[0] <= BURN_WINDOW_S]
 
     def renumber(self, mapping: dict[str, str]) -> None:
@@ -311,6 +331,46 @@ class BurnTracker:
         if span < BURN_MIN_SPAN_S or burned <= 0:
             return None
         return burned / span
+
+    def fast_rate(
+        self, pending: tuple[float, str, float, float] | None = None
+    ) -> float | None:
+        """The fastest pace the latest stretch of readings PROVES, or None.
+
+        ``rate()`` averages up to ``BURN_WINDOW_S`` and wants a minute of
+        evidence, so it lags a sudden burn: right after a start or a switch it
+        does not exist for a minute, and after a quiet spell a steep burn is
+        diluted by the quiet minutes (measured: ten idle minutes at 95%, then
+        five points a minute, and the guard never fired before 100%).
+
+        This looks only at the trailing run of the current account, from the
+        newest reading back, and for each earlier reading takes the rise
+        minus ``BURN_QUANTUM_PCT`` over the time between them. Every one of
+        those is a lower bound on the real pace over its stretch, so the
+        result is too, and it needs no minimum span: two readings 20 s apart
+        that rose 30 points prove 84 points a minute, two that rose one point
+        prove nothing. A quiet stretch at the end pulls it down by itself,
+        since every stretch ends at the newest reading.
+
+        ``pending`` is a reading not yet recorded (the escalation decision
+        runs before the tick records its sample).
+        """
+        samples = self._samples
+        if pending is not None and self._is_new(pending):
+            samples = [*samples, pending]
+        if len(samples) < 2:
+            return None
+        end = samples[-1]
+        best = 0.0
+        prev = end
+        for start in reversed(samples[:-1]):
+            if start[1] != end[1] or start[0] >= prev[0] or start[2] > prev[2]:
+                break  # another account, or a rollover: the run ends here
+            rise = end[2] - start[2] - BURN_QUANTUM_PCT
+            if rise > 0:
+                best = max(best, rise * end[3] / (end[0] - start[0]))
+            prev = start
+        return best or None
 
 
 def _recovery_is_useful(
@@ -1507,23 +1567,28 @@ class AutoSwitchEngine:
             utilization = 100.0 - active_headroom
             # Burn is measured on the endpoint's own numbers, never the gate's
             # estimate, so a gate flip is not read as burn or as a rollover.
-            value = usage.get(current)
-            raw = oauth.account_headroom(
-                value if isinstance(value, dict) else None, self._models
-            )
-            self._burn.record(
-                self._collected_at, current,
-                100.0 - raw if raw is not None else utilization, self._cap(current),
-            )
+            self._burn.record(*self._burn_sample(
+                current, usage.get(current), entries.get(current), utilization
+            ))
             self._burn_rate = self._burn.rate()
             if self._burn_rate:
                 self._last_burn_rate = self._burn_rate
                 self._recent_burns.append((self._collected_at, self._burn_rate))
-                self._time_to_limit = (
-                    active_headroom * self._cap(current) / self._burn_rate
-                )
+            # The projection takes the faster of the windowed average and the
+            # pace the latest readings prove (`BurnTracker.fast_rate`): the
+            # average lags a sudden burn by up to a minute. Only the guard
+            # uses the fast pace; the landing and runway checks keep the
+            # average and its peak.
+            rate = max(self._burn_rate or 0.0, self._burn.fast_rate() or 0.0)
+            if rate:
+                self._time_to_limit = active_headroom * self._cap(current) / rate
             # Below the threshold but burning into the limit faster than the
-            # next tick can react: move now, as if over the threshold.
+            # next tick can react: move now, as if over the threshold. Above
+            # it the cooldown still holds (only the at-limit escape skips it):
+            # the window average carries the last account's burn onto a new
+            # one, and letting it skip the cooldown there traded two spent
+            # accounts back and forth (test_limit_guard_does_not_ping_pong_
+            # between_spent_accounts).
             self._limit_guard = (
                 utilization < settings.threshold
                 and not riding
@@ -2509,6 +2574,43 @@ class AutoSwitchEngine:
     def _cap(self, num: str) -> float:
         return self._caps.get(num, DEFAULT_CAPACITY)
 
+    def _burn_sample(
+        self, current: str, value: object, entry: object, fallback_pct: float
+    ) -> tuple[float, str, float, float]:
+        """The active account's burn sample: (measured at, account, binding %,
+        capacity), on the endpoint's own numbers.
+
+        The time is when the binding number was measured: the newest
+        statusline reading when a live window supplies it, else the usage
+        fetch. A stored reading re-served by a later tick keeps its fetch
+        time, so the tracker sees it as no new evidence instead of a flat
+        stretch, and the next fresh reading is credited with the whole gap
+        since the last one. Without a measured time (a gate-only number) it
+        is this tick's collection time; never later than that.
+        """
+        usage = value if isinstance(value, dict) else None
+        raw = oauth.account_headroom(usage, self._models)
+        if raw is None:
+            return self._collected_at, current, fallback_pct, self._cap(current)
+        pct = 100.0 - raw
+        measured: float | None = None
+        if usage is not None and self._live_now and any(
+            isinstance(w := usage.get(key), dict)
+            and w.get("live")
+            and isinstance(w.get("pct"), (int, float))
+            and w["pct"] >= pct
+            for key in ("five_hour", "seven_day")
+        ):
+            measured = max(
+                (r["at"] for r in self._live_now if isinstance(r.get("at"), (int, float))),
+                default=None,
+            )
+        fetched = getattr(entry, "fetched_at", None)
+        if measured is None and isinstance(fetched, (int, float)):
+            measured = fetched
+        at = self._collected_at if measured is None else min(measured, self._collected_at)
+        return at, current, pct, self._cap(current)
+
     def _runway_s(self, num: str, h: float | None, *, landing: bool = False) -> float | None:
         """Seconds of work the account holds at the current burn rate.
 
@@ -3075,6 +3177,17 @@ class AutoSwitchEngine:
                 active_headroom is not None
                 and (runway := self._runway_s(current, active_headroom)) is not None
                 and runway <= 2 * LIMIT_GUARD_S
+            )
+            or (
+                # The same, on the pace this very reading proves: a sudden
+                # burn fires the guard on its first tick, before any rate
+                # from an earlier tick exists.
+                active_headroom is not None
+                and active_headroom > 0
+                and (fast := self._burn.fast_rate(self._burn_sample(
+                    current, active_value, entries.get(current), 0.0
+                ))) is not None
+                and active_headroom * self._cap(current) / fast <= 2 * LIMIT_GUARD_S
             )
         )
         if escalate:
