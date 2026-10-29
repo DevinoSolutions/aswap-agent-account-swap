@@ -27,8 +27,12 @@ from claude_swap.gate import _reset_ts
 WINDOWS = ("five_hour", "seven_day")
 LAST_POINT_PCT = 99.0
 # Share of the last point the clock spends, and a margin for a late reading
-# and the switch itself (about a second).
-EDGE_SHARE = 0.8
+# and the switch itself (about a second). Half, not more: the burn is
+# measured on this machine's work, and consume-first sends every machine to
+# the same soonest-expiring account at once (2026-10-29: laptop and desktop
+# both landed on cool@ within ten seconds and both were refused 70 s later),
+# so its last point can burn twice as fast as either one measures.
+EDGE_SHARE = 0.5
 EDGE_MARGIN_S = 8.0
 # While a clock runs the window is re-probed this often, not every 3-5 s:
 # only a burst faster than the clock assumed shows up there, as a refusal.
