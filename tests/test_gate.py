@@ -132,6 +132,17 @@ class TestApply:
         rec = _record(status="rejected", d7=100.0, s7="rejected")
         assert gate.apply(_usage(99.0), rec, (), NOW) == (0.0, gate.BLOCKED)
 
+    def test_a_window_reading_100_is_at_limit_while_still_allowed(self):
+        # Into Claude's grace: move now, before a request is refused.
+        rec = _record(status="allowed_warning", d7=100.0, s7="allowed_warning")
+        assert gate.apply(_usage(100.0), rec, (), NOW) == (0.0, gate.BLOCKED)
+        assert gate.apply(_usage(99.0), rec, (), NOW) == (0.0, gate.BLOCKED)
+
+    def test_a_full_window_that_has_since_reset_is_stale(self):
+        rec = _record(status="allowed_warning", d7=100.0, s7="allowed_warning")
+        rec["gate"]["seven_day"]["resets_at"] = _iso(NOW - 10)
+        assert gate.apply(_usage(5.0), rec, (), NOW) == (60.0, None)
+
     def test_stale_gate_changes_nothing(self):
         rec = _record(at=NOW - gate.FRESH_S - 1)
         assert gate.apply(_usage(100.0), rec, (), NOW) == (0.0, None)

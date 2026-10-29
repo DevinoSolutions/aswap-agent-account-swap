@@ -124,6 +124,15 @@ LIVE_TICK_S = scaled(20.0)
 # Floor for the faster live ticks taken while the active account closes on
 # its limit.
 LIVE_MIN_TICK_S = scaled(5.0)
+# The active account's last stretch (projected limit within GUARD_PREFETCH_S,
+# or riding an open gate): auto checks every 3-5 s, randomised so two
+# machines never fall into step, and probes the gate on each check unless a
+# live statusline reading is fresher. The probe's headers are the newest
+# usage there is, and a window reading 100% moves the work at once, before
+# any request is refused (owner rule 2026-10-29: never stop running scripts
+# to squeeze the last of an account).
+ENDGAME_TICK_MIN_S = scaled(3.0)
+ENDGAME_TICK_MAX_S = scaled(5.0)
 # How often a running engine heals damaged state files and checks whether a
 # snapshot is due (snapshots themselves are hourly; see snapshots.py).
 MAINTAIN_INTERVAL_S = scaled(300.0)
@@ -1057,6 +1066,9 @@ class AutoSwitchEngine:
         # The active account is riding an open gate (endpoint 100%, API still
         # serving it): ticks then come at least every gate.RIDE_REPROBE_S.
         self._riding = False
+        # The active account is in its last stretch (see ENDGAME_TICK_MIN_S).
+        # Kept across ticks: the gate step of the next tick reads it.
+        self._endgame = False
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -1614,6 +1626,10 @@ class AutoSwitchEngine:
                 and self._time_to_limit is not None
                 and rate > 0
                 and self._time_to_limit <= LIMIT_GUARD_S
+            )
+            self._endgame = riding or (
+                self._time_to_limit is not None
+                and self._time_to_limit <= GUARD_PREFETCH_S
             )
             if utilization < settings.threshold and not self._limit_guard:
                 if settings.strategy != "consume-first":
@@ -3005,11 +3021,19 @@ class AutoSwitchEngine:
 
         budget = gate.MAX_PROBES_PER_TICK
         value = usage.get(current)
-        if live is None and isinstance(value, dict):
+        # In the last stretch a live reading only stands in for the probe
+        # while it is as fresh as the 3-5 s cadence.
+        stale_live = live is not None and self._endgame and (
+            now - live["gate"]["probedAt"] > ENDGAME_TICK_MAX_S
+        )
+        if (live is None or stale_live) and isinstance(value, dict):
             record = self._gate_recs.get(current)
-            closed = (gate.gate_of(record) or {}).get("status") == gate.REJECTED
+            closed = gate.is_full(gate.gate_of(record))
             interval = gate.PROBE_INTERVAL_S if closed else gate.RIDE_REPROBE_S
-            if gate.due(value, record, self._models, now, interval):
+            endgame = self._endgame and not closed
+            if endgame:
+                interval = ENDGAME_TICK_MIN_S * 0.8
+            if gate.due(value, record, self._models, now, interval, any_level=endgame):
                 self._gate_recs.update(probe([current], now))
                 budget -= 1
                 headroom = self._apply_gates(current, usage, now)
@@ -3687,6 +3711,10 @@ class AutoSwitchEngine:
                 # Burning the last point behind an open gate: never sleep
                 # past the next re-probe that can see it close.
                 delay = min(delay, gate.RIDE_REPROBE_S)
+            if self._endgame:
+                delay = min(
+                    delay, random.uniform(ENDGAME_TICK_MIN_S, ENDGAME_TICK_MAX_S)
+                )
         return self._respect_warmup_deadline(delay)
 
     def _respect_warmup_deadline(self, delay: float) -> float:

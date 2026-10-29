@@ -10,6 +10,8 @@ import pytest
 
 from claude_swap import gate
 from claude_swap.autoswitch import (
+    ENDGAME_TICK_MAX_S,
+    ENDGAME_TICK_MIN_S,
     LIMIT_GUARD_S,
     NoSwitchEvent,
     SwitchEvent,
@@ -90,18 +92,48 @@ class TestActiveRidesAnOpenGate:
         assert next(e for e in h.events if isinstance(e, SwitchEvent)).trigger == "at-limit"
         assert h.active_number() == 2
 
-    def test_reprobed_every_few_minutes_and_escapes_when_it_closes(self, temp_home):
+    def test_reprobed_every_few_seconds_and_escapes_when_it_closes(self, temp_home):
         h = _harness(temp_home, threshold=99.9)
         fake = _probing({"sk-live": ("allowed_warning", 99.0)})
         usage = {"1": _full(), "2": _usage(50), "3": _usage(60)}
         h.tick_with_usage(usage)
-        h.clock.advance(gate.RIDE_REPROBE_S / 2)
+        assert h.engine._endgame
+        h.clock.advance(ENDGAME_TICK_MIN_S / 2)
         assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
         assert fake.calls == ["sk-live"]  # not yet due
-        h.clock.advance(gate.RIDE_REPROBE_S)
+        h.clock.advance(ENDGAME_TICK_MIN_S)
         fake.answers["sk-live"] = ("rejected", 100.0)
         assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
         assert fake.calls == ["sk-live", "sk-live"]
+
+    def test_moves_when_the_gate_reads_100_before_any_refusal(self, temp_home):
+        h = _harness(temp_home, threshold=99.9)
+        fake = _probing({"sk-live": ("allowed_warning", 99.0)})
+        usage = {"1": _full(), "2": _usage(50), "3": _usage(60)}
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        # Still allowed, but the window now reads 100%: inside the grace.
+        fake.answers["sk-live"] = ("allowed_warning", 100.0)
+        h.clock.advance(ENDGAME_TICK_MIN_S)
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert next(e for e in h.events if isinstance(e, SwitchEvent)).trigger == "at-limit"
+        assert h.active_number() == 2
+
+    def test_last_stretch_probes_below_100_every_few_seconds(self, temp_home):
+        h = _harness(temp_home, threshold=99.9)
+        fake = _probing({"sk-live": ("allowed", 97.0)})
+        others = {"2": _usage(50), "3": _usage(60)}
+        assert h.tick_with_usage({"1": _usage(94), **others}) is TickOutcome.NO_ACTION
+        h.clock.advance(60)
+        # Three points a minute, three left: a minute out, the last stretch.
+        assert h.tick_with_usage({"1": _usage(97), **others}) is TickOutcome.NO_ACTION
+        assert h.engine._endgame
+        assert fake.calls == []  # the endpoint's 97% is not a probe trigger
+        for _ in range(20):
+            delay = h.engine._next_delay(TickOutcome.NO_ACTION)
+            assert ENDGAME_TICK_MIN_S <= delay <= ENDGAME_TICK_MAX_S
+        h.clock.advance(ENDGAME_TICK_MIN_S)
+        assert h.tick_with_usage({"1": _usage(97), **others}) is TickOutcome.NO_ACTION
+        assert fake.calls == ["sk-live"]
 
     def test_failed_reprobes_fall_back_to_the_endpoint(self, temp_home):
         h = _harness(temp_home, threshold=99.9)
