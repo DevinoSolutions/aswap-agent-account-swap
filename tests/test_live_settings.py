@@ -108,7 +108,7 @@ class TestCheapWhenUnchanged:
         _set(h, "autoswitch.threshold", "72")
         h.tick_with_usage(_HOT_1)
 
-        with patch("claude_swap.autoswitch.reload_autoswitch_settings") as reread:
+        with patch("claude_swap.live_settings.reload_autoswitch_settings") as reread:
             h.tick_with_usage(_HOT_1)
             h.tick_with_usage(_HOT_1)
         reread.assert_not_called()

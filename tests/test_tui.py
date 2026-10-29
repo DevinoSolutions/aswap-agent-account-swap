@@ -2323,6 +2323,126 @@ class TestAutoScreen:
             await pilot.pause()
             assert screen._settings.threshold == 50.0  # spec's lower bound
 
+    async def test_summary_follows_a_live_settings_reload(
+        self, tmp_path, fake_engine
+    ):
+        """The engine reloads `aswap config` changes; the summary line, the
+        bar tick and the exit value must follow, not keep the mount values."""
+        from textual.widgets import Static
+
+        from claude_swap.autoswitch import SettingsReloadedEvent
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            summary = screen.query_one("#auto-summary", Static)
+            assert "threshold 90% · poll every 60s" in summary.render().plain
+
+            # What the engine thread's on_event delivers via call_from_thread.
+            screen._on_engine_event(
+                SettingsReloadedEvent(
+                    changes=(
+                        ("autoswitch.threshold", 90.0, 80.0),
+                        ("autoswitch.intervalSeconds", 60.0, 30.0),
+                        ("autoswitch.warmupFiveHour", False, True),
+                    )
+                )
+            )
+            await settle(pilot)
+
+            plain = summary.render().plain
+            assert "threshold 80% · poll every 30s" in plain
+            assert "(session)" not in plain  # it is the stored value now
+            assert "5h warm-up on" in plain
+            assert app.threshold_pct == 80.0
+            await pilot.press("escape")
+            await settle(pilot)
+            assert app.threshold_pct == 80.0  # the new file value, not 90
+
+    async def test_a_session_threshold_survives_a_live_reload(
+        self, tmp_path, fake_engine
+    ):
+        from textual.widgets import Static
+
+        from claude_swap.autoswitch import SettingsReloadedEvent
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("t", "right", "right", "enter")
+            await pilot.pause()
+            assert screen._settings.threshold == 92.0
+
+            # The engine pinned the session value, so a stored change arrives
+            # as "pinned", alongside a key it did apply.
+            screen._on_engine_event(
+                SettingsReloadedEvent(
+                    changes=(("autoswitch.intervalSeconds", 60.0, 30.0),),
+                    pinned=(("autoswitch.threshold", 80.0, 92.0),),
+                )
+            )
+            await settle(pilot)
+
+            plain = screen.query_one("#auto-summary", Static).render().plain
+            assert "threshold 92% (session) · poll every 30s" in plain
+            assert app.threshold_pct == 92.0
+            await pilot.press("escape")
+            await settle(pilot)
+            assert app.threshold_pct == 80.0  # reverts to the new file value
+
+    async def test_codex_summary_follows_a_real_engine_reload(self, tmp_path):
+        """End to end inside the TUI: the real Codex engine, a real
+        `aswap config set`, and the summary line catching up -- plus a session
+        threshold step, which the Codex engine now accepts and pins."""
+        from textual.widgets import Static
+
+        from claude_swap.settings import set_setting
+
+        claude = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        codex = FakeSwitcher(
+            [make_account(7, active=True), make_account(8)], tmp_path
+        )
+        app = make_app(claude, codex)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "auto")
+            await menu_select(pilot, "auto:codex")
+            await pilot.pause()
+            screen = app.screen
+            summary = screen.query_one("#auto-summary", Static)
+            assert "threshold 90% · poll every 60s" in summary.render().plain
+
+            set_setting(tmp_path, "autoswitch.intervalSeconds", "30")
+            set_setting(tmp_path, "autoswitch.threshold", "80")
+            screen._engine.wake()
+            for _ in range(100):
+                await pilot.pause(0.05)
+                if "poll every 30s" in summary.render().plain:
+                    break
+            plain = summary.render().plain
+            assert "threshold 80% · poll every 30s" in plain
+            assert screen._engine.settings.threshold == 80.0
+
+            await pilot.press("t", "right", "enter")
+            await pilot.pause()
+            assert screen._engine.settings.threshold == 81.0
+            set_setting(tmp_path, "autoswitch.threshold", "70")
+            screen._engine.wake()
+            for _ in range(100):
+                await pilot.pause(0.05)
+                if screen._configured_threshold == 70.0:
+                    break
+            assert screen._engine.settings.threshold == 81.0  # pinned
+            assert "threshold 81% (session)" in summary.render().plain
+
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
             [

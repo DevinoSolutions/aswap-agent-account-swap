@@ -5,6 +5,12 @@ credential-lock/token-refresh protocol, so it deliberately uses a compact
 engine rather than ``AutoSwitchEngine``. It changes ``$CODEX_HOME/auth.json``
 for the *next* Codex launch; an already running Codex session must be restarted
 to pick up the selected account.
+
+Its own settings, though, follow ``aswap config`` live, exactly like the Claude
+engine's: the same :class:`~claude_swap.live_settings.LiveSettings` check at the
+top of every tick, the same sliced sleep, the same ``settings reloaded`` line
+and ``settings-reloaded`` / ``config-warning`` events, and the same pinning of
+keys given as command-line flags (or as a TUI session threshold).
 """
 
 from __future__ import annotations
@@ -12,7 +18,8 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from dataclasses import replace
 from pathlib import Path
 
 from claude_swap.autoswitch import (
@@ -23,10 +30,12 @@ from claude_swap.autoswitch import (
     PollEvent,
     SwitchEvent,
     TickOutcome,
+    apply_settings_reload,
     binding_pct,
 )
 from claude_swap import statedb
 from claude_swap.codex import CodexAccountSwitcher, _codex_restart_hint
+from claude_swap.live_settings import LiveSettings, sliced_wait
 from claude_swap.locking import FileLock
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json
 
@@ -50,14 +59,20 @@ class CodexAutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        pinned: Iterable[str] = (),
     ) -> None:
         self.switcher = switcher
         self.settings = settings
+        # ``aswap config`` changes apply from the next tick on, except the
+        # keys in ``pinned`` (command-line flags) and any the caller passed
+        # differently from the settings document (a TUI session threshold).
+        self._live = LiveSettings(switcher.backup_dir, settings, pinned)
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
         self._stop = threading.Event()
+        self._wake = threading.Event()
 
     def _state_lock(self) -> FileLock:
         return FileLock(self.state_path.parent / ".codex_autoswitch_state.lock")
@@ -81,6 +96,9 @@ class CodexAutoSwitchEngine:
     def tick(self) -> TickOutcome:
         """Fetch usage, choose the best eligible account, and switch if needed."""
         try:
+            # Before the tick reads ``self.settings``, so a whole tick decides
+            # on one set of values.
+            self._reload_settings()
             return self._tick()
         except Exception as exc:
             self._emit(ErrorEvent(message=f"{type(exc).__name__}: {exc}"))
@@ -244,10 +262,50 @@ class CodexAutoSwitchEngine:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
+
+    def wake(self) -> None:
+        """Cut the current inter-tick sleep short and tick now."""
+        self._wake.set()
+
+    def apply_threshold(self, threshold: float) -> None:
+        """Session override from the TUI; a stored change must not undo it."""
+        self.settings = replace(self.settings, threshold=threshold)
+        self._live.pin("threshold")
+
+    # -- live settings ----------------------------------------------------------
+
+    def _reload_settings(self) -> None:
+        """Pick up an ``aswap config`` change made while this engine runs.
+
+        Same semantics as ``AutoSwitchEngine._reload_settings``: one indexed
+        lookup per tick, a strict re-read after a write, pinned keys kept, an
+        invalid stored value refused with a ``config-warning`` (the last good
+        value stays), and one ``settings-reloaded`` event naming the change.
+        Never raises. Nothing else is reset: the cooldown lives in the state
+        file and is measured against the new ``cooldownSeconds`` from now on.
+        """
+        apply_settings_reload(self, self._live.poll(self.settings))
+
+    def _settings_applied(
+        self, old: AutoSwitchSettings, new: AutoSwitchSettings
+    ) -> None:
+        """Nothing is derived from the settings here: each tick reads them."""
+
+    def _sleep(self, delay: float) -> None:
+        """Wait ``delay`` seconds, ending early on wake/stop or a settings change."""
+        sliced_wait(delay, self._wake, self._stop, self._live.changed)
 
     def run_loop(self) -> int:
-        self._stop.clear()
+        """Tick until :meth:`stop`. Single-use, like ``AutoSwitchEngine``: a
+        stop that lands before the loop starts (the TUI swapping engines) is
+        never cleared, so the loop exits at once instead of running on."""
         while not self._stop.is_set():
+            # Clear before the tick, not after the wait, so a wake() that
+            # races a wait timeout is never lost.
+            self._wake.clear()
             self.tick()
-            self._stop.wait(self.settings.interval_seconds)
+            if self._stop.is_set():
+                break
+            self._sleep(self.settings.interval_seconds)
         return 0

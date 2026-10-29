@@ -27,6 +27,7 @@ from textual.widgets import Footer, RichLog, Static
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
+    SettingsReloadedEvent,
     binding_pct,
     clock_label,
     pct_label,
@@ -343,6 +344,39 @@ class AutoScreen(Screen):
             self._update_summary()  # the manual-hold note comes and goes
         if event.kind == "switch":
             self.app.request_refresh(self.provider)
+        if event.kind == "settings-reloaded":
+            self._on_settings_reloaded(event)
+
+    def _on_settings_reloaded(self, event: SettingsReloadedEvent) -> None:
+        """Follow an ``aswap config`` change the running engine just applied.
+
+        The screen keeps its own copy of the settings for the summary line,
+        the bar tick and the candidate ranking; without this it would keep
+        showing the values it loaded when it opened while the engine already
+        decides on new ones. Reads the event, not ``engine.settings``: the
+        event says exactly what moved, and a session threshold stays put
+        (the engine pinned it, so it arrives under ``pinned``).
+        """
+        updates = {SETTING_SPECS[key].field: new for key, _old, new in event.changes}
+        stored_threshold = {
+            key: stored for key, stored, _kept in event.pinned
+        }.get("autoswitch.threshold", updates.get("threshold"))
+        if stored_threshold is not None:
+            # The file value the screen reverts the bar tick to on exit, and
+            # what the "(session)" marker compares against.
+            self._configured_threshold = stored_threshold
+        if updates:
+            self._settings = replace(self._settings, **updates)
+        if "threshold" in updates:
+            if self._adjusting:
+                # Not stepped yet (a step pins it): the new value is the
+                # baseline, not a session change to announce.
+                self._entry_threshold = self._settings.threshold
+            self.app.threshold_pct = self._settings.threshold
+            self.query_one("#auto-active-panel", AccountsPanel).refresh()
+        if "model" in updates:
+            self._on_snapshot(self.app.snapshots[self.provider])  # re-rank
+        self._update_summary()
 
     def action_toggle_live(self) -> None:
         if self._engine is None:
