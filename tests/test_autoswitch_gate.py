@@ -230,18 +230,20 @@ class TestRunwayRule:
                           for n in ("1", "2", "3")},
         ).start()
         _probing({})
-        readings = {"1": 94.0, "2": 97.0, "3": 96.5}
+        # a minute of burn evidence before the active nears its limit
+        readings = {"1": 85.0, "2": 97.0, "3": 96.5}
         switches = []
-        for _ in range(8):
+        for _ in range(12):
             usage = {num: _usage(pct) for num, pct in readings.items()}
             h.tick_with_usage(usage)
             new = [e for e in h.events if isinstance(e, SwitchEvent)]
             if len(new) > len(switches):
                 switches = new
-            # the active burns 3 points a minute; the others hold still
+            # the active burns 3 points every 20 s (a burst the limit guard
+            # sees coming); the others hold still
             active = str(h.active_number())
             readings[active] = min(readings[active] + 3.0, 100.0)
-            h.clock.advance(60)
+            h.clock.advance(20)
         moves = [(e.from_ref["number"], e.to_ref["number"], e.trigger) for e in switches]
         # one at-limit escape at most once the active really is spent; never
         # a proactive move to an account that runs out as fast
