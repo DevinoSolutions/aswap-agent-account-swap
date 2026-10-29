@@ -54,6 +54,11 @@ LAPSED_TTL_S = scaled(30 * 60)
 LAPSED_RECHECK_S = scaled(5 * 60)
 LAPSED_STAGGER_S = scaled(60)
 PLAN_RECHECK_MIN_S = scaled(60)
+# Every plan is re-read (profile only) at least this often, lapsed or not.
+# 2026-10-29: three accounts upgraded 5x -> 20x stayed 5x in aswap until
+# `aswap billing tier` was run by hand; an active row is otherwise re-read
+# once a day, and a 20x counted as 5x hides three quarters of its quota.
+PLAN_REFRESH_S = scaled(3600)
 FAILURE_RETRY_S = scaled(3600)
 # A tier check asked for an off-schedule weekly reading stays open this long;
 # an older one is asked again rather than answered by an unrelated fetch.
@@ -485,9 +490,11 @@ class BillingCache:
         identities: dict[str, tuple[str, str]],
         min_age: float,
         stagger: bool = False,
+        lapsed_only: bool = True,
     ) -> list[str]:
-        """Slots cached as lapsed whose plan was last read ``min_age`` ago or
-        more, stamped as checked now (``planCheckedAt``).
+        """Slots cached as lapsed (any slot with ``lapsed_only=False``) whose
+        plan was last read ``min_age`` ago or more, stamped as checked now
+        (``planCheckedAt``).
 
         The stamp is the claim: every surface (``auto``, the TUI, a switch)
         asks in its own process, and the second one to ask inside the window
@@ -501,7 +508,9 @@ class BillingCache:
         due: list[str] = []
         for num, (email, org) in identities.items():
             row = rows.get(num)
-            if not self._matches(row, email, org) or not looks_lapsed(row):
+            if not self._matches(row, email, org) or (
+                lapsed_only and not looks_lapsed(row)
+            ):
                 continue
             last = max(row.get("fetchedAt") or 0, row.get("planCheckedAt") or 0)
             offset = zlib.crc32(num.encode()) % (LAPSED_STAGGER_S + 1) if stagger else 0

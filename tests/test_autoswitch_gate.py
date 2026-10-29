@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import gate
+from claude_swap import edge, gate
 from claude_swap.autoswitch import (
     ENDGAME_TICK_MAX_S,
     ENDGAME_TICK_MIN_S,
@@ -70,9 +70,20 @@ def _reasons(h: EngineHarness) -> list[str]:
     return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
 
 
+def _seen_at_98(h: EngineHarness, ago: float = 2.0, account: str = "1") -> None:
+    """The active account was read at 98% a moment ago, so the tick to 99
+    that follows starts a last-point clock (edge.py) instead of reading as
+    a last point whose start was never seen."""
+    now = h.clock.now
+    h.engine._edge.observe(
+        account, {"probedAt": now - ago, "seven_day": {"pct": 98.0}}, now
+    )
+
+
 class TestActiveRidesAnOpenGate:
     def test_endpoint_100_with_open_gate_is_not_escaped(self, temp_home, caplog):
         h = _harness(temp_home, threshold=99.9)
+        _seen_at_98(h)
         fake = _probing({"sk-live": ("allowed_warning", 99.0)})
         with caplog.at_level(logging.INFO, logger="claude-swap"):
             outcome = h.tick_with_usage({"1": _full(), "2": _usage(50), "3": _usage(60)})
@@ -92,28 +103,30 @@ class TestActiveRidesAnOpenGate:
         assert next(e for e in h.events if isinstance(e, SwitchEvent)).trigger == "at-limit"
         assert h.active_number() == 2
 
-    def test_reprobed_every_few_seconds_and_escapes_when_it_closes(self, temp_home):
+    def test_a_timed_last_point_is_reprobed_and_escapes_when_it_closes(self, temp_home):
         h = _harness(temp_home, threshold=99.9)
+        _seen_at_98(h)
         fake = _probing({"sk-live": ("allowed_warning", 99.0)})
         usage = {"1": _full(), "2": _usage(50), "3": _usage(60)}
         h.tick_with_usage(usage)
-        assert h.engine._endgame
-        h.clock.advance(ENDGAME_TICK_MIN_S / 2)
+        assert h.engine._edge.running()
+        h.clock.advance(edge.EDGE_REPROBE_S / 2)
         assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
         assert fake.calls == ["sk-live"]  # not yet due
-        h.clock.advance(ENDGAME_TICK_MIN_S)
+        h.clock.advance(edge.EDGE_REPROBE_S / 2)
         fake.answers["sk-live"] = ("rejected", 100.0)
         assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
         assert fake.calls == ["sk-live", "sk-live"]
 
     def test_moves_when_the_gate_reads_100_before_any_refusal(self, temp_home):
         h = _harness(temp_home, threshold=99.9)
+        _seen_at_98(h)
         fake = _probing({"sk-live": ("allowed_warning", 99.0)})
         usage = {"1": _full(), "2": _usage(50), "3": _usage(60)}
         assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
         # Still allowed, but the window now reads 100%: inside the grace.
         fake.answers["sk-live"] = ("allowed_warning", 100.0)
-        h.clock.advance(ENDGAME_TICK_MIN_S)
+        h.clock.advance(edge.EDGE_REPROBE_S)
         assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
         assert next(e for e in h.events if isinstance(e, SwitchEvent)).trigger == "at-limit"
         assert h.active_number() == 2
@@ -137,6 +150,7 @@ class TestActiveRidesAnOpenGate:
 
     def test_failed_reprobes_fall_back_to_the_endpoint(self, temp_home):
         h = _harness(temp_home, threshold=99.9)
+        _seen_at_98(h)
         _probing({"sk-live": ("allowed_warning", 99.0)})
         usage = {"1": _full(), "2": _usage(50), "3": _usage(60)}
         h.tick_with_usage(usage)
@@ -151,9 +165,10 @@ class TestActiveRidesAnOpenGate:
         # 0.5 estimated points burning at a point a minute would trip the
         # guard; the gate is the signal instead.
         h = _harness(temp_home, threshold=99.9)
+        _seen_at_98(h)
         _probing({"sk-live": ("allowed_warning", 99.0)})
         h.tick_with_usage({"1": _full(99.0), "2": _usage(50), "3": _usage(60)})
-        h.clock.advance(60)
+        h.clock.advance(20)
         outcome = h.tick_with_usage({"1": _full(100.0), "2": _usage(50), "3": _usage(60)})
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
@@ -162,6 +177,7 @@ class TestActiveRidesAnOpenGate:
         from claude_swap import live_usage
 
         h = _harness(temp_home, threshold=99.9)
+        _seen_at_98(h)
         fake = _probing({})
         live_usage.write_reading(
             h.switcher.backup_dir, "s1",
@@ -175,6 +191,48 @@ class TestActiveRidesAnOpenGate:
             outcome = h.tick_with_usage({"1": _full(), "2": _usage(50), "3": _usage(60)})
         assert outcome is TickOutcome.NO_ACTION
         assert fake.calls == []
+
+    def test_a_last_point_that_started_unseen_is_left_at_once(self, temp_home, caplog):
+        # 2026-10-29 desktop: landed on an account already at 99 and rode it
+        # into a refusal 68 s later. Nothing inside the last point is
+        # visible, so with no 98 reading seen there is nothing to time.
+        h = _harness(temp_home, threshold=99.9)
+        _probing({"sk-live": ("allowed_warning", 99.0)})
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            outcome = h.tick_with_usage({"1": _full(), "2": _usage(50), "3": _usage(60)})
+        assert outcome is TickOutcome.SWITCHED
+        assert next(e for e in h.events if isinstance(e, SwitchEvent)).trigger == "at-limit"
+        assert any("start unseen" in r.getMessage() for r in caplog.records)
+
+    def test_the_clock_leaves_before_the_point_runs_out_probing_sparingly(self, temp_home):
+        h = _harness(temp_home, threshold=99.9)
+        fake = _probing({"sk-live": ("allowed_warning", 99.0)})
+        usage = {"1": _full(), "2": _usage(50), "3": _usage(60)}
+        _seen_at_98(h, ago=1.0)
+        start = h.clock.now - 1.0
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.engine._edge.running()
+        deadline = h.engine._edge_deadline
+        # A point a minute (the default burn, 5x): 80% of it, minus margin.
+        assert deadline == pytest.approx(start + 60 * edge.EDGE_SHARE - edge.EDGE_MARGIN_S)
+        delay = h.engine._next_delay(TickOutcome.NO_ACTION)
+        assert delay <= deadline - h.clock.now
+        while h.clock.now + ENDGAME_TICK_MIN_S < deadline:
+            h.clock.advance(ENDGAME_TICK_MIN_S)
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        # Timed, not polled: a re-probe every EDGE_REPROBE_S, not every 3-5 s.
+        assert len(fake.calls) <= 1 + (deadline - start) / edge.EDGE_REPROBE_S
+        h.clock.advance(ENDGAME_TICK_MIN_S)
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_the_clock_never_trades_for_another_unknown_last_point(self, temp_home):
+        h = _harness(temp_home, n=2, threshold=99.9)
+        _probing({"sk-live": ("allowed_warning", 99.0), "sk-2": ("allowed_warning", 99.0)})
+        outcome = h.tick_with_usage({"1": _full(), "2": _full()})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert "last-point" in _reasons(h)
 
     def test_dry_run_never_probes(self, temp_home):
         h = _harness(temp_home, threshold=99.9)

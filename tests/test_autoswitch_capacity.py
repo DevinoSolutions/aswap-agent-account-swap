@@ -413,6 +413,24 @@ class TestLandingRunway:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_consume_first_leaves_a_last_point_it_cannot_time(self, temp_home):
+        # Half a point left (an open gate behind an endpoint 100 reads the
+        # same): somewhere inside its last point, where nothing is visible
+        # before the refusal (edge.py). Two minutes of it at this burn would
+        # clear the drain floor; draining it gambles on that refusal.
+        h = _harness(
+            temp_home, {"1": "20x", "2": "20x", "3": "20x"},
+            strategy="consume-first", threshold=99.9,
+        )
+        h.engine._recent_burns = [(h.clock.now - 600, 1.0 / 60)]
+        outcome = h.tick_with_usage({
+            "1": _usage7(30, 50, _R_LATER),
+            "2": _usage7(0, 99.5, _R_SOON),
+            "3": _usage7(0, 10, _R_LATER),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
     def test_a_forced_move_drains_a_sooner_account_the_ratio_would_refuse(self, temp_home):
         # The active nears its limit with ~7 minutes left; the sooner 5x holds
         # 20 points (~7 minutes too), short of the runway ratio. Draining it

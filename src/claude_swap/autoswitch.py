@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap.endpoints import scaled  # test-only clock scale (1.0 outside tests)
-from claude_swap import gate, live_usage, oauth, poll_policy, snapshots, statedb
+from claude_swap import edge, gate, live_usage, oauth, poll_policy, snapshots, statedb
 from claude_swap.exceptions import ClaudeSwitchError, RosterChangedError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -1069,6 +1069,12 @@ class AutoSwitchEngine:
         # The active account is in its last stretch (see ENDGAME_TICK_MIN_S).
         # Kept across ticks: the gate step of the next tick reads it.
         self._endgame = False
+        # When the active account's last point runs out (see edge.py), and
+        # whether this tick's move is that clock's (not a refusal's).
+        self._edge = edge.LastPointClock()
+        self._edge_deadline: float | None = None
+        self._edge_forced = False
+        self._edge_logged: tuple | None = None
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -1472,6 +1478,8 @@ class AutoSwitchEngine:
         self._live_active = False
         self._time_to_limit = None
         self._limit_guard = False
+        self._edge_deadline = None
+        self._edge_forced = False
         self.manual_hold = None
         self._follow_roster()
         self._reload_settings()
@@ -1590,6 +1598,14 @@ class AutoSwitchEngine:
         # anything on an estimated half point; the next closed gate (re-probed
         # every few minutes) is the at-limit escape.
         riding = self._gate_verdicts.get(current) == gate.OPEN
+        if active_headroom is not None and active_headroom > 0 and self._edge_due(
+            current, usage.get(current), entries.get(current)
+        ):
+            # The last point is spent by the clock, before any refusal.
+            active_headroom = 0.0
+            headroom[current] = 0.0
+            riding = False
+            self._edge_forced = True
         self._riding = riding
         if active_headroom is not None:
             self._unhealthy_ticks = 0
@@ -1753,6 +1769,21 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
+        if self._edge_forced:
+            # Leaving a last point for another one in an unknown state would
+            # only come straight back: only accounts with more than that.
+            oauth_candidates = [
+                n for n in oauth_candidates
+                if (headroom.get(n) or 0.0) > gate.OPEN_HEADROOM
+            ]
+            if not oauth_candidates and not metered_candidates:
+                self._emit(
+                    NoSwitchEvent(
+                        reason="last-point",
+                        detail="no other account has more than its last point left",
+                    )
+                )
+                return TickOutcome.NO_ACTION
         if not oauth_candidates and not metered_candidates:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
@@ -2127,6 +2158,10 @@ class AutoSwitchEngine:
             background = getattr(self.switcher, "recheck_lapsed_plans", None)
             if background is not None:
                 background()
+            # Hourly plan pass; never while the 3-5 s last stretch runs.
+            hourly = getattr(self.switcher, "recheck_plans", None)
+            if hourly is not None and not self._endgame:
+                hourly()
         except Exception:
             _logger.debug("lapsed-plan re-check failed", exc_info=True)
 
@@ -2646,6 +2681,40 @@ class AutoSwitchEngine:
         at = self._collected_at if measured is None else min(measured, self._collected_at)
         return at, current, pct, self._cap(current)
 
+    def _edge_due(self, current: str, value: object, entry: object) -> bool:
+        """Feed the last-point clock and say whether its deadline has passed.
+
+        The point is sized at the fastest burn in sight (the landing peak,
+        the windowed average, the pace the latest readings prove), so the
+        clock errs early; see edge.py for why 100% cannot be waited for.
+        """
+        now = self._collected_at
+        self._edge.observe_endpoint(
+            current,
+            value if isinstance(value, dict) else None,
+            getattr(entry, "fetched_at", None),
+        )
+        self._edge.observe(current, gate.gate_of(self._gate_recs.get(current)), now)
+        rate = max(
+            self._landing_rate(),
+            self._burn_rate or 0.0,
+            self._burn.fast_rate() or 0.0,
+        )
+        deadline = self._edge.deadline(self._cap(current) / rate if rate > 0 else None)
+        self._edge_deadline = deadline
+        if deadline is None or now < deadline:
+            return False
+        note = (current, tuple(self._edge.windows()))
+        if self._edge_logged != note:
+            self._edge_logged = note
+            _logger.info(
+                "Account %s: %s in its last point (%s); leaving before it is refused",
+                current,
+                "/".join(w.replace("_", "-") for w in note[1]),
+                "start unseen" if deadline == edge.UNKNOWN else "clock ran out",
+            )
+        return True
+
     def _landing_rate(self) -> float:
         """The burn a switch target is judged by: the fastest rate seen within
         ``LANDING_BURN_WINDOW_S``, so a lull does not shrink the check; an
@@ -2936,6 +3005,10 @@ class AutoSwitchEngine:
                 runway_refused = True
                 continue
             min_runway = LIMIT_GUARD_S + DRAIN_MIN_USE_S if drain else MIN_LANDING_RUNWAY_S
+            if drain and h < 100.0 - edge.LAST_POINT_PCT:
+                # Already in its last point: nothing in it can be timed (see
+                # edge.py), so draining it is a gamble on a refusal.
+                runway = 0.0
             if runway is not None and runway < min_runway:
                 if trigger == "consume-first":
                     continue  # a voluntary move that would not last
@@ -3030,10 +3103,17 @@ class AutoSwitchEngine:
             record = self._gate_recs.get(current)
             closed = gate.is_full(gate.gate_of(record))
             interval = gate.PROBE_INTERVAL_S if closed else gate.RIDE_REPROBE_S
-            endgame = self._endgame and not closed
+            # A timed last point needs no 3-5 s probing (its next tick is the
+            # refusal); a slower re-probe still catches a burst it missed.
+            timed = self._edge.running() and not closed
+            endgame = self._endgame and not closed and not timed
             if endgame:
                 interval = ENDGAME_TICK_MIN_S * 0.8
-            if gate.due(value, record, self._models, now, interval, any_level=endgame):
+            elif timed:
+                interval = edge.EDGE_REPROBE_S
+            if gate.due(
+                value, record, self._models, now, interval, any_level=endgame or timed
+            ):
                 self._gate_recs.update(probe([current], now))
                 budget -= 1
                 headroom = self._apply_gates(current, usage, now)
@@ -3715,6 +3795,9 @@ class AutoSwitchEngine:
                 delay = min(
                     delay, random.uniform(ENDGAME_TICK_MIN_S, ENDGAME_TICK_MAX_S)
                 )
+            if self._edge_deadline is not None:
+                # Wake on the last point's deadline, not a tick after it.
+                delay = min(delay, max(0.5, self._edge_deadline - self.clock()))
         return self._respect_warmup_deadline(delay)
 
     def _respect_warmup_deadline(self, delay: float) -> float:

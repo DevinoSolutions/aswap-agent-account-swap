@@ -60,6 +60,7 @@ from claude_swap import live_login
 from claude_swap.billing import (
     LAPSED_RECHECK_S,
     PLAN_RECHECK_MIN_S,
+    PLAN_REFRESH_S,
     BillingCache,
     billing_text,
     billing_view,
@@ -163,6 +164,11 @@ _TORN_READ_ATTEMPTS = 3
 # this in-memory map is only the fallback when that write fails.
 _WIPED_WARN_INTERVAL_S = 3600.0
 _wiped_warned_at: dict[str, float] = {}
+
+# A fall this large inside one window (same reset time) re-reads the plan:
+# usage only falls that way when the plan under it grew (see
+# _note_usage_drop). Readings are whole percents, so a point or two is noise.
+USAGE_DROP_PCT = 5.0
 _TORN_READ_DELAY_S = 0.05
 # An account cached as lapsed but reporting live usage gets its plan re-read
 # at most this often (one profile request each time).
@@ -459,6 +465,8 @@ class ClaudeAccountSwitcher:
             self.backup_dir / "cache", on_measure=self._observe_usage,
             on_forbidden=self._observe_forbidden,
         )
+        # Last usage per identity and window, for _note_usage_drop.
+        self._usage_seen: dict[tuple[str, str], dict[str, tuple[float, str]]] = {}
         # Rate-limit gate answers (gate.py), next to the usage they qualify.
         self._gate_store = gate.GateStore(self.backup_dir / "cache")
         self._billing = BillingCache(
@@ -2494,8 +2502,27 @@ class ClaudeAccountSwitcher:
         """
         self._recheck_lapsed(None, LAPSED_RECHECK_S, stagger=True)
 
+    def recheck_plans(self) -> None:
+        """Background pass: re-read every slot's plan, lapsed or not, each at
+        most once per ``PLAN_REFRESH_S`` across processes, so an upgrade or a
+        downgrade shows within the hour. Profile only. Run each ``aswap
+        auto`` tick; a no-op unless something is due.
+        """
+        self._recheck_lapsed(None, PLAN_REFRESH_S, stagger=True, lapsed_only=False)
+
+    def recheck_plan_now(self, num: str) -> None:
+        """Re-read one slot's plan now (at most once per ``PLAN_RECHECK_MIN_S``)."""
+        self._recheck_lapsed(
+            [str(num)], PLAN_RECHECK_MIN_S, stagger=False, lapsed_only=False
+        )
+
     def _recheck_lapsed(
-        self, nums: list[str] | None, min_age: float, *, stagger: bool
+        self,
+        nums: list[str] | None,
+        min_age: float,
+        *,
+        stagger: bool,
+        lapsed_only: bool = True,
     ) -> None:
         try:
             accounts = (self._get_sequence_data() or {}).get("accounts", {})
@@ -2507,7 +2534,9 @@ class ClaudeAccountSwitcher:
             }
             if not identities:
                 return
-            due = self._billing.claim_plan_checks(identities, min_age, stagger=stagger)
+            due = self._billing.claim_plan_checks(
+                identities, min_age, stagger=stagger, lapsed_only=lapsed_only
+            )
             if not due:
                 return
             info = [i for i in self._build_accounts_info() if str(i[0]) in due]
@@ -2516,8 +2545,42 @@ class ClaudeAccountSwitcher:
         except Exception:
             self._logger.debug("Lapsed-plan re-check failed", exc_info=True)
 
+    def _note_usage_drop(
+        self, num: str, identity: tuple[str, str], usage: dict
+    ) -> None:
+        """Re-read the plan when a window's usage falls inside the same window.
+
+        A window only empties at its reset, so a fall of several points with
+        the same reset time means the plan under it grew: 5x -> 20x makes 80%
+        read 20%. In memory only (a long-running ``aswap auto`` is where it
+        matters); the hourly ``recheck_plans`` covers the rest.
+        """
+        seen = self._usage_seen.setdefault(identity, {})
+        dropped = False
+        for key in ("five_hour", "seven_day"):
+            window = usage.get(key)
+            if not isinstance(window, dict):
+                continue
+            pct, resets = window.get("pct"), window.get("resets_at")
+            if not isinstance(pct, (int, float)) or not resets:
+                continue
+            before = seen.get(key)
+            seen[key] = (float(pct), resets)
+            if before is not None and before[1] == resets and before[0] - pct >= USAGE_DROP_PCT:
+                dropped = True
+        if dropped:
+            self._logger.info(
+                "Account %s (%s): usage fell with no reset; re-reading its plan",
+                num, identity[0],
+            )
+            self.recheck_plan_now(num)
+
     def _observe_usage(self, num: str, identity: tuple[str, str], usage: dict) -> None:
         """UsageStore hook: remember the account's weekly reset anchor."""
+        try:
+            self._note_usage_drop(num, identity, usage)
+        except Exception:
+            self._logger.debug("usage-drop check failed", exc_info=True)
         try:
             if self._anchors.note_usable(identity):
                 self._logger.info(

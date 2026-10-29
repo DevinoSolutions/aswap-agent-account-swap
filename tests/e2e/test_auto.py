@@ -136,30 +136,23 @@ def test_manual_hold_survives_consume_first_but_not_the_limit(box):
     assert sw["trigger"] == "at-limit"
 
 
-def test_gate_keeps_an_open_account_then_escapes_when_it_closes(box):
+def test_a_last_point_that_began_unseen_is_left_before_any_refusal(box):
+    # 2026-10-29: Claude refuses at 100% with no grace, and nothing inside
+    # the last point is visible (edge.py). The endpoint rounds up to 100 and
+    # the gate says 0.99 and open: somewhere in its last point, with no
+    # reading of when it started. Riding it waits for a refusal.
     accounts, nums = _setup(box, {
-        # The usage endpoint rounds up to 100; the gate says 0.99 and open.
         "alice": {"five_hour": 30, "seven_day": 100, "gate_7d": 0.99},
         "bob": {"five_hour": 20, "seven_day": 97},
     }, active="alice")
     auto = box.start_auto()
-
-    def gate_note():
-        alice = box.accounts_by_email()[accounts["alice"]["email"]]
-        return alice["usage"]["sevenDay"].get("gate")
-
-    note = wait_until(gate_note, 60, "the open gate to show in aswap list")
-    assert note["status"] == "open" and note["pct"] == 99.0
+    sw = auto.wait_switch(nums["bob"], timeout=60)
+    assert sw["trigger"] == "at-limit"
+    wait_until(lambda: box.live_email() == accounts["bob"]["email"], 20, "the live login to be bob")
     probes = [r for r in box.fake.log() if r["path"] == "/v1/messages"]
     assert probes and probes[0]["account"] == accounts["alice"]["email"]
-    assert probes[0]["gate"] in ("allowed", "allowed_warning")
-    assert _quiet_for(auto, 6) == [], "left an account the gate still serves"
-
-    box.fake.set(accounts["alice"]["email"], gate_7d=1.0)
-    sw = auto.wait_switch(nums["bob"], timeout=60)
-    assert sw["trigger"] in ("at-limit", "proactive")
-    wait_until(lambda: box.live_email() == accounts["bob"]["email"], 20, "the live login to be bob")
-    assert any(r["path"] == "/v1/messages" and r["status"] == 429 for r in box.fake.log())
+    assert not any(r["status"] == 429 for r in probes), "waited for a refusal"
+    assert "start unseen" in box.all_log_text()
 
 
 def test_no_ping_pong_when_everything_is_hot(box):
@@ -238,7 +231,9 @@ def test_a_live_statusline_jump_switches_within_a_tick_or_two(box):
     sw = auto.wait_switch(nums["bob"], timeout=90)
     took = time.monotonic() - jumped
     print(f"jump to switch (live statusline): {took:.1f}s")
-    assert sw["trigger"] == "proactive"
+    # The limit guard, or the last-point clock (99 is the last point, and at
+    # this pace it is spent before the next reading).
+    assert sw["trigger"] in ("proactive", "at-limit")
     assert took < JUMP_SWITCH_BOUND_S, f"switched {took:.1f}s after the jump"
     assert box.fake.state(accounts["alice"]["email"])["fiveHour"] == 50.0
 
