@@ -202,19 +202,44 @@ def gate_of(record: dict | None) -> dict | None:
     return gate if isinstance(gate, dict) else None
 
 
+def _window_full(window: object) -> bool:
+    """A gated window at its limit: refused, or reading 100% or more.
+
+    Headers carry whole percents rounded down, so 100 means the account is
+    already into Claude's grace before requests are refused. That is the
+    moment to move the work (owner rule 2026-10-29): waiting for the refusal
+    means a request has already failed.
+    """
+    if not isinstance(window, dict):
+        return False
+    pct = window.get("pct")
+    return window.get("status") == REJECTED or (
+        isinstance(pct, (int, float)) and pct >= 100.0
+    )
+
+
+def is_full(gate: dict | None) -> bool:
+    """The gate says this account is at its limit (see ``_window_full``)."""
+    if not isinstance(gate, dict):
+        return False
+    return gate.get("status") == REJECTED or any(
+        _window_full(gate.get(key)) for key, _ in _WINDOWS
+    )
+
+
 def is_fresh(record: dict | None, now: float, fresh_s: float = FRESH_S) -> bool:
-    """A gate answer recent enough to decide on, whose rejecting window (if
-    any) has not reset since."""
+    """A gate answer recent enough to decide on, whose full window (if any)
+    has not reset since."""
     gate = gate_of(record)
     if gate is None:
         return False
     probed = gate.get("probedAt")
     if not isinstance(probed, (int, float)) or now - probed > fresh_s:
         return False
-    if gate.get("status") == REJECTED:
+    if is_full(gate):
         for key, _ in _WINDOWS:
             window = gate.get(key)
-            if isinstance(window, dict) and window.get("status") == REJECTED:
+            if _window_full(window):
                 ts = _reset_ts(window.get("resets_at"))
                 if ts is not None and ts <= now:
                     return False
@@ -235,7 +260,8 @@ def apply(
     """Decision headroom for one account with its gate folded in.
 
     Returns ``(headroom, verdict)``: ``verdict`` is ``BLOCKED`` when a fresh
-    gate says rejected (at the limit whatever the endpoint reads), ``OPEN``
+    gate says rejected or reads 100% on a window (at the limit whatever the
+    endpoint reads; see ``_window_full``), ``OPEN``
     when a fresh open gate lifts an endpoint reading of 100% on the 5h/7d
     windows (headroom ``OPEN_HEADROOM``), and ``None`` when the gate changes
     nothing — then ``headroom`` is the endpoint's own. A per-model window at
@@ -245,7 +271,7 @@ def apply(
     if not is_fresh(record, now, fresh_s):
         return raw, None
     gate = gate_of(record) or {}
-    if gate.get("status") == REJECTED:
+    if is_full(gate):
         return min(raw, 0.0) if raw is not None else 0.0, BLOCKED
     if gate.get("status") not in OPEN_STATUSES or raw is None or raw > 0:
         return raw, None
@@ -294,17 +320,23 @@ def due(
     models: Sequence[str],
     now: float,
     interval_s: float = PROBE_INTERVAL_S,
+    *,
+    any_level: bool = False,
 ) -> bool:
     """Would a probe of this account now be worth its request?
 
     Only an endpoint reading of 100% on the 5h/7d windows can be changed by
     the gate, so nothing else is probed (a 99% account is already usable);
-    a full per-model window cannot be opened by it either. A full window
-    that resets within ``RESET_SKIP_S`` is left to reset. The last attempt,
-    successful or not, throttles the next one by ``interval_s``.
+    a full per-model window cannot be opened by it either. ``any_level``
+    lifts that for the active account's last stretch, where the probe is the
+    freshest usage reading there is. A full window that resets within
+    ``RESET_SKIP_S`` is left to reset. The last attempt, successful or not,
+    throttles the next one by ``interval_s``.
     """
     full = _full_windows(usage, models)
-    if not full or any(label not in _GATED_LABELS for label, _, _ in full):
+    if not any_level and (
+        not full or any(label not in _GATED_LABELS for label, _, _ in full)
+    ):
         return False
     for _, _, resets_at in full:
         ts = _reset_ts(resets_at)
@@ -335,11 +367,12 @@ def annotate(usage: dict | None, record: dict | None, now: float) -> dict | None
         if not isinstance(window, dict) or not isinstance(seen, dict):
             continue
         status = seen.get("status") or gate.get("status")
+        full = status == REJECTED or _window_full(seen)
         pct = window.get("pct")
-        if status != REJECTED and not (isinstance(pct, (int, float)) and pct >= 99.0):
+        if not full and not (isinstance(pct, (int, float)) and pct >= 99.0):
             continue
         note: dict = {
-            "status": BLOCKED if status == REJECTED else OPEN,
+            "status": BLOCKED if full else OPEN,
             "probedAt": gate.get("probedAt"),
         }
         if isinstance(seen.get("pct"), (int, float)):
