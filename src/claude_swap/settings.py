@@ -72,11 +72,19 @@ class AutoSwitchSettings:
     # OPTIONAL moves (consume-first). Moves that protect the session — at the
     # limit, over the threshold, failover — still happen. 0 disables.
     manual_hold_minutes: float = 60.0
+    # The hold's on/off switch, kept apart from its length so turning it off
+    # and on again keeps a custom ``manual_hold_minutes``.
+    manual_hold: bool = True
     # A Claude Code `/login` aswap does not manage yet is added to the next
     # free slot by `aswap auto` (and the TUI's engine) once it has been
     # stable for two polls, and a re-login for a managed slot refreshes its
     # stored credential — no `aswap add` by hand. OAuth logins only.
     auto_add_accounts: bool = True
+
+    @property
+    def hold_minutes(self) -> float:
+        """The manual hold in force: its length, or 0 when it is switched off."""
+        return self.manual_hold_minutes if self.manual_hold else 0.0
 
 
 @dataclass(frozen=True)
@@ -204,6 +212,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "manualHoldMinutes", "manual_hold_minutes", "float",
             0.0, 1440.0,
             help="Minutes auto leaves a hand-picked account alone (0 = off)",
+        ),
+        SettingSpec(
+            "autoswitch", "manualHold", "manual_hold", "bool",
+            help="Hold a hand-picked account for manualHoldMinutes (false = off)",
         ),
         SettingSpec(
             "autoswitch", "autoAddAccounts", "auto_add_accounts", "bool",
