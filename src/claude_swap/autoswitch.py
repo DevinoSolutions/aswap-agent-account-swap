@@ -56,15 +56,17 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
+from claude_swap.live_settings import (
+    SETTINGS_WATCH_S,  # noqa: F401  (re-exported; see live_settings.py)
+    LiveSettings,
+    SettingsReload,
+    sliced_wait,
+)
 from claude_swap.settings import (
-    SETTING_SPECS,
     AutoSwitchSettings,
     atomic_write_json,
     format_setting_value,
-    load_settings,
     parse_model_names,
-    reload_autoswitch_settings,
-    settings_fingerprint,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
@@ -125,14 +127,6 @@ LIVE_MIN_TICK_S = scaled(5.0)
 # How often a running engine heals damaged state files and checks whether a
 # snapshot is due (snapshots themselves are hourly; see snapshots.py).
 MAINTAIN_INTERVAL_S = scaled(300.0)
-# How often a sleeping engine looks for a settings change (one indexed
-# lookup of the settings document's ``updated_at``). A change ends the sleep,
-# so ``aswap config set`` reaches a running ``aswap auto`` within this long
-# even while it waits out an exhausted account's reset.
-SETTINGS_WATCH_S = scaled(10.0)
-_AUTOSWITCH_SPECS = tuple(
-    spec for spec in SETTING_SPECS.values() if spec.section == "autoswitch"
-)
 
 # Idle-hold cap (elapsed, not ticks — the hold itself slows the cadence to
 # NO_RESET_FALLBACK_S): an owned-and-expired token normally means Claude Code
@@ -699,6 +693,30 @@ class SettingsReloadedEvent(AutoSwitchEvent):
         return "settings reloaded: " + "; ".join(parts)
 
 
+def apply_settings_reload(engine, reload: SettingsReload | None) -> None:
+    """Apply one :meth:`LiveSettings.poll` result to a running engine.
+
+    Shared by the Claude and Codex engines so both report a reload the same
+    way: one ``config-warning`` per refused value, then the new settings
+    (carried into derived state by ``engine._settings_applied(old, new)``),
+    then one ``settings-reloaded`` event -- after the assignment, so a
+    listener that reads ``engine.settings`` already sees the new values.
+    """
+    if reload is None:
+        return
+    for message in reload.problems:
+        _logger.warning("settings reload: %s", message)
+        engine._emit(ConfigWarningEvent(message=message))
+    if not reload.changes and not reload.pinned:
+        return
+    if reload.changes:
+        old, engine.settings = engine.settings, reload.settings
+        engine._settings_applied(old, reload.settings)
+    event = SettingsReloadedEvent(changes=reload.changes, pinned=reload.pinned)
+    _logger.info("%s", event.human())
+    engine._emit(event)
+
+
 @dataclass(frozen=True)
 class WarmupAutoEvent(AutoSwitchEvent):
     """One guarded five-hour warm-up decision emitted by ``aswap auto``."""
@@ -906,22 +924,11 @@ class AutoSwitchEngine:
     ):
         self.switcher = switcher
         self.settings = settings
-        # Live settings (see ``_reload_settings``): the settings document's
-        # fingerprint as last read, its autoswitch section as last read, and
-        # the fields this process keeps whatever the document says --
-        # ``pinned`` (command-line flags) plus any field the caller passed
-        # differently from the document (a TUI session threshold, a caller's
-        # own settings). Fingerprint first: a write racing these reads is
-        # then seen again next tick rather than missed.
-        self._settings_fp = settings_fingerprint(switcher.backup_dir)
-        self._stored_settings, _problems = reload_autoswitch_settings(
-            switcher.backup_dir, load_settings(switcher.backup_dir)
-        )
-        self._pinned: set[str] = set(pinned) | {
-            spec.field
-            for spec in _AUTOSWITCH_SPECS
-            if getattr(settings, spec.field) != getattr(self._stored_settings, spec.field)
-        }
+        # Live settings (see ``_reload_settings``): the fields this process
+        # keeps whatever the document says are ``pinned`` (command-line
+        # flags) plus any field the caller passed differently from the
+        # document (a TUI session threshold, a caller's own settings).
+        self._live = LiveSettings(switcher.backup_dir, settings, pinned)
         self._maintained_at = float("-inf")
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
@@ -3434,7 +3441,7 @@ class AutoSwitchEngine:
         state) are fixed at construction. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
-        self._pinned.add("threshold")  # a stored change must not undo it
+        self._live.pin("threshold")  # a stored change must not undo it
         self.switcher.set_poll_policy_inputs(threshold, self._models)
 
     def apply_warmup_enabled(self, enabled: bool) -> None:
@@ -3454,9 +3461,6 @@ class AutoSwitchEngine:
             self._enable_warmup()
 
     # -- live settings ----------------------------------------------------------
-
-    def _settings_changed(self) -> bool:
-        return settings_fingerprint(self.switcher.backup_dir) != self._settings_fp
 
     def _reload_settings(self) -> None:
         """Pick up an ``aswap config`` change made while this engine runs.
@@ -3478,43 +3482,7 @@ class AutoSwitchEngine:
         change forgets the half-confirmed login observation, so a login is
         still adopted only after two polls under the new value.
         """
-        try:
-            fp = settings_fingerprint(self.switcher.backup_dir)
-            if fp == self._settings_fp:
-                return
-            stored, problems = reload_autoswitch_settings(
-                self.switcher.backup_dir, self._stored_settings
-            )
-            self._settings_fp = fp
-        except Exception:
-            _logger.debug("settings reload failed", exc_info=True)
-            return
-        for message in problems:
-            _logger.warning("settings reload: %s", message)
-            self._emit(ConfigWarningEvent(message=message))
-        previous_stored, self._stored_settings = self._stored_settings, stored
-        updates: dict = {}
-        changes: list[tuple[str, object, object]] = []
-        pinned: list[tuple[str, object, object]] = []
-        for spec in _AUTOSWITCH_SPECS:
-            new = getattr(stored, spec.field)
-            if new == getattr(previous_stored, spec.field):
-                continue
-            current = getattr(self.settings, spec.field)
-            if spec.field in self._pinned:
-                pinned.append((spec.dotted, new, current))
-            elif new != current:
-                updates[spec.field] = new
-                changes.append((spec.dotted, current, new))
-        if not changes and not pinned:
-            return
-        old = self.settings
-        if updates:
-            self.settings = replace(old, **updates)
-            self._settings_applied(old, self.settings)
-        event = SettingsReloadedEvent(changes=tuple(changes), pinned=tuple(pinned))
-        _logger.info("%s", event.human())
-        self._emit(event)
+        apply_settings_reload(self, self._live.poll(self.settings))
 
     def _settings_applied(
         self, old: AutoSwitchSettings, new: AutoSwitchSettings
@@ -3538,16 +3506,7 @@ class AutoSwitchEngine:
         Sliced by count, not against a deadline, so a test that stubs the
         wait still finishes in a bounded number of slices.
         """
-        slices = max(1, math.ceil(delay / SETTINGS_WATCH_S))
-        step = delay / slices
-        for _ in range(slices):
-            if self._wake.wait(step) or self._stop.is_set():
-                return
-            try:
-                if self._settings_changed():
-                    return  # the next tick applies it
-            except Exception:
-                pass
+        sliced_wait(delay, self._wake, self._stop, self._live.changed)
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
