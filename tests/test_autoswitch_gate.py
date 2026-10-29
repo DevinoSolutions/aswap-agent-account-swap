@@ -95,7 +95,7 @@ class TestActiveRidesAnOpenGate:
         fake = _probing({"sk-live": ("allowed_warning", 99.0)})
         usage = {"1": _full(), "2": _usage(50), "3": _usage(60)}
         h.tick_with_usage(usage)
-        h.clock.advance(60)
+        h.clock.advance(gate.RIDE_REPROBE_S / 2)
         assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
         assert fake.calls == ["sk-live"]  # not yet due
         h.clock.advance(gate.RIDE_REPROBE_S)

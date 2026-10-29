@@ -64,7 +64,9 @@ BLOCKED = "blocked"
 PROBE_INTERVAL_S = scaled(10 * 60.0)
 # The ACTIVE account riding an open gate is re-probed this often: it is
 # burning its last point, and the next closed answer is what moves the work.
-RIDE_REPROBE_S = scaled(150.0)
+# A probe is one one-token request. Was 150 s until 2026-10-29: at three
+# points a minute a 5x spends its last point in 20 s.
+RIDE_REPROBE_S = scaled(30.0)
 # A probe is trusted for decisions this long (a little over one interval, so
 # an account due for its next probe is not dropped between two ticks)...
 FRESH_S = PROBE_INTERVAL_S + 60.0
