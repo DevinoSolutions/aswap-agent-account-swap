@@ -7497,7 +7497,7 @@ class ClaudeAccountSwitcher:
             return None
         settings = load_settings(self.backup_dir)
         until = manual_hold_until(
-            state, account_num, settings.manual_hold_minutes, time.time()
+            state, account_num, settings.hold_minutes, time.time()
         )
         if until is None or not settings.enabled:
             return None

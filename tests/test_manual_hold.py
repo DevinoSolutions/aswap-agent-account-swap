@@ -134,6 +134,14 @@ class TestManualHold:
         assert h.tick_with_usage(_WANTS_2_FROM_3) is TickOutcome.SWITCHED
         assert _current(h) == "2"
 
+    def test_switching_the_hold_off_disables_it_and_keeps_its_minutes(self, temp_home):
+        h = _harness(temp_home, manual_hold=False, manual_hold_minutes=30)
+        self._manual_switch_to_3(h)
+
+        assert h.tick_with_usage(_WANTS_2_FROM_3) is TickOutcome.SWITCHED
+        assert _current(h) == "2"
+        assert h.engine.settings.manual_hold_minutes == 30
+
     def test_at_limit_still_escapes_during_the_hold(self, temp_home):
         h = _harness(temp_home)
         self._manual_switch_to_3(h)
@@ -370,6 +378,17 @@ class TestSetting:
         assert load_settings(tmp_path).manual_hold_minutes == 15
         set_setting(tmp_path, "autoswitch.manualHoldMinutes", "0")
         assert load_settings(tmp_path).manual_hold_minutes == 0
+
+    def test_on_by_default_and_switchable_via_config(self, tmp_path):
+        assert load_settings(tmp_path).manual_hold is True
+        assert load_settings(tmp_path).hold_minutes == 60
+        set_setting(tmp_path, "autoswitch.manualHoldMinutes", "15")
+        set_setting(tmp_path, "autoswitch.manualHold", "false")
+        settings = load_settings(tmp_path)
+        assert settings.manual_hold is False and settings.hold_minutes == 0
+        assert settings.manual_hold_minutes == 15
+        set_setting(tmp_path, "autoswitch.manualHold", "true")
+        assert load_settings(tmp_path).hold_minutes == 15
 
     def test_rejects_out_of_range(self, tmp_path):
         from claude_swap.exceptions import ConfigError

@@ -2180,7 +2180,7 @@ class AutoSwitchEngine:
         A dry run writes nothing: it keeps its own view in memory, and takes
         the file's again only when a live engine elsewhere moves it.
         """
-        minutes = self.settings.manual_hold_minutes
+        minutes = self.settings.hold_minutes
         stored = state.get("lastSeenActive")
         if self.dry_run and self._last_seen is not None and stored == self._stored_seen:
             known = self._last_seen
