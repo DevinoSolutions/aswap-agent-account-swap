@@ -347,6 +347,38 @@ class TestLapsedPlanRecheck:
             sw.recheck_lapsed_plans()
         assert check.call_count == 2
 
+    def test_hourly_pass_reads_every_plan_not_only_lapsed_ones(self, h):
+        sw = h.switcher
+        sw._billing.clock = h.clock
+        sw._billing._save({
+            "1": _lapsed_row("a@example.com", status="active", fetchedAt=h.clock.now - 7200),
+            "2": _lapsed_row("b@example.com", status="active", fetchedAt=h.clock.now - 7200),
+        })
+        with patch.object(type(sw._billing), "check_tiers", return_value={}) as check:
+            sw.recheck_plans()
+            sw.recheck_plans()
+            assert check.call_count == 1
+            assert sorted(str(i[0]) for i in check.call_args.args[0]) == ["1", "2"]
+            h.clock.advance(billing.PLAN_REFRESH_S + billing.LAPSED_STAGGER_S + 1)
+            sw.recheck_plans()
+        assert check.call_count == 2
+
+    def test_usage_falling_inside_a_window_rechecks_the_plan(self, h):
+        # 2026-10-29: upgrades 5x -> 20x went unseen for hours. The usage
+        # endpoint shows them at once: the same window reads a quarter.
+        sw = h.switcher
+        ident = ("b@example.com", "")
+        reset = "2026-11-02T08:00:00Z"
+        with patch.object(sw, "recheck_plan_now") as recheck:
+            sw._observe_usage("2", ident, {"seven_day": {"pct": 80.0, "resets_at": reset}})
+            sw._observe_usage("2", ident, {"seven_day": {"pct": 78.0, "resets_at": reset}})
+            assert recheck.call_count == 0  # rounding, not a plan change
+            sw._observe_usage("2", ident, {"seven_day": {"pct": 20.0, "resets_at": reset}})
+            assert [c.args[0] for c in recheck.call_args_list] == ["2"]
+            # A new window starting low is a reset, not an upgrade.
+            sw._observe_usage("2", ident, {"seven_day": {"pct": 1.0, "resets_at": "2026-11-09T08:00:00Z"}})
+        assert recheck.call_count == 1
+
     def test_becoming_active_rechecks_at_once(self, h):
         sw = h.switcher
         sw._billing.clock = h.clock

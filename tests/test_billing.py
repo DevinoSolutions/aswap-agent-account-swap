@@ -541,6 +541,12 @@ class TestClaimPlanChecks:
         clock.t += 61
         assert cache.claim_plan_checks(self.IDS, min_age=60) == ["1"]
 
+    def test_every_row_is_claimed_when_not_only_lapsed(self, tmp_path):
+        clock = _Clock()
+        cache = self._cache(tmp_path, clock)
+        assert cache.claim_plan_checks(self.IDS, min_age=60, lapsed_only=False) == ["1", "2"]
+        assert cache.claim_plan_checks(self.IDS, min_age=60, lapsed_only=False) == []
+
     def test_a_recent_fetch_counts_as_a_check(self, tmp_path):
         clock = _Clock()
         cache = self._cache(tmp_path, clock)
