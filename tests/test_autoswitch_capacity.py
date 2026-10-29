@@ -357,6 +357,38 @@ class TestLandingRunway:
         assert _switch(h).trigger == "proactive"
         assert h.active_number() == 3
 
+    def test_consume_first_drains_a_sooner_account_with_a_real_balance(self, temp_home):
+        # 2026-10-29: four points a minute on a 20x that resets last, and a 5x
+        # resetting sooner with 28 points. Seven minutes there is short, but
+        # every point left at its reset is lost.
+        h = _harness(temp_home, {"1": "20x", "2": "5x", "3": "5x"}, strategy="consume-first")
+        self._burning(h, 50)
+        h.engine._recent_burns = [(h.clock.now - 600, 4.0 / 60)]
+        outcome = h.tick_with_usage({
+            "1": _usage7(30, 50, _R_LATER),
+            "2": _usage7(0, 72, _R_SOON),
+            "3": _usage7(0, 10, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert _switch(h).trigger == "consume-first"
+        assert h.active_number() == 2
+
+    def test_a_forced_move_drains_a_sooner_account_the_ratio_would_refuse(self, temp_home):
+        # The active nears its limit with ~7 minutes left; the sooner 5x holds
+        # 20 points (~7 minutes too), short of the runway ratio. Draining it
+        # beats spending the 20x that resets later.
+        h = _harness(temp_home, {"1": "20x", "2": "5x", "3": "20x"}, strategy="consume-first")
+        self._burning(h, 95)
+        h.engine._recent_burns = [(h.clock.now - 600, 3.0 / 60)]
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 50, _R_LATER),
+            "2": _usage7(0, 80, _R_SOON),
+            "3": _usage7(0, 70, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert _switch(h).trigger == "proactive"
+        assert h.active_number() == 2
+
     def test_an_escape_still_lands_short_when_nothing_else_has_room(self, temp_home):
         h = _harness(temp_home, {"1": "5x", "2": "5x", "3": "5x"}, strategy="consume-first")
         self._burning(h, 95)
@@ -382,13 +414,13 @@ class TestLandingRunway:
 
     def test_a_lull_does_not_shrink_the_landing_check(self, temp_home):
         # Burning a point a minute now, but four a minute ten minutes ago: #2's
-        # 20 points last 5 minutes at the recent pace, not 20.
+        # 16 points last 4 minutes at the recent pace, not 16.
         h = _harness(temp_home, {"1": "5x", "2": "5x", "3": "5x"}, strategy="consume-first")
         self._burning(h, 50)
         h.engine._recent_burns = [(h.clock.now - 600, 4.0 / 60)]
         outcome = h.tick_with_usage({
             "1": _usage7(50, 20, _R_LATER),
-            "2": _usage7(80, 10, _R_SOON),
+            "2": _usage7(84, 10, _R_SOON),
             "3": _usage7(10, 10, _R_LATER),
         })
         assert outcome is TickOutcome.NO_ACTION
