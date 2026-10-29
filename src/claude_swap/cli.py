@@ -490,6 +490,92 @@ Examples:
         sys.exit(130)
 
 
+def _priority_command(argv: list[str]) -> None:
+    """Handle `aswap priority [NUM|EMAIL ...] [--clear]`.
+
+    Sets ``autoswitch.priority``: the accounts auto uses up first, in order,
+    over consume-first ordering, the manual hold and the cooldown. Stored as
+    emails so the list survives `aswap renumber` and reads the same on every
+    machine. Pre-dispatched before the main parser for the same reason as
+    `alias`.
+    """
+    from claude_swap.settings import (
+        load_settings,
+        parse_priority,
+        set_setting,
+        unset_setting,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} priority",
+        description=(
+            "Pick accounts that aswap auto uses up first, in the order given. "
+            "Auto moves onto the first one with room right away and stays on "
+            "it until its limit, whatever resets sooner and whatever account "
+            "was picked by hand; then it moves to the next one on the list."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  aswap priority 3 5 7                use up accounts 3, 5 and 7 first
+  aswap priority user@example.com     by email works too
+  aswap priority                      show the list
+  aswap priority --clear              back to the normal strategy
+        """,
+    )
+    parser.add_argument(
+        "accounts", nargs="*", metavar="NUM|EMAIL",
+        help="Accounts in priority order. Omit to show the list.",
+    )
+    parser.add_argument("--clear", action="store_true", help="Remove the priority list")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    if args.clear and args.accounts:
+        parser.error("--clear does not take accounts")
+
+    root = paths.get_backup_root()
+    try:
+        if args.clear:
+            if unset_setting(root, "autoswitch.priority"):
+                print(f"{accent('Cleared')} the priority list")
+            else:
+                print(dimmed("No priority list was set"))
+            return
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        if not args.accounts:
+            names = parse_priority(load_settings(root).priority)
+            if not names:
+                print(dimmed("No priority accounts; auto follows autoswitch.strategy"))
+                return
+            print(bolded("Priority (used up first, in order):"))
+            for i, name in enumerate(names, 1):
+                try:
+                    num, email, _org = switcher.resolve_account(name)
+                except ClaudeSwitchError:
+                    print(f"  {i}. {name} {muted('(no such account here)')}")
+                    continue
+                print(f"  {i}. Account {num} {muted(f'({email})')}")
+            return
+        chosen: list[str] = []
+        shown: list[str] = []
+        for ident in args.accounts:
+            num, email, _org = switcher.resolve_account(ident)
+            entry = email or num
+            if entry.lower() not in (c.lower() for c in chosen):
+                chosen.append(entry)
+                shown.append(num)
+        set_setting(root, "autoswitch.priority", ",".join(chosen))
+        print(
+            f"{accent('Priority set')}: account "
+            + ", ".join(shown)
+            + muted(" (a running aswap auto picks it up on its next check)")
+        )
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+
+
 def _renumber_command(argv: list[str]) -> None:
     """Handle `aswap renumber [--by-email] [--dry-run] [--yes] [--json]`.
 
@@ -1939,6 +2025,9 @@ def main() -> None:
     if argv and argv[0] == "renumber":
         _renumber_command(argv[1:])
         return
+    if argv and argv[0] == "priority":
+        _priority_command(argv[1:])
+        return
 
     # Bare `aswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -1978,6 +2067,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s renumber [--by-email]      renumber every account to 1..N
+  %(prog)s priority [<num|email>...]  accounts auto uses up first, in order
   %(prog)s codex <command>            manage Codex CLI accounts
   %(prog)s backup [take|list|check|restore|export]  snapshots of state.db; crash restore
   %(prog)s billing <command>          exact billing, weekly resets, resub plan

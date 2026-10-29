@@ -67,6 +67,7 @@ from claude_swap.settings import (
     atomic_write_json,
     format_setting_value,
     parse_model_names,
+    parse_priority,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
@@ -608,7 +609,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "priority"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -1607,6 +1608,16 @@ class AutoSwitchEngine:
             riding = False
             self._edge_forced = True
         self._riding = riding
+        # The priority list (autoswitch.priority) over every other rule: the
+        # first account on it with room is where auto wants to be.
+        priority = self._priority_accounts(quarantined)
+        priority_target = next(
+            (
+                n for n in priority
+                if n != current and self._priority_usable(n, headroom, settings)
+            ),
+            None,
+        )
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
@@ -1648,7 +1659,22 @@ class AutoSwitchEngine:
                 and self._time_to_limit <= GUARD_PREFETCH_S
             )
             if utilization < settings.threshold and not self._limit_guard:
-                if settings.strategy != "consume-first":
+                if current in priority:
+                    # A priority account is used up before anything else,
+                    # whatever resets sooner: only its limit moves it.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="priority",
+                            detail=(
+                                f"account {current} is a priority account; "
+                                f"using it up first ({pct_label(utilization)}%)"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                if priority_target is not None:
+                    trigger = "priority"
+                elif settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -1665,11 +1691,13 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
-                # consume-first: below the threshold we still proactively move to
-                # whichever account's weekly window resets soonest, to burn the
-                # most-perishable quota first. Candidate selection decides whether
-                # a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                else:
+                    # consume-first: below the threshold we still proactively
+                    # move to whichever account's weekly window resets soonest,
+                    # to burn the most-perishable quota first. Candidate
+                    # selection decides whether a sooner-resetting account
+                    # with room actually exists.
+                    trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
@@ -1867,17 +1895,46 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts = _rank(
-            trigger=trigger,
-            consume_first=consume_first,
-            oauth_candidates=oauth_candidates,
-            usage=usage,
-            headroom=headroom,
-            current=current,
-            active_headroom=active_headroom,
-            settings=settings,
-            now=decided_now,
-        )
+        if trigger == "priority":
+            # Never ranked: the list names the target, and a move it cannot
+            # make is no reason to go anywhere else. Re-read on fresh data
+            # first, as consume-first does, so a stale reading never moves
+            # the work onto an account that is already spent.
+            entries = self.switcher.usage_entries_by_account(
+                fetch={current, priority_target}
+            )
+            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            headroom = self._apply_gates(current, usage, self._collected_at)
+            active_headroom = headroom.get(current)
+            decided_now = self.clock()
+            if not self._priority_usable(priority_target, headroom, settings):
+                self._emit(
+                    NoSwitchEvent(
+                        reason="priority-spent",
+                        detail=(
+                            f"priority account {priority_target} has no room "
+                            "on a fresh reading"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            ordered, any_known, active_reset_ts = [priority_target], True, None
+        else:
+            ordered, any_known, active_reset_ts = _rank(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+            )
+            if priority_target is not None:
+                # Leaving (the limit, or unreadable usage): the next priority
+                # account with room first, the ranking after it.
+                ordered = [priority_target, *(n for n in ordered if n != priority_target)]
 
         if trigger in OPTIONAL_TRIGGERS and ordered and hold_until is not None:
             # Decided on the provisional ranking, before phase 2 below: a
@@ -2028,7 +2085,7 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first":
+            if trigger in ("consume-first", "priority"):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -2680,6 +2737,46 @@ class AutoSwitchEngine:
             measured = fetched
         at = self._collected_at if measured is None else min(measured, self._collected_at)
         return at, current, pct, self._cap(current)
+
+    def _priority_accounts(self, quarantined: set[str]) -> list[str]:
+        """``autoswitch.priority`` as switchable account numbers, in order.
+
+        Each entry is an email (portable across machines and renumbering) or
+        a slot number. Entries that match no switchable account (removed,
+        disabled, quarantined) are skipped, not errors.
+        """
+        names = parse_priority(self.settings.priority)
+        if not names:
+            return []
+        switchable = [
+            n for n in self.switcher.switchable_account_numbers()
+            if n not in quarantined
+            and self.switcher.account_kind_for(n) != "api_key"
+        ]
+        by_email = {}
+        for n in switchable:
+            email = (self.switcher.account_email(n) or "").lower()
+            if email:
+                by_email.setdefault(email, n)
+        out: list[str] = []
+        for name in names:
+            num = name if name in switchable else by_email.get(name.lower())
+            if num is not None and num not in out:
+                out.append(num)
+        return out
+
+    @staticmethod
+    def _priority_usable(
+        num: str, headroom: dict, settings: AutoSwitchSettings
+    ) -> bool:
+        """Room enough to move onto: below the threshold and more than its
+        last point left (a last point cannot be timed, see edge.py)."""
+        h = headroom.get(num)
+        return (
+            h is not None
+            and h > 100.0 - edge.LAST_POINT_PCT
+            and 100.0 - h < settings.threshold
+        )
 
     def _edge_due(self, current: str, value: object, entry: object) -> bool:
         """Feed the last-point clock and say whether its deadline has passed.
