@@ -1598,7 +1598,9 @@ class AutoSwitchEngine:
         # anything on an estimated half point; the next closed gate (re-probed
         # every few minutes) is the at-limit escape.
         riding = self._gate_verdicts.get(current) == gate.OPEN
-        if active_headroom is not None and active_headroom > 0 and self._edge_due(current):
+        if active_headroom is not None and active_headroom > 0 and self._edge_due(
+            current, usage.get(current), entries.get(current)
+        ):
             # The last point is spent by the clock, before any refusal.
             active_headroom = 0.0
             headroom[current] = 0.0
@@ -2679,7 +2681,7 @@ class AutoSwitchEngine:
         at = self._collected_at if measured is None else min(measured, self._collected_at)
         return at, current, pct, self._cap(current)
 
-    def _edge_due(self, current: str) -> bool:
+    def _edge_due(self, current: str, value: object, entry: object) -> bool:
         """Feed the last-point clock and say whether its deadline has passed.
 
         The point is sized at the fastest burn in sight (the landing peak,
@@ -2687,6 +2689,11 @@ class AutoSwitchEngine:
         clock errs early; see edge.py for why 100% cannot be waited for.
         """
         now = self._collected_at
+        self._edge.observe_endpoint(
+            current,
+            value if isinstance(value, dict) else None,
+            getattr(entry, "fetched_at", None),
+        )
         self._edge.observe(current, gate.gate_of(self._gate_recs.get(current)), now)
         rate = max(
             self._landing_rate(),

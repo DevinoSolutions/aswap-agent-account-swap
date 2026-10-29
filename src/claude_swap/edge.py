@@ -55,6 +55,7 @@ class LastPointClock:
         self._below: dict[str, float] = {}  # newest reading under 99
         self._crossed: dict[str, float] = {}  # earliest the 99 tick can be
         self._unknown: set[str] = set()
+        self._first_99: dict[str, float] = {}  # first reading at 99+
         self._tick_at: dict[str, tuple[float, float, float]] = {}  # pct, lo, hi
         self._point_s: dict[str, float] = {}  # shortest a point has lasted
 
@@ -102,11 +103,35 @@ class LastPointClock:
             self._crossed.pop(key, None)
             self._unknown.discard(key)
         elif key not in self._crossed and key not in self._unknown:
+            self._first_99[key] = at
             below = self._below.get(key)
             if below is None:
                 self._unknown.add(key)
             else:
                 self._crossed[key] = below
+
+    def observe_endpoint(self, account: str, usage: dict | None, at: float | None) -> None:
+        """The usage endpoint's reading of the active account, fetched at ``at``.
+
+        The endpoint rounds UP (see gate.py), so a window it reads at 99 or
+        less was at most 99.0 then: below the last point, for the clock's
+        purposes. That times the last point of an account the gate first
+        saw at 99 (a drain target landed on at 99%), instead of leaving it.
+        """
+        if account != self._account:
+            self.reset(account)
+        if not isinstance(usage, dict) or not isinstance(at, (int, float)):
+            return
+        for key in WINDOWS:
+            window = usage.get(key)
+            pct = window.get("pct") if isinstance(window, dict) else None
+            if not isinstance(pct, (int, float)) or pct > LAST_POINT_PCT:
+                continue
+            if key in self._unknown and at <= self._first_99.get(key, float("-inf")):
+                self._unknown.discard(key)
+                self._crossed[key] = float(at)
+            elif key not in self._crossed and key not in self._unknown:
+                self._below[key] = max(self._below.get(key, float("-inf")), float(at))
 
     def running(self) -> bool:
         """A window is in its last point and timed (no probe can help)."""

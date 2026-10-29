@@ -80,6 +80,27 @@ class TestLastPointClock:
         c.observe("1", gate, NOW)
         assert c.deadline(60.0) is None
 
+    def test_an_endpoint_reading_of_99_or_less_starts_the_clock(self):
+        # The endpoint rounds up: 99 there is at most 99.0.
+        c = LastPointClock()
+        c.observe_endpoint("1", {"seven_day": {"pct": 99.0}}, NOW - 30)
+        _read(c, NOW, 99.0)
+        assert c.deadline(60.0) == NOW - 30 + 60.0 * EDGE_SHARE - EDGE_MARGIN_S
+
+    def test_a_later_endpoint_reading_resolves_an_unknown_start_only_if_older(self):
+        c = LastPointClock()
+        _read(c, NOW, 99.0)
+        c.observe_endpoint("1", {"seven_day": {"pct": 99.0}}, NOW + 5)
+        assert c.deadline(60.0) == UNKNOWN
+        c.observe_endpoint("1", {"seven_day": {"pct": 99.0}}, NOW - 5)
+        assert c.deadline(60.0) == NOW - 5 + 60.0 * EDGE_SHARE - EDGE_MARGIN_S
+
+    def test_an_endpoint_reading_of_100_says_nothing(self):
+        c = LastPointClock()
+        c.observe_endpoint("1", {"seven_day": {"pct": 100.0}}, NOW - 30)
+        _read(c, NOW, 99.0)
+        assert c.deadline(60.0) == UNKNOWN
+
     def test_no_burn_known_means_unknown(self):
         c = LastPointClock()
         _read(c, NOW, 98.0)
