@@ -47,6 +47,9 @@ def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
         maxBytes=1024 * 1024,  # 1MB
         backupCount=3,
         delay=True,
+        # The messages carry emoji marks; the Windows default (cp1252) would
+        # drop every such record with a logging error.
+        encoding="utf-8",
     )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(
