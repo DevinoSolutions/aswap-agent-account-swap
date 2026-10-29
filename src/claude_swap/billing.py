@@ -564,7 +564,7 @@ def _run_parallel(fn, items: list) -> list:
 def _log_tier_change(num: str, email: str, before: object, after: object) -> None:
     if before and after and before != after:
         _logger.info(
-            "Account %s (%s) plan tier changed: %s -> %s",
+            "💳 Account %s (%s) plan tier changed: %s -> %s",
             num, email, _tier_name(before), _tier_name(after),
         )
 

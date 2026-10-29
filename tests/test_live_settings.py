@@ -80,7 +80,7 @@ class TestThresholdChange:
 
         lines = [r.getMessage() for r in caplog.records if "settings reloaded" in r.getMessage()]
         assert lines == [
-            "settings reloaded: autoswitch.threshold 90 -> 72; "
+            "⚙️ settings reloaded: autoswitch.threshold 90 -> 72; "
             "autoswitch.autoAddAccounts true -> false"
         ]
         (event,) = _reloads(h)

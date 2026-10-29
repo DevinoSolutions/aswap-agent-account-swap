@@ -634,7 +634,18 @@ class SwitchEvent(AutoSwitchEvent):
             else "?"
         )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
-        return f"{prefix} {src} -> {dst} ({self.trigger})"
+        return f"🔀 {prefix} {src} -> {dst} ({self.trigger})"
+
+
+# Only the decisions worth spotting in a scroll of routine polls get a mark.
+_NO_SWITCH_EMOJI = {
+    "manual-hold": "✋",
+    "priority": "⭐",
+    "priority-spent": "⭐",
+    "last-point": "⏱️",
+    "no-candidates": "🛑",
+    "no-viable-target": "🛑",
+}
 
 
 @dataclass(frozen=True)
@@ -647,7 +658,12 @@ class NoSwitchEvent(AutoSwitchEvent):
         return {"reason": self.reason, "detail": self.detail}
 
     def human(self) -> str:
-        return f"no switch: {self.reason}" + (f" ({self.detail})" if self.detail else "")
+        mark = _NO_SWITCH_EMOJI.get(self.reason)
+        return (
+            (f"{mark} " if mark else "")
+            + f"no switch: {self.reason}"
+            + (f" ({self.detail})" if self.detail else "")
+        )
 
 
 @dataclass(frozen=True)
@@ -662,7 +678,7 @@ class QuarantineEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         return (
-            f"Account-{self.number} ({self.email}) quarantined: {self.reason}. "
+            f"🚫 Account-{self.number} ({self.email}) quarantined: {self.reason}. "
             f"Log in with it and run 'aswap --add-account --slot {self.number}' "
             "to recover."
         )
@@ -679,7 +695,7 @@ class UnquarantineEvent(AutoSwitchEvent):
         return {"number": self.number, "email": self.email, "reason": self.reason}
 
     def human(self) -> str:
-        return f"Account-{self.number} ({self.email}) back in rotation ({self.reason})"
+        return f"✅ Account-{self.number} ({self.email}) back in rotation ({self.reason})"
 
 
 @dataclass(frozen=True)
@@ -692,8 +708,8 @@ class AllExhaustedEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         if self.earliest_reset_at:
-            return f"all accounts exhausted; earliest reset {self.earliest_reset_at}"
-        return "all accounts exhausted; no reset time known"
+            return f"🛑 all accounts exhausted; earliest reset {self.earliest_reset_at}"
+        return "🛑 all accounts exhausted; no reset time known"
 
 
 @dataclass(frozen=True)
@@ -719,7 +735,7 @@ class ErrorEvent(AutoSwitchEvent):
         return {"message": self.message, "transient": self.transient}
 
     def human(self) -> str:
-        return f"error: {self.message}" + (" (will retry)" if self.transient else "")
+        return f"❌ error: {self.message}" + (" (will retry)" if self.transient else "")
 
 
 @dataclass(frozen=True)
@@ -735,7 +751,7 @@ class ConfigWarningEvent(AutoSwitchEvent):
         return {"message": self.message}
 
     def human(self) -> str:
-        return f"warning: {self.message}"
+        return f"⚠️ warning: {self.message}"
 
 
 @dataclass(frozen=True)
@@ -774,7 +790,7 @@ class SettingsReloadedEvent(AutoSwitchEvent):
             f"stored {format_setting_value(stored)} applies after a restart)"
             for key, stored, kept in self.pinned
         ]
-        return "settings reloaded: " + "; ".join(parts)
+        return "⚙️ settings reloaded: " + "; ".join(parts)
 
 
 def apply_settings_reload(engine, reload: SettingsReload | None) -> None:
@@ -789,7 +805,7 @@ def apply_settings_reload(engine, reload: SettingsReload | None) -> None:
     if reload is None:
         return
     for message in reload.problems:
-        _logger.warning("settings reload: %s", message)
+        _logger.warning("⚠️ settings reload: %s", message)
         engine._emit(ConfigWarningEvent(message=message))
     if not reload.changes and not reload.pinned:
         return
@@ -1316,7 +1332,7 @@ class AutoSwitchEngine:
             return mapping.get(str(value)) if value is not None else None
 
         _logger.info(
-            "Account numbers changed under the running engine: %s",
+            "🔢 Account numbers changed under the running engine: %s",
             ", ".join(f"{o}->{n}" for o, n in sorted(mapping.items()) if o != n) or "-",
         )
         self._last_seen = tr(self._last_seen)
@@ -1728,7 +1744,7 @@ class AutoSwitchEngine:
                 # dead refresh token with an *active* user. Fall through to
                 # normal unhealthy counting so failover can still happen.
                 _logger.warning(
-                    "Active token expired and owned for over %.0f minutes; "
+                    "⚠️ Active token expired and owned for over %.0f minutes; "
                     "resuming unhealthy counting (dead refresh token?)",
                     IDLE_HOLD_MAX_S / 60,
                 )
@@ -2183,7 +2199,7 @@ class AutoSwitchEngine:
                 ):
                     self._auto_add_hinted = True
                     _logger.info(
-                        "The live Claude Code login is not managed and "
+                        "👤 The live Claude Code login is not managed and "
                         "autoswitch.autoAddAccounts is off; run 'aswap add' "
                         "to include it."
                     )
@@ -2290,7 +2306,7 @@ class AutoSwitchEngine:
             self._mutate_state(record)
         if start:
             _logger.info(
-                "Manual switch to %s; holding it for %s min unless it nears "
+                "✋ Manual switch to %s; holding it for %s min unless it nears "
                 "its limit", current, f"{minutes:g}",
             )
         return hold
@@ -2313,7 +2329,7 @@ class AutoSwitchEngine:
         if noted is None or noted[0] != key or now - noted[1] >= HOLD_NOTE_INTERVAL_S:
             self._hold_noted = (key, now)
             _logger.info(
-                "Manual hold: staying on account %s (%s would move to %s); "
+                "✋ Manual hold: staying on account %s (%s would move to %s); "
                 "held until %s", current, trigger, target, label,
             )
 
@@ -2805,7 +2821,7 @@ class AutoSwitchEngine:
         if self._edge_logged != note:
             self._edge_logged = note
             _logger.info(
-                "Account %s: %s in its last point (%s); leaving before it is refused",
+                "⏱️ Account %s: %s in its last point (%s); leaving before it is refused",
                 current,
                 "/".join(w.replace("_", "-") for w in note[1]),
                 "start unseen" if deadline == edge.UNKNOWN else "clock ran out",
@@ -3267,13 +3283,13 @@ class AutoSwitchEngine:
                     value if isinstance(value, dict) else None, self._models
                 )
                 _logger.info(
-                    "Account %s: usage API says %s%% but the gate is open (%s); "
+                    "🟢 Account %s: usage API says %s%% but the gate is open (%s); "
                     "keeping it usable",
                     num, f"{endpoint:.0f}" if endpoint is not None else "100", gate_pct,
                 )
             else:
                 _logger.info(
-                    "Account %s: the gate is closed (%s); treating it as at its limit",
+                    "🛑 Account %s: the gate is closed (%s); treating it as at its limit",
                     num, gate_pct,
                 )
 
@@ -3664,7 +3680,10 @@ class AutoSwitchEngine:
 
         # Why, next to the switcher's own "Switched from account X to Y" line:
         # without it a log cannot tell an engine move from a manual one.
-        _logger.info("Auto-switch to account %s (%s): %s", number, trigger, detail or "-")
+        _logger.info(
+            "%s Auto-switch to account %s (%s): %s",
+            "⭐" if trigger == "priority" else "🔀", number, trigger, detail or "-",
+        )
 
         self._emit(
             SwitchEvent(

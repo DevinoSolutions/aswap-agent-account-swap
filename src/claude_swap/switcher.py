@@ -3867,7 +3867,7 @@ class ClaudeAccountSwitcher:
                 }
                 self._write_needs_login(data)
                 self._logger.warning(
-                    "Account %s's session profile holds a wiped credential "
+                    "🔑 Account %s's session profile holds a wiped credential "
                     "(Claude Code's invalid_grant reaction); refusing to write "
                     "it into the store. The slot is kept as 'needs login' and "
                     "stays out of rotation until its owner logs in again.",
@@ -4892,7 +4892,7 @@ class ClaudeAccountSwitcher:
         if migrate_from:
             self._forget_engine_slot(migrate_from, old_email)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
-        self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
+        self._logger.info(f"➕ Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
@@ -5074,7 +5074,7 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
             self._logger.info(
-                "Auto-added account %s: %s (org: %s) from the live Claude Code login",
+                "➕ Auto-added account %s: %s (org: %s) from the live Claude Code login",
                 slot, email, org or "personal",
             )
             return ("added", slot)
@@ -5363,7 +5363,7 @@ class ClaudeAccountSwitcher:
         if migrate_from:
             self._forget_engine_slot(migrate_from, old_email)
         source_label = "API key" if is_api_key else "token"
-        self._logger.info(f"Added account {account_num} from {source_label}: {email}")
+        self._logger.info(f"➕ Added account {account_num} from {source_label}: {email}")
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(
@@ -9017,7 +9017,7 @@ class ClaudeAccountSwitcher:
                 transaction.record_step("sequence_updated")
 
                 self._logger.info(
-                    f"Switched from account {current_account} to {target_account}"
+                    f"🔀 Switched from account {current_account} to {target_account}"
                 )
 
             except Exception as e:

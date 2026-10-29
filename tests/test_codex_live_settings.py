@@ -98,13 +98,13 @@ class TestThresholdChange:
 
         (event,) = _reloads(events)
         assert event.changes == (("autoswitch.threshold", 90.0, 72.0),)
-        assert event.human() == "settings reloaded: autoswitch.threshold 90 -> 72"
+        assert event.human() == "⚙️ settings reloaded: autoswitch.threshold 90 -> 72"
         assert event.to_json()["event"] == "settings-reloaded"
         assert event.to_json()["changes"] == [
             {"key": "autoswitch.threshold", "old": 90.0, "new": 72.0}
         ]
         lines = [r.getMessage() for r in caplog.records if "settings reloaded" in r.getMessage()]
-        assert lines == ["settings reloaded: autoswitch.threshold 90 -> 72"]
+        assert lines == ["⚙️ settings reloaded: autoswitch.threshold 90 -> 72"]
 
     def test_unset_goes_back_to_the_default(self, tmp_path):
         _set(tmp_path, "autoswitch.threshold", "72")
