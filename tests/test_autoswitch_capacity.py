@@ -11,7 +11,6 @@ import pytest
 from claude_swap import gate
 from claude_swap.autoswitch import (
     BURN_QUANTUM_PCT,
-    GUARD_QUANTUM_PCT,
     LANDING_BURN_WINDOW_S,
     LIMIT_GUARD_S,
     LIVE_MIN_TICK_S,
@@ -156,13 +155,12 @@ class TestFastRate:
         for i in range(31):  # ten quiet minutes at 95%
             t.record(i * 20.0, "1", 95.0, 1.0)
         t.record(620.0, "1", 96.0, 1.0)
-        t.record(640.0, "1", 98.0, 1.0)  # five points a minute
-        assert t.rate() == pytest.approx(3.0 / 600.0)
+        t.record(640.0, "1", 99.0, 1.0)  # six points a minute
+        assert t.rate() == pytest.approx(4.0 / 600.0)
         fast = t.fast_rate()
-        assert fast == pytest.approx((3.0 - BURN_QUANTUM_PCT) / 40.0)
-        # The guard window adds one reading step's worth of burn (5x: cap 1).
-        assert 2.0 / fast <= LIMIT_GUARD_S + GUARD_QUANTUM_PCT / fast
-        assert 2.0 / t.rate() > LIMIT_GUARD_S + GUARD_QUANTUM_PCT / t.rate()
+        assert fast == pytest.approx((4.0 - BURN_QUANTUM_PCT) / 40.0)
+        # One point left: inside the guard at the proven pace, not the average.
+        assert 1.0 / fast <= LIMIT_GUARD_S < 1.0 / t.rate()
 
     def test_takes_the_steepest_trailing_stretch(self):
         t = BurnTracker()
@@ -198,19 +196,18 @@ class TestFastRate:
 
 
 class TestLimitGuard:
-    def test_switches_below_threshold_when_the_limit_is_minutes_away(self, temp_home, caplog):
+    def test_switches_below_threshold_when_the_limit_is_seconds_away(self, temp_home, caplog):
         h = _harness(temp_home, {"1": "5x", "2": "20x", "3": "20x"})
-        assert h.tick_with_usage({"1": _usage(70), "2": _usage(10), "3": _usage(50)}) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage({"1": _usage(50), "2": _usage(10), "3": _usage(50)}) is TickOutcome.NO_ACTION
         h.clock.advance(60)
-        # 15 points a minute with 15 left: one minute to the limit, inside the
-        # guard window (a minute plus one point's four seconds).
+        # 35 points a minute with 15 left: 26 seconds to the limit.
         with caplog.at_level(logging.INFO, logger="claude-swap"):
             outcome = h.tick_with_usage({"1": _usage(85), "2": _usage(10), "3": _usage(50)})
         assert outcome is TickOutcome.SWITCHED
         assert _switch(h).trigger == "proactive"
         assert h.active_number() == 2
         line = next(r.getMessage() for r in caplog.records if "Auto-switch" in r.getMessage())
-        assert "limit projected in 1.0 min" in line
+        assert "limit projected in 0.4 min" in line
         assert "from 1 85% used, 5x" in line and "to 2 10% used, 20x" in line
 
     def test_slow_burn_below_threshold_stays(self, temp_home):
@@ -224,7 +221,7 @@ class TestLimitGuard:
     def test_guard_ignores_the_cooldown(self, temp_home):
         h = _harness(temp_home, {"1": "5x", "2": "20x"})
         h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock.now))
-        h.tick_with_usage({"1": _usage(70), "2": _usage(10), "3": _usage(50)})
+        h.tick_with_usage({"1": _usage(50), "2": _usage(10), "3": _usage(50)})
         h.clock.advance(60)
         outcome = h.tick_with_usage({"1": _usage(85), "2": _usage(10), "3": _usage(50)})
         assert outcome is TickOutcome.SWITCHED
@@ -250,23 +247,23 @@ class TestLimitGuard:
             h.clock.advance(20)
         assert h.tick_with_usage({"1": _usage(96), **others}) is TickOutcome.NO_ACTION
         h.clock.advance(20)
-        outcome = h.tick_with_usage({"1": _usage(98), **others})
+        outcome = h.tick_with_usage({"1": _usage(99), **others})
         assert outcome is TickOutcome.SWITCHED
         assert _switch(h).trigger == "proactive"
-        # 2 points at the proven 1.5 a minute: 80 s, inside 60 s + 40 s.
-        assert h.engine._time_to_limit == pytest.approx(80.0)
+        # 1 point at the proven 3 a minute: 20 s.
+        assert h.engine._time_to_limit == pytest.approx(20.0)
 
-    def test_rides_until_a_minute_and_one_reading_remain(self, temp_home):
-        # 5x at three points a minute: the window is 60 s + 20 s. Five points
-        # left (100 s) keeps working; three (60 s) moves.
+    def test_rides_a_steady_burn_to_its_last_half_minute(self, temp_home):
+        # 5x at three points a minute: two points left (40 s) keeps working;
+        # one (20 s) moves.
         h = _harness(temp_home, {"1": "5x", "2": "20x", "3": "20x"}, threshold=99.9)
         others = {"2": _usage(10), "3": _usage(50)}
-        for pct in (89, 92):
+        for pct in (89, 92, 95):
             assert h.tick_with_usage({"1": _usage(pct), **others}) is TickOutcome.NO_ACTION
             h.clock.advance(60)
-        assert h.tick_with_usage({"1": _usage(95), **others}) is TickOutcome.NO_ACTION
-        h.clock.advance(40)
-        assert h.tick_with_usage({"1": _usage(97), **others}) is TickOutcome.SWITCHED
+        assert h.tick_with_usage({"1": _usage(98), **others}) is TickOutcome.NO_ACTION
+        h.clock.advance(20)
+        assert h.tick_with_usage({"1": _usage(99), **others}) is TickOutcome.SWITCHED
         assert _switch(h).trigger == "proactive"
 
     def test_a_reading_served_again_is_not_read_as_a_burst(self, temp_home):
@@ -348,9 +345,9 @@ class TestLandingRunway:
         self._burning(h, 50)
         outcome = h.tick_with_usage({
             "1": _usage7(50, 20, _R_LATER),
-            # 2 points: two minutes at this rate, short of its own guard
-            # window (one minute plus one point) and a minute of work.
-            "2": _usage7(98, 10, _R_SOON),
+            # Half a point: 30 s at this rate, inside the guard plus the
+            # half minute of work a drain must buy.
+            "2": _usage7(99.5, 10, _R_SOON),
             "3": _usage7(10, 10, _R_LATER),
         })
         assert outcome is TickOutcome.NO_ACTION
@@ -373,10 +370,10 @@ class TestLandingRunway:
     def test_proactive_skips_a_sooner_reset_too_small_to_work_on(self, temp_home):
         h = _harness(temp_home, {"1": "5x", "2": "5x", "3": "5x"}, strategy="consume-first")
         self._burning(h, 95)
-        # #2 resets sooner but holds 2 minutes at one point a minute; #3 20.
+        # #2 resets sooner but holds 30 s at one point a minute; #3 20 min.
         outcome = h.tick_with_usage({
             "1": _usage7(95, 20, _R_LATER),
-            "2": _usage7(98, 10, _R_SOON),
+            "2": _usage7(99.5, 10, _R_SOON),
             "3": _usage7(80, 10, _R_LATER),
         })
         assert outcome is TickOutcome.SWITCHED
@@ -397,6 +394,23 @@ class TestLandingRunway:
         })
         assert outcome is TickOutcome.SWITCHED
         assert _switch(h).trigger == "consume-first"
+        assert h.active_number() == 2
+
+    def test_consume_first_drains_the_last_point_of_a_sooner_20x(self, temp_home):
+        # 2026-10-29 legal@: a 20x at 99% resetting before the active one.
+        # One point of a 20x is four 5x-points: 80 s at three a minute.
+        h = _harness(
+            temp_home, {"1": "20x", "2": "20x", "3": "20x"},
+            strategy="consume-first", threshold=99.9,
+        )
+        self._burning(h, 50)
+        h.engine._recent_burns = [(h.clock.now - 600, 3.0 / 60)]
+        outcome = h.tick_with_usage({
+            "1": _usage7(30, 50, _R_LATER),
+            "2": _usage7(0, 99, _R_SOON),
+            "3": _usage7(0, 10, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
     def test_a_forced_move_drains_a_sooner_account_the_ratio_would_refuse(self, temp_home):
@@ -440,14 +454,14 @@ class TestLandingRunway:
 
     def test_a_lull_does_not_shrink_the_landing_check(self, temp_home):
         # Burning a point a minute now, but four a minute ten minutes ago: #2's
-        # 8 points last 2 minutes at the recent pace (short of its 75 s guard
-        # window and a minute of work), not 8.
+        # 3 points last 45 s at the recent pace (short of the guard plus half
+        # a minute of work), not 3 minutes.
         h = _harness(temp_home, {"1": "5x", "2": "5x", "3": "5x"}, strategy="consume-first")
         self._burning(h, 50)
         h.engine._recent_burns = [(h.clock.now - 600, 4.0 / 60)]
         outcome = h.tick_with_usage({
             "1": _usage7(50, 20, _R_LATER),
-            "2": _usage7(92, 10, _R_SOON),
+            "2": _usage7(97, 10, _R_SOON),
             "3": _usage7(10, 10, _R_LATER),
         })
         assert outcome is TickOutcome.NO_ACTION
