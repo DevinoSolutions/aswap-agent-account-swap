@@ -217,21 +217,25 @@ DEFAULT_LANDING_BURN = 1.0 / 60
 # minute, because a lull had dropped the instant rate to 0.4.
 LANDING_BURN_WINDOW_S = 30 * 60.0
 # consume-first exception to both runway rules: an account whose weekly quota
-# perishes sooner than the active one's is worth draining even for a short
-# stay, because whatever is left there at its reset is lost. It still needs
-# this much quota (5x points) and this much runway, so a few leftover points
-# never pull the engine over (the 2026-10-25/26/27 hops above all landed on
-# 3-7 points). Measured 2026-10-29: at ~4.8 points a minute the 15-minute
-# floor kept a desktop off two 5x accounts holding 28 and 44 points that
-# expired a day later, while it burned a 20x that reset five days out.
-DRAIN_MIN_POINTS = 15.0
-DRAIN_MIN_RUNWAY_S = 5 * 60.0
+# perishes sooner than the active one's is drained whatever its size, because
+# whatever is left there at its reset is lost. The only condition is that the
+# stay is real work: at the landing burn it must outlast its own limit-guard
+# window (`_guard_window_s`) by this much, or the guard would move straight
+# off it again (the 2026-10-25/26/27 hops above all landed inside it).
+# Owner rule 2026-10-29: squeeze every account, soonest-expiring first; a
+# 15-point floor had left 9 points that expired within 18 hours.
+DRAIN_MIN_USE_S = 60.0
 
 # Switch below the threshold when the active account would reach 100% within
-# this long at the current burn rate: the switch itself plus Claude Code
-# picking up the new credentials, with margin. Makes a threshold close to
-# 100 safe, so less of each account is left behind.
-LIMIT_GUARD_S = 3 * 60.0
+# this long at the current burn rate: the switch itself (about a second,
+# measured end to end) plus Claude Code's next request picking up the new
+# credentials, with margin. Readings are whole percentages and the live feed
+# rounds down, so the real headroom can be up to GUARD_QUANTUM_PCT lower than
+# read: the guard adds that much burn on top (`_guard_window_s`). Was a flat
+# 3 minutes until 2026-10-29, which left ~9 5x-points behind on every
+# account at 3 points a minute.
+LIMIT_GUARD_S = 60.0
+GUARD_QUANTUM_PCT = 1.0
 
 # A proactive move must buy meaningfully more time than it leaves: the
 # target's runway (at the same peak burn the landing check uses) at least
@@ -1050,6 +1054,9 @@ class AutoSwitchEngine:
         self._gate_logged: dict[str, str] = {}
         self._live_now: list[dict] = []
         self._runway_refused: float | None = None
+        # The active account is riding an open gate (endpoint 100%, API still
+        # serving it): ticks then come at least every gate.RIDE_REPROBE_S.
+        self._riding = False
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -1571,6 +1578,7 @@ class AutoSwitchEngine:
         # anything on an estimated half point; the next closed gate (re-probed
         # every few minutes) is the at-limit escape.
         riding = self._gate_verdicts.get(current) == gate.OPEN
+        self._riding = riding
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
@@ -1604,7 +1612,8 @@ class AutoSwitchEngine:
                 and not riding
                 and active_headroom > 0
                 and self._time_to_limit is not None
-                and self._time_to_limit <= LIMIT_GUARD_S
+                and rate > 0
+                and self._time_to_limit <= self._guard_window_s(current, rate)
             )
             if utilization < settings.threshold and not self._limit_guard:
                 if settings.strategy != "consume-first":
@@ -2621,23 +2630,33 @@ class AutoSwitchEngine:
         at = self._collected_at if measured is None else min(measured, self._collected_at)
         return at, current, pct, self._cap(current)
 
-    def _runway_s(self, num: str, h: float | None, *, landing: bool = False) -> float | None:
-        """Seconds of work the account holds at the current burn rate.
-
-        ``landing`` judges a switch target by the fastest rate seen within
+    def _landing_rate(self) -> float:
+        """The burn a switch target is judged by: the fastest rate seen within
         ``LANDING_BURN_WINDOW_S``, so a lull does not shrink the check; an
         idle spell falls back to the last rate seen, then to
-        ``DEFAULT_LANDING_BURN``, instead of waving every target through.
-        """
-        rate = self._burn_rate
-        if landing:
-            cutoff = self._collected_at - LANDING_BURN_WINDOW_S
-            self._recent_burns = [(t, r) for t, r in self._recent_burns if t >= cutoff]
-            peak = max((r for _t, r in self._recent_burns), default=0.0)
-            rate = max(rate or 0.0, peak) or self._last_burn_rate or DEFAULT_LANDING_BURN
+        ``DEFAULT_LANDING_BURN``, instead of waving every target through."""
+        cutoff = self._collected_at - LANDING_BURN_WINDOW_S
+        self._recent_burns = [(t, r) for t, r in self._recent_burns if t >= cutoff]
+        peak = max((r for _t, r in self._recent_burns), default=0.0)
+        return (
+            max(self._burn_rate or 0.0, peak)
+            or self._last_burn_rate
+            or DEFAULT_LANDING_BURN
+        )
+
+    def _runway_s(self, num: str, h: float | None, *, landing: bool = False) -> float | None:
+        """Seconds of work the account holds at the current burn rate
+        (``landing``: at ``_landing_rate``)."""
+        rate = self._landing_rate() if landing else self._burn_rate
         if h is None or not rate:
             return None
         return max(h, 0.0) * self._cap(num) / rate
+
+    def _guard_window_s(self, num: str, rate: float) -> float:
+        """How close to its projected limit an account may run before the
+        limit guard moves the work: LIMIT_GUARD_S plus the time one reading
+        step (GUARD_QUANTUM_PCT of this account's tier) lasts at ``rate``."""
+        return LIMIT_GUARD_S + GUARD_QUANTUM_PCT * self._cap(num) / rate
 
     def _describe_move(
         self, current: str, target: str, headroom: dict[str, float | None]
@@ -2887,14 +2906,13 @@ class AutoSwitchEngine:
             else:
                 key = (-h * cap,)
             runway = self._runway_s(num, h, landing=True)
-            # Draining perishable quota: see DRAIN_MIN_POINTS.
+            # Draining perishable quota: see DRAIN_MIN_USE_S.
             drain = (
                 consume_first
                 and not all_above
                 and reset_ts is not None
                 and active_reset_ts is not None
                 and reset_ts < active_reset_ts
-                and h * cap >= DRAIN_MIN_POINTS
             )
             if (
                 active_runway is not None
@@ -2907,7 +2925,11 @@ class AutoSwitchEngine:
             ):
                 runway_refused = True
                 continue
-            min_runway = DRAIN_MIN_RUNWAY_S if drain else MIN_LANDING_RUNWAY_S
+            min_runway = (
+                self._guard_window_s(num, self._landing_rate()) + DRAIN_MIN_USE_S
+                if drain
+                else MIN_LANDING_RUNWAY_S
+            )
             if runway is not None and runway < min_runway:
                 if trigger == "consume-first":
                     continue  # a voluntary move that would not last
@@ -3197,7 +3219,8 @@ class AutoSwitchEngine:
                 # move it is about to force needs fresh candidates.
                 active_headroom is not None
                 and (runway := self._runway_s(current, active_headroom)) is not None
-                and runway <= 2 * LIMIT_GUARD_S
+                and self._burn_rate
+                and runway <= 2 * self._guard_window_s(current, self._burn_rate)
             )
             or (
                 # The same, on the pace this very reading proves: a sudden
@@ -3208,7 +3231,8 @@ class AutoSwitchEngine:
                 and (fast := self._burn.fast_rate(self._burn_sample(
                     current, active_value, entries.get(current), 0.0
                 ))) is not None
-                and active_headroom * self._cap(current) / fast <= 2 * LIMIT_GUARD_S
+                and active_headroom * self._cap(current) / fast
+                <= 2 * self._guard_window_s(current, fast)
             )
         )
         if escalate:
@@ -3671,6 +3695,10 @@ class AutoSwitchEngine:
                     # Closing on the limit: re-read the (free) live feed
                     # several times before the projected hit.
                     delay = min(delay, max(LIVE_MIN_TICK_S, self._time_to_limit / 4))
+            if self._riding:
+                # Burning the last point behind an open gate: never sleep
+                # past the next re-probe that can see it close.
+                delay = min(delay, gate.RIDE_REPROBE_S)
         return self._respect_warmup_deadline(delay)
 
     def _respect_warmup_deadline(self, delay: float) -> float:
