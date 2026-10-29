@@ -1,6 +1,6 @@
 [project]
 name = "aswap"
-version = "1.0.0"
+version = "1.1.0"
 description = "aswap (agent account swap): switch between multiple Claude Code and OpenAI Codex accounts automatically before you hit rate limits"
 readme = "README.md"
 requires-python = ">=3.12"
