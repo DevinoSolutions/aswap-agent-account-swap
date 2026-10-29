@@ -216,6 +216,16 @@ DEFAULT_LANDING_BURN = 1.0 / 60
 # account with 7 points left 19 minutes after leaving it at 4.7 points a
 # minute, because a lull had dropped the instant rate to 0.4.
 LANDING_BURN_WINDOW_S = 30 * 60.0
+# consume-first exception to both runway rules: an account whose weekly quota
+# perishes sooner than the active one's is worth draining even for a short
+# stay, because whatever is left there at its reset is lost. It still needs
+# this much quota (5x points) and this much runway, so a few leftover points
+# never pull the engine over (the 2026-10-25/26/27 hops above all landed on
+# 3-7 points). Measured 2026-10-29: at ~4.8 points a minute the 15-minute
+# floor kept a desktop off two 5x accounts holding 28 and 44 points that
+# expired a day later, while it burned a 20x that reset five days out.
+DRAIN_MIN_POINTS = 15.0
+DRAIN_MIN_RUNWAY_S = 5 * 60.0
 
 # Switch below the threshold when the active account would reach 100% within
 # this long at the current burn rate: the switch itself plus Claude Code
@@ -2877,17 +2887,28 @@ class AutoSwitchEngine:
             else:
                 key = (-h * cap,)
             runway = self._runway_s(num, h, landing=True)
+            # Draining perishable quota: see DRAIN_MIN_POINTS.
+            drain = (
+                consume_first
+                and not all_above
+                and reset_ts is not None
+                and active_reset_ts is not None
+                and reset_ts < active_reset_ts
+                and h * cap >= DRAIN_MIN_POINTS
+            )
             if (
                 active_runway is not None
                 and runway is not None
                 and not all_above
+                and not drain
                 and runway < min(
                     active_runway * RUNWAY_RATIO, active_runway + RUNWAY_MARGIN_S
                 )
             ):
                 runway_refused = True
                 continue
-            if runway is not None and runway < MIN_LANDING_RUNWAY_S:
+            min_runway = DRAIN_MIN_RUNWAY_S if drain else MIN_LANDING_RUNWAY_S
+            if runway is not None and runway < min_runway:
                 if trigger == "consume-first":
                     continue  # a voluntary move that would not last
                 short.append((key, num))  # an escape still takes it, last
