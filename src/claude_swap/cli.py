@@ -1036,12 +1036,18 @@ restart; a setting given as a flag keeps its flag value until restart.
         help="Evaluate and report, but never switch or write state",
     )
     parser.add_argument(
+        "--at-login",
+        action="store_true",
+        help=argparse.SUPPRESS,  # the login entry's launch (login_start.py)
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
     )
     args = parser.parse_args(argv)
 
+    from claude_swap import login_start
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import cli_overrides, load_settings, merged_with_cli
@@ -1070,6 +1076,16 @@ restart; a setting given as a flag keeps its flag value until restart.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        if args.at_login:
+            reason = login_start.skip_reason(
+                settings.start_on_login, switcher.backup_dir, _time.time()
+            )
+            if reason:
+                print(dimmed(reason))
+                return
+        if settings.start_on_login and not (args.once or args.dry_run):
+            # Keeps the entry pointing at this install after an upgrade or move.
+            login_start.sync(True, switcher.backup_dir)
         engine = AutoSwitchEngine(
             switcher,
             settings,
@@ -1099,6 +1115,7 @@ restart; a setting given as a flag keeps its flag value until restart.
                     f"Auto-switch running: threshold {settings.threshold:.0f}%, "
                     f"every {settings.interval_seconds:.0f}s"
                     f" · 5h warm-up {'on' if settings.warmup_five_hour else 'off'}"
+                    f" · start on login {'on' if settings.start_on_login else 'off'}"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )
@@ -1242,6 +1259,18 @@ through aswap's isolated session profiles. Ctrl-C stops loop mode.
     except KeyboardInterrupt:
         print(f"\n{dimmed('Five-hour warm-up stopped')}")
         sys.exit(130)
+
+
+def _sync_login_entry(root: Path) -> None:
+    """Make the login entry follow ``autoswitch.startOnLogin`` and say what changed."""
+    from claude_swap import login_start
+    from claude_swap.settings import load_settings
+
+    result = login_start.sync(load_settings(root).start_on_login, root)
+    if result and result.startswith("failed"):
+        print(yellowed(f"Start on login: {result}"), file=sys.stderr)
+    elif result:
+        print(muted(f"Start on login: login entry {result}"))
 
 
 def _config_command(argv: list[str]) -> None:
@@ -1430,6 +1459,11 @@ loop, which keeps its last good value and logs a warning.
                 print(f"{args.key} unset (default: {format_setting_value(default)})")
             else:
                 print(muted(f"{args.key} is not set; nothing to do"), file=sys.stderr)
+        if action == "import" or (
+            action in ("set", "unset")
+            and setting_spec(args.key).dotted == "autoswitch.startOnLogin"
+        ):
+            _sync_login_entry(root)
     except ClaudeSwitchError as e:
         if json_mode:
             print(json.dumps(error_envelope(e), indent=2))

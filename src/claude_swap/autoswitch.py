@@ -3934,6 +3934,10 @@ class AutoSwitchEngine:
             self._auto_add_hinted = False
         if new.warmup_five_hour != old.warmup_five_hour:
             self._restart_warmup(new.warmup_five_hour)
+        if new.start_on_login != old.start_on_login and not self.dry_run:
+            from claude_swap import login_start  # imports this module
+
+            login_start.sync(new.start_on_login, self.switcher.backup_dir)
 
     def _sleep(self, delay: float) -> None:
         """Wait ``delay`` seconds, ending early on wake/stop or a settings change.
