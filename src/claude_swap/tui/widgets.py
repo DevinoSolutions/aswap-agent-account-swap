@@ -345,6 +345,9 @@ def mini_account_text(
     ):
         window = last_good.get(key) if isinstance(last_good, dict) else None
         if not window:
+            if key == "five_hour" and oauth.has_no_five_hour(last_good):
+                text.append("5h none", style=palette.muted)
+                parts += 1
             continue
         pct = float(window["pct"])
         if parts:
