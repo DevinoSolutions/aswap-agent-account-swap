@@ -490,6 +490,33 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.setattr("pathlib.Path.home", lambda: safe_home)
 
 
+class FakeRunKey:
+    """In-memory stand-in for the Windows Run key (login_start)."""
+
+    def __init__(self):
+        self.values: dict[str, str] = {}
+
+    def get(self, name):
+        return self.values.get(name)
+
+    def set(self, name, value):
+        self.values[name] = value
+
+    def delete(self, name):
+        self.values.pop(name, None)
+
+
+@pytest.fixture(autouse=True)
+def block_real_login_entry(monkeypatch):
+    """Safety net: no test may write the real Windows Run key or the
+    developer's real autostart dir (``$HOME`` is isolated above; the
+    registry and ``XDG_CONFIG_HOME`` are not)."""
+    fake = FakeRunKey()
+    monkeypatch.setattr("claude_swap.login_start._run_key", fake)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    return fake
+
+
 @pytest.fixture(autouse=True)
 def _close_state_dbs():
     """Close every state-database connection a test opened.

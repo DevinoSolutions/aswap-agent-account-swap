@@ -85,6 +85,9 @@ class AutoSwitchSettings:
     # stable for two polls, and a re-login for a managed slot refreshes its
     # stored credential — no `aswap add` by hand. OAuth logins only.
     auto_add_accounts: bool = True
+    # Start `aswap auto` when the user logs in (a per-user login entry, see
+    # login_start.py). Off by default: it adds an entry outside aswap's data.
+    start_on_login: bool = False
 
     @property
     def hold_minutes(self) -> float:
@@ -229,6 +232,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "autoAddAccounts", "auto_add_accounts", "bool",
             help="Let aswap auto add new Claude Code logins (no aswap add)",
+        ),
+        SettingSpec(
+            "autoswitch", "startOnLogin", "start_on_login", "bool",
+            help="Start aswap auto when you log in (adds a per-user login entry)",
         ),
         SettingSpec(
             "profiles", "persistent", "persistent", "bool",
