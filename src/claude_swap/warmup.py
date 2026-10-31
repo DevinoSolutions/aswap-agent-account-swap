@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
-from claude_swap import statedb
+from claude_swap import oauth, statedb
 from claude_swap.exceptions import ClaudeSwitchError, PromptOutcomeUnknown, WarmupError
 from claude_swap.locking import FileLock
 from claude_swap.models import AccountSnapshot
@@ -229,7 +229,7 @@ class WarmupEngine:
         usage = entry.last_good
         if not isinstance(usage, dict):
             return True
-        if self._stale_weekly_is_exhausted(usage, now):
+        if self._stale_weekly_is_exhausted(usage, now) or oauth.has_no_five_hour(usage):
             return False
 
         weekly = usage.get("seven_day")
@@ -274,6 +274,8 @@ class WarmupEngine:
             if isinstance(stale, dict):
                 if self._stale_weekly_is_exhausted(stale, now):
                     return "weekly-exhausted"
+                if oauth.has_no_five_hour(stale):
+                    return "no-five-hour"
                 if self._stale_five_hour_is_live(stale, now):
                     return "live"
             return None
@@ -285,6 +287,8 @@ class WarmupEngine:
             and float(weekly["pct"]) >= 100.0
         ) or self._model_weekly_exhausted(usage):
             return "weekly-exhausted"
+        if oauth.has_no_five_hour(usage):
+            return "no-five-hour"
 
         five_hour = usage.get("five_hour")
         if not isinstance(five_hour, dict):
@@ -503,6 +507,7 @@ class WarmupEngine:
             "recently-warmed": "a successful or in-progress warm is still protected",
             "weekly-exhausted": "weekly quota is exhausted; no request sent",
             "live": "five-hour window is already active",
+            "no-five-hour": "plan has no five-hour limit; nothing to warm",
         }[reason]
 
     def _emit(self, account: AccountSnapshot, kind: str, detail: str) -> None:

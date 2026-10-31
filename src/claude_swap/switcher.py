@@ -251,6 +251,8 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
                 rows.append((label, f"{pct_text}   resets {clock:<12}  in {countdown}{marker}"))
             else:
                 rows.append((label, f"{pct_text}{marker}"))
+        elif label == "5h" and oauth.has_no_five_hour(usage):
+            rows.append((label, "none   (weekly limit only)"))
     reset_credits = usage.get("reset_credits")
     if isinstance(reset_credits, dict) and isinstance(
         reset_credits.get("available"), int

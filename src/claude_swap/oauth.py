@@ -538,6 +538,18 @@ def _log_usage_failure(
 
 
 
+NO_FIVE_HOUR = "no_five_hour"
+
+
+def has_no_five_hour(usage: dict | None) -> bool:
+    """The account's plan has no 5-hour window, only weekly limits."""
+    return (
+        isinstance(usage, dict)
+        and usage.get(NO_FIVE_HOUR) is True
+        and not isinstance(usage.get("five_hour"), dict)
+    )
+
+
 def build_usage_result(data: dict) -> dict | None:
     """Normalize raw usage API data into the structure used by the CLI."""
     _logger.debug("Usage API response: %s", json.dumps(data, indent=2))
@@ -559,6 +571,13 @@ def build_usage_result(data: dict) -> dict | None:
             d7_entry["resets_at"] = d7["resets_at"]
             d7_entry["countdown"], d7_entry["clock"] = format_reset(d7["resets_at"])
         result["seven_day"] = d7_entry
+
+    if "five_hour" in data and data["five_hour"] is None and result:
+        # Measured 2026-10-31: plans without a 5-hour limit (personal Max
+        # accounts) answer an explicit null here and send no 5h-* rate-limit
+        # headers. A 5h plan whose window has not started reads
+        # {"utilization": 0, "resets_at": null} instead, so null is not "cold".
+        result[NO_FIVE_HOUR] = True
 
     eu = data.get("extra_usage")
     if eu and eu.get("is_enabled"):

@@ -116,6 +116,8 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
     out: dict = {}
     if "five_hour" in usage:
         out["fiveHour"] = _window_to_json(usage["five_hour"])
+    elif oauth.has_no_five_hour(usage):
+        out["noFiveHour"] = True
     if "seven_day" in usage:
         out["sevenDay"] = _weekly_window_to_json(usage["seven_day"], fetched_at)
     if "weekly" in usage:
