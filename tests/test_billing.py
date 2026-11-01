@@ -575,3 +575,74 @@ class TestClaimPlanChecks:
             self.IDS, min_age=billing.LAPSED_RECHECK_S, stagger=True
         )
         assert sorted(claimed) == ["1", "2"]
+
+
+class TestConfirmedEnd:
+    """Auto drains a cancelled account only on a confirmed, current reading
+    (owner rule 2026-11-01): claude.ai said plan_ending_at, recently."""
+
+    NOW = _dt("2026-10-15T00:00:00").timestamp()
+
+    def _rec(self, **kw):
+        base = {
+            "source": "exact",
+            "subscriptionStatus": "active",
+            "currentPeriodEnd": "2026-10-20T09:00:00+00:00",
+            "cancelAtPeriodEnd": True,
+            "fetchedAt": self.NOW - 600,
+        }
+        base.update(kw)
+        return base
+
+    def test_a_fresh_confirmed_cancellation_ends_at_the_period_end(self):
+        assert billing.confirmed_end_ts(self._rec(), self.NOW) == _dt("2026-10-20T09:00:00").timestamp()
+
+    def test_a_stale_reading_is_not_confirmation(self):
+        stale = self._rec(fetchedAt=self.NOW - billing.CONFIRM_FRESH_S - 1)
+        assert billing.confirmed_end_ts(stale, self.NOW) is None
+
+    @pytest.mark.parametrize(
+        "kw",
+        [
+            {"cancelAtPeriodEnd": False},
+            {"source": "estimate"},
+            {"currentPeriodEnd": "2026-10-01T00:00:00+00:00"},
+            {"fetchedAt": None},
+        ],
+    )
+    def test_anything_less_is_not_confirmation(self, kw):
+        assert billing.confirmed_end_ts(self._rec(**kw), self.NOW) is None
+
+    def test_none_is_none(self):
+        assert billing.confirmed_end_ts(None, self.NOW) is None
+
+
+class TestCancelLog:
+    INFO = [(3, "a@example.com", "Org", "org-1", False, "", "")]
+
+    def _refresh(self, tmp_path, monkeypatch, cache, cancelling):
+        from claude_swap import billing_session as bs
+
+        monkeypatch.setattr(
+            bs,
+            "fetch_subscription_details",
+            lambda key, org: {
+                "periodEnd": "2099-01-01T00:00:00+00:00",
+                "cancelAtPeriodEnd": cancelling,
+                "status": "active", "interval": "monthly", "keys": [],
+            },
+        )
+        cache.refresh(self.INFO, force=True)
+
+    def test_confirmation_and_undo_are_logged_once(self, tmp_path, monkeypatch, caplog):
+        sessions = FakeSessions({("a@example.com", "org-1"): {"sessionKey": "sk", "status": "ok"}})
+        cache = billing.BillingCache(tmp_path, sessions=sessions)
+        caplog.set_level("INFO", logger="claude-swap")
+        self._refresh(tmp_path, monkeypatch, cache, False)
+        self._refresh(tmp_path, monkeypatch, cache, True)
+        self._refresh(tmp_path, monkeypatch, cache, True)
+        self._refresh(tmp_path, monkeypatch, cache, False)
+        lines = [r.getMessage() for r in caplog.records if "📅" in r.getMessage()]
+        assert len(lines) == 2
+        assert "cancellation confirmed" in lines[0] and "2099-01-01" in lines[0]
+        assert "no longer cancelling" in lines[1]

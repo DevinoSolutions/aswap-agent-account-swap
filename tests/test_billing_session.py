@@ -62,7 +62,9 @@ class TestParser:
             }
         )
         assert out["periodEnd"] == "2026-10-12T14:28:34+00:00"
-        assert out["cancelAtPeriodEnd"] is True
+        # Only claude.ai's own plan_ending_at confirms a cancellation; a
+        # Stripe-style flag this endpoint has never sent is not evidence.
+        assert out["cancelAtPeriodEnd"] is False
         assert out["status"] == "active"
         assert out["interval"] == "monthly"
 
@@ -73,11 +75,11 @@ class TestParser:
         assert out["periodEnd"].startswith("2026-10-12")
         assert out["cancelAtPeriodEnd"] is False
 
-    def test_cancel_timestamp_means_cancelling(self):
+    def test_a_cancel_timestamp_alone_is_not_a_confirmed_cancellation(self):
         out = bs.parse_subscription_details(
             {"status": "active", "next_charge_date": "2026-10-12", "canceled_at": "2026-10-01T00:00:00Z"}
         )
-        assert out["cancelAtPeriodEnd"] is True
+        assert out["cancelAtPeriodEnd"] is False
 
     def test_unknown_shape_records_keys_only(self):
         out = bs.parse_subscription_details({"foo": 1, "bar": "x"})
@@ -115,6 +117,13 @@ class TestRealPayload:
         )
         assert out["periodEnd"] == "2026-11-02T10:00:00+00:00"
         assert out["cancelAtPeriodEnd"] is True
+
+    def test_plan_ending_before_alone_is_not_a_cancellation(self):
+        out = bs.parse_subscription_details(
+            dict(REAL, plan_ending_before="2026-11-02T10:00:00Z")
+        )
+        assert out["periodEnd"] == "2026-11-17T22:41:23+00:00"
+        assert out["cancelAtPeriodEnd"] is False
 
     def test_scheduled_downgrade_is_kept(self):
         out = bs.parse_subscription_details(dict(REAL, scheduled_downgrade={"plan": "pro"}))

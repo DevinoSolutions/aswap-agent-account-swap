@@ -34,6 +34,32 @@ def _login(sw, args) -> None:
         print(dimmed(f"  subscription_details keys: {rec.get('detailKeys')}"))
 
 
+def _refresh(sw, args) -> None:
+    """Re-read billing now and say whether a cancellation is confirmed."""
+    import time as _time
+
+    from claude_swap.billing import confirmed_end_ts
+
+    info = sw._build_accounts_info()
+    if args.accounts:
+        wanted = {sw.resolve_account(a)[0] for a in args.accounts}
+        info = [i for i in info if str(i[0]) in wanted]
+    sw._billing.refresh(info, force=True)
+    views = sw._billing_views(info)
+    for num, email, _on, org, _a, _c, _al in info:
+        key = str(num)
+        record = sw._billing.records({key: (email, org or "")}).get(key)
+        confirmed = confirmed_end_ts(record, _time.time()) is not None
+        session = sw._billing.session_state((email, org or "")) or "none"
+        if confirmed:
+            note = accent("  cancellation confirmed: auto treats the end as its reset")
+        elif session != "ok":
+            note = dimmed("  (no claude.ai session: a cancellation cannot be confirmed; aswap billing login)")
+        else:
+            note = ""
+        print(f"  {num}: {email}  {billing_text(views.get(key)) or 'unknown'}{note}")
+
+
 def _status(sw, args) -> None:
     info = sw._build_accounts_info()
     billing = sw._billing_views(info)
@@ -278,6 +304,11 @@ def billing_command(argv: list[str]) -> None:
     p.add_argument("--timeout", type=float, default=300.0)
     p = sub.add_parser("status", help="sessions, billing and weekly reset per account")
     p.add_argument("--json", action="store_true")
+    p = sub.add_parser(
+        "refresh",
+        help="re-read billing now (e.g. right after cancelling, to confirm it for auto)",
+    )
+    p.add_argument("accounts", nargs="*", metavar="NUM|EMAIL", help="default: every account")
     p = sub.add_parser("tier", help="live plan tier (5x / 20x / free) per account, read now")
     p.add_argument("accounts", nargs="*", metavar="NUM|EMAIL", help="default: every account")
     p.add_argument("--json", action="store_true")
@@ -298,13 +329,15 @@ def billing_command(argv: list[str]) -> None:
     p.add_argument("email")
     args = parser.parse_args(argv)
     if args.action is None:
-        parser.error("a subcommand is required: login, status, tier, plan, paid, forget, forget-anchor")
+        parser.error("a subcommand is required: login, status, refresh, tier, plan, paid, forget, forget-anchor")
     try:
         sw = _switcher(args.debug)
         if args.action == "login":
             _login(sw, args)
         elif args.action == "status":
             _status(sw, args)
+        elif args.action == "refresh":
+            _refresh(sw, args)
         elif args.action == "tier":
             _tier(sw, args)
         elif args.action == "plan":
