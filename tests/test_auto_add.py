@@ -363,6 +363,19 @@ class TestLapsedPlanRecheck:
             sw.recheck_plans()
         assert check.call_count == 2
 
+    def test_auto_rereads_session_billing_without_the_tui(self, h):
+        # 2026-11-01: a confirmed cancellation steers consume-first, so the
+        # loop itself re-reads it; only slots with a claude.ai session.
+        sw = h.switcher
+        info = {str(i[0]): i for i in sw._build_accounts_info()}
+        email, org = info["2"][1], info["2"][3] or ""
+        sw._sessions.put((email, org), "sk-test")
+        with patch.object(type(sw._billing), "check_tiers", return_value={}),                 patch.object(type(sw._billing), "refresh") as refresh:
+            sw.recheck_plans()
+            sw.recheck_plans()  # inside SESSION_BILLING_SCAN_S: not looked at again
+        assert refresh.call_count == 1
+        assert [str(i[0]) for i in refresh.call_args.args[0]] == ["2"]
+
     def test_usage_falling_inside_a_window_rechecks_the_plan(self, h):
         # 2026-10-29: upgrades 5x -> 20x went unseen for hours. The usage
         # endpoint shows them at once: the same window reads a quarter.

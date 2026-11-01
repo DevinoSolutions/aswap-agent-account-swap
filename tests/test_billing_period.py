@@ -11,6 +11,9 @@ import pytest
 from claude_swap import billing
 from claude_swap import weekly_anchor as wa
 
+# Captured at import, before the suite-wide stub replaces it per test.
+_REAL_REFRESH = billing.BillingCache.refresh
+
 ID = ("legal@example.com", "org-1")
 
 
@@ -381,3 +384,55 @@ class TestPlanCommand:
         out = capsys.readouterr().out
         assert "27: banned@example.com  [disabled" in out
         assert "buy now" not in out
+
+
+class TestRefreshCommand:
+    @staticmethod
+    def _real_refresh_no_profile(monkeypatch):
+        from claude_swap import oauth
+
+        monkeypatch.setattr(billing.BillingCache, "refresh", _REAL_REFRESH)
+
+        def no_network(token):
+            raise OSError("no network in tests")
+
+        monkeypatch.setattr(oauth, "request_profile_data", no_network)
+
+    def test_refresh_confirms_a_cancellation_from_claude_ai(self, temp_home, capsys, monkeypatch):
+        from unittest.mock import patch
+
+        from claude_swap import billing_cli
+        from claude_swap import billing_session as bs
+        from tests.test_autoswitch import EngineHarness
+
+        h = EngineHarness(temp_home)
+        h.seed(4, "amin@example.com")
+        self._real_refresh_no_profile(monkeypatch)
+        info = {str(i[0]): i for i in h.switcher._build_accounts_info()}
+        h.switcher._sessions.put(("amin@example.com", info["4"][3] or ""), "sk-test")
+        monkeypatch.setattr(
+            bs, "fetch_subscription_details",
+            lambda key, org: bs.parse_subscription_details(
+                {"status": "active", "plan_ending_at": "2099-11-10T19:47:00Z"}
+            ),
+        )
+        with patch.object(billing_cli, "_switcher", return_value=h.switcher):
+            billing_cli.billing_command(["refresh", "4"])
+        out = capsys.readouterr().out
+        assert "amin@example.com" in out and "(cancelling)" in out
+        assert "cancellation confirmed" in out
+        assert h.switcher.perish_inputs()["4"]["endsAt"] is not None
+
+    def test_without_a_session_nothing_is_confirmed(self, temp_home, capsys, monkeypatch):
+        from unittest.mock import patch
+
+        from claude_swap import billing_cli
+        from tests.test_autoswitch import EngineHarness
+
+        h = EngineHarness(temp_home)
+        h.seed(4, "amin@example.com")
+        self._real_refresh_no_profile(monkeypatch)
+        with patch.object(billing_cli, "_switcher", return_value=h.switcher):
+            billing_cli.billing_command(["refresh"])
+        out = capsys.readouterr().out
+        assert "cannot be confirmed" in out

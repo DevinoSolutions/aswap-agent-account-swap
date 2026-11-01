@@ -39,7 +39,15 @@ from claude_swap.weekly_anchor import normalize_tier, tier_label
 _logger = logging.getLogger("claude-swap")
 
 SUCCESS_TTL_S = 24 * 3600
-EXACT_TTL_S = 6 * 3600
+# A claude.ai session's exact reading is re-read hourly: it is what confirms
+# a cancellation (and an undone one), and consume-first acts on it.
+EXACT_TTL_S = scaled(3600)
+# A confirmed cancellation older than this no longer steers auto: the
+# owner may have resumed the plan since (owner rule 2026-11-01: drain a
+# cancelled account only once the cancellation is confirmed).
+CONFIRM_FRESH_S = 3 * EXACT_TTL_S
+# How often `aswap auto` looks for session slots whose exact reading is due.
+SESSION_BILLING_SCAN_S = scaled(5 * 60)
 # A lapsed subscription can be bought again any minute, so its row is
 # re-checked far sooner than an active one.
 LAPSED_TTL_S = scaled(30 * 60)
@@ -205,6 +213,26 @@ def billing_view(
     if renewing:
         view["nextBillingAt"] = next_renewal(anchor, now_dt).isoformat()
     return view
+
+
+def confirmed_end_ts(record: dict | None, now: float) -> float | None:
+    """When a CONFIRMED cancellation ends the plan, or None.
+
+    Confirmed: an exact claude.ai reading (``plan_ending_at``, see
+    billing_session) taken within ``CONFIRM_FRESH_S``, ending in the future.
+    Estimates never confirm anything.
+    """
+    if not isinstance(record, dict) or record.get("source") != "exact":
+        return None
+    if record.get("cancelAtPeriodEnd") is not True:
+        return None
+    fetched = record.get("fetchedAt")
+    if not isinstance(fetched, (int, float)) or now - fetched > CONFIRM_FRESH_S:
+        return None
+    end = _parse_iso(record.get("currentPeriodEnd") or "")
+    if end is None or end.timestamp() <= now:
+        return None
+    return end.timestamp()
 
 
 def ends_at_ts(view: dict | None) -> float | None:
@@ -407,6 +435,7 @@ class BillingCache:
             ok = exact is not None or result["profile"] is not None
             if ok:
                 _log_lapse_change(num, email, before, row)
+                _log_cancel_change(num, email, before, row)
                 ttl = EXACT_TTL_S if exact is not None else SUCCESS_TTL_S
                 status = row.get("subscriptionStatus")
                 if status is not None and status not in _RENEWING_STATUSES:
@@ -567,6 +596,25 @@ def _log_tier_change(num: str, email: str, before: object, after: object) -> Non
             "💳 Account %s (%s) plan tier changed: %s -> %s",
             num, email, _tier_name(before), _tier_name(after),
         )
+
+
+def _log_cancel_change(num: str, email: str, before: dict | None, after: dict) -> None:
+    """One INFO line when claude.ai confirms a cancellation, or it is undone."""
+    if after.get("source") != "exact":
+        return
+    was = bool(before and before.get("source") == "exact" and before.get("cancelAtPeriodEnd") is True)
+    now = after.get("cancelAtPeriodEnd") is True
+    if was == now:
+        return
+    if now:
+        end = after.get("currentPeriodEnd") or "?"
+        _logger.info(
+            "📅 Account %s (%s): cancellation confirmed by claude.ai, plan ends %s; "
+            "consume-first treats that as its reset",
+            num, email, end,
+        )
+    else:
+        _logger.info("📅 Account %s (%s): no longer cancelling", num, email)
 
 
 def _log_lapse_change(num: str, email: str, before: dict | None, after: dict) -> None:

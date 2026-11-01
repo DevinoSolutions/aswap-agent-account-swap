@@ -293,9 +293,11 @@ _PERIOD_END_KEYS = (
     "period_end",
     "ends_at",
 )
-_CANCEL_FLAG_KEYS = ("cancel_at_period_end", "will_cancel", "is_canceling", "is_cancelling")
-_CANCEL_TS_KEYS = ("cancel_at", "canceled_at", "cancelled_at", "cancels_at")
-_ENDING_KEYS = ("plan_ending_at", "plan_ending_before")
+# Only plan_ending_at confirms a cancellation (owner rule 2026-11-01: auto
+# drains a cancelled account only once the cancellation is confirmed). The
+# endpoint has never sent a Stripe-style cancel flag or cancel timestamp,
+# and plan_ending_before's meaning is unknown, so neither counts.
+_ENDING_KEYS = ("plan_ending_at",)
 _STATUS_KEYS = ("status", "subscription_status")
 _INTERVAL_KEYS = ("billing_interval", "interval", "billing_period")
 
@@ -360,15 +362,7 @@ def parse_subscription_details(payload: object) -> dict:
     out["status"] = status if isinstance(status, str) else None
     interval = _first(payload, _INTERVAL_KEYS)
     out["interval"] = interval if isinstance(interval, str) else None
-    flag = _first(payload, _CANCEL_FLAG_KEYS)
-    if isinstance(flag, bool):
-        out["cancelAtPeriodEnd"] = flag
-    elif _first(payload, _CANCEL_TS_KEYS) is not None and out["status"] in (None, "active", "trialing"):
-        out["cancelAtPeriodEnd"] = True
-    elif out["status"] in ("canceling", "cancelling", "pending_cancellation"):
-        out["cancelAtPeriodEnd"] = True
-    else:
-        out["cancelAtPeriodEnd"] = False if out["periodEnd"] else None
+    out["cancelAtPeriodEnd"] = False if out["periodEnd"] else None
     return out
 
 

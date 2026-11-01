@@ -61,6 +61,7 @@ from claude_swap.billing import (
     LAPSED_RECHECK_S,
     PLAN_RECHECK_MIN_S,
     PLAN_REFRESH_S,
+    SESSION_BILLING_SCAN_S,
     BillingCache,
     billing_text,
     billing_view,
@@ -474,6 +475,7 @@ class ClaudeAccountSwitcher:
         self._billing = BillingCache(
             self.backup_dir / "cache", sessions=self._sessions, anchors=self._anchors
         )
+        self._session_billing_scan_at = float("-inf")
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
@@ -2511,6 +2513,28 @@ class ClaudeAccountSwitcher:
         auto`` tick; a no-op unless something is due.
         """
         self._recheck_lapsed(None, PLAN_REFRESH_S, stagger=True, lapsed_only=False)
+        self._refresh_session_billing()
+
+    def _refresh_session_billing(self) -> None:
+        """Re-read the exact billing of slots with a claude.ai session when due
+        (hourly, ``EXACT_TTL_S``): it is what confirms a cancellation for
+        consume-first, and it must not wait for someone to open the TUI.
+        Looked at once per ``SESSION_BILLING_SCAN_S``; best-effort.
+        """
+        now = time.time()
+        if now - self._session_billing_scan_at < SESSION_BILLING_SCAN_S:
+            return
+        self._session_billing_scan_at = now
+        try:
+            info = [
+                row for row in self._build_accounts_info()
+                if (session := self._sessions.get((row[1], row[3] or "")))
+                and session.get("status") != "expired"
+            ]
+            if info:
+                self._billing.refresh(info)
+        except Exception:
+            self._logger.debug("Session billing re-read failed", exc_info=True)
 
     def recheck_plan_now(self, num: str) -> None:
         """Re-read one slot's plan now (at most once per ``PLAN_RECHECK_MIN_S``)."""
@@ -2638,7 +2662,7 @@ class ClaudeAccountSwitcher:
         """
         from datetime import datetime, timezone
 
-        from claude_swap.billing import ends_at_ts
+        from claude_swap.billing import confirmed_end_ts
         from claude_swap.weekly_anchor import current_anchor, next_occurrence
 
         data = self._get_sequence_data() or {}
@@ -2654,7 +2678,8 @@ class ClaudeAccountSwitcher:
         now_dt = datetime.fromtimestamp(now_ts, timezone.utc)
         out: dict[str, dict] = {}
         for num, identity in identities.items():
-            ends = ends_at_ts(billing_view(records.get(num), now_ts))
+            # Only a confirmed, current cancellation moves consume-first.
+            ends = confirmed_end_ts(records.get(num), now_ts)
             anchor = current_anchor(anchors.get(f"{identity[0]}|{identity[1]}"))
             nxt = next_occurrence(anchor, now_dt).timestamp() if anchor else None
             tier = (records.get(num) or {}).get("rateLimitTier")

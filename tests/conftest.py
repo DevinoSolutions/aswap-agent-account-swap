@@ -705,7 +705,7 @@ def _no_billing_network(monkeypatch):
     """Listings refresh billing anchors over the network; the suite must not.
     test_billing.py restores the real refresh for its own tests."""
     monkeypatch.setattr(
-        "claude_swap.billing.BillingCache.refresh", lambda self, accounts_info: None
+        "claude_swap.billing.BillingCache.refresh", lambda self, accounts_info, force=False: None
     )
 
 

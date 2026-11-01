@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from tests import statefiles
-from claude_swap import oauth, poll_policy
+from claude_swap import billing, oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
@@ -7150,7 +7150,9 @@ class TestConsumeFirstEndingFirst:
         h.make_live("a@example.com", 1)
         return h
 
-    def _ends(self, h: EngineHarness, num: int, email: str, ends: str) -> None:
+    def _ends(
+        self, h: EngineHarness, num: int, email: str, ends: str, age_s: float = 60.0
+    ) -> None:
         h.switcher._billing._save({
             str(num): {
                 "email": email,
@@ -7159,6 +7161,7 @@ class TestConsumeFirstEndingFirst:
                 "subscriptionStatus": "active",
                 "currentPeriodEnd": ends,
                 "cancelAtPeriodEnd": True,
+                "fetchedAt": h.clock.now - age_s,
                 "nextCheckAt": 9e18,
             }
         })
@@ -7173,6 +7176,21 @@ class TestConsumeFirstEndingFirst:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
+
+    def test_a_stale_cancellation_no_longer_steers(self, temp_home):
+        # Owner rule 2026-11-01: only a confirmed, current cancellation counts;
+        # the plan may have been resumed since an old reading.
+        h = self._harness(temp_home)
+        self._ends(
+            h, 3, "c@example.com", "2024-01-02T00:00:00+00:00",
+            age_s=billing.CONFIRM_FRESH_S + 60,
+        )
+        h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert h.active_number() != 3
 
     def test_without_billing_data_ranking_is_unchanged(self, temp_home):
         h = self._harness(temp_home)
