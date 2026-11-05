@@ -2038,6 +2038,13 @@ def main() -> None:
 
         billing_command(argv[1:])
         return
+    if argv and argv[0] == "login":
+        # `aswap login` is the friendly spelling of `aswap billing login`:
+        # capture a claude.ai session and mint a CC OAuth token in one step.
+        from claude_swap.billing_cli import billing_command
+
+        billing_command(["login", *argv[1:]])
+        return
     if argv and argv[0] == "map":
         _map_command(argv[1:])
         return
@@ -2104,6 +2111,7 @@ Commands:
   %(prog)s priority [<num|email>...]  accounts auto uses up first, in order
   %(prog)s codex <command>            manage Codex CLI accounts
   %(prog)s backup [take|list|check|restore|export]  snapshots of state.db; crash restore
+  %(prog)s login [num|email]          sign in: session + CC token in one step
   %(prog)s billing <command>          exact billing, weekly resets, resub plan
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s warmup                     keep five-hour windows ready (opt-in spend)
