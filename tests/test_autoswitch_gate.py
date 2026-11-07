@@ -148,6 +148,36 @@ class TestActiveRidesAnOpenGate:
         assert h.tick_with_usage({"1": _usage(97), **others}) is TickOutcome.NO_ACTION
         assert fake.calls == ["sk-live"]
 
+    def test_the_last_two_points_are_probed_every_few_seconds_at_any_burn(
+        self, temp_home
+    ):
+        # 2026-11-07 laptop: cozy_comfort (20x) at 98% burned a point every
+        # ~3.6 min across both PCs, so the projection never came within
+        # GUARD_PREFETCH_S; the statusline readings it leaned on can be two
+        # minutes old, no 99 reading reached the last-point clock, and four
+        # sessions were refused at 12:10:56, 11 s before auto moved.
+        h = _harness(temp_home, threshold=99.9)
+        fake = _probing({"sk-live": ("allowed", 98.0)})
+        others = {"2": _usage(50), "3": _usage(60)}
+        assert h.tick_with_usage({"1": _usage(98), **others}) is TickOutcome.NO_ACTION
+        assert h.engine._endgame
+        for _ in range(20):
+            delay = h.engine._next_delay(TickOutcome.NO_ACTION)
+            assert ENDGAME_TICK_MIN_S <= delay <= ENDGAME_TICK_MAX_S
+        h.clock.advance(ENDGAME_TICK_MIN_S)
+        assert h.tick_with_usage({"1": _usage(98), **others}) is TickOutcome.NO_ACTION
+        assert fake.calls == ["sk-live"]
+
+    def test_three_points_out_at_no_burn_is_not_the_last_stretch(self, temp_home):
+        h = _harness(temp_home, threshold=99.9)
+        fake = _probing({"sk-live": ("allowed", 97.0)})
+        others = {"2": _usage(50), "3": _usage(60)}
+        h.tick_with_usage({"1": _usage(97), **others})
+        h.clock.advance(ENDGAME_TICK_MIN_S)
+        h.tick_with_usage({"1": _usage(97), **others})
+        assert not h.engine._endgame
+        assert fake.calls == []
+
     def test_failed_reprobes_fall_back_to_the_endpoint(self, temp_home):
         h = _harness(temp_home, threshold=99.9)
         _seen_at_98(h)

@@ -135,6 +135,13 @@ LIVE_MIN_TICK_S = scaled(5.0)
 # to squeeze the last of an account).
 ENDGAME_TICK_MIN_S = scaled(3.0)
 ENDGAME_TICK_MAX_S = scaled(5.0)
+# The last two points are a last stretch whatever the projection says: only
+# a 99 reading starts the last-point clock (edge.py), and a statusline
+# reading can be two minutes old (live_usage.FRESH_S), longer than a point
+# lasts when both machines burn one account. 2026-11-07 laptop: a 20x at
+# 98% projected past GUARD_PREFETCH_S, no 99 reading came in, and four
+# sessions were refused 11 s before auto moved.
+EDGE_WATCH_PCT = edge.LAST_POINT_PCT - 1.0
 # How often a running engine heals damaged state files and checks whether a
 # snapshot is due (snapshots themselves are hourly; see snapshots.py).
 MAINTAIN_INTERVAL_S = scaled(300.0)
@@ -1726,9 +1733,13 @@ class AutoSwitchEngine:
                 and rate > 0
                 and self._time_to_limit <= LIMIT_GUARD_S
             )
-            self._endgame = riding or (
-                self._time_to_limit is not None
-                and self._time_to_limit <= GUARD_PREFETCH_S
+            self._endgame = (
+                riding
+                or EDGE_WATCH_PCT <= utilization < 100.0
+                or (
+                    self._time_to_limit is not None
+                    and self._time_to_limit <= GUARD_PREFETCH_S
+                )
             )
             if utilization < settings.threshold and not self._limit_guard:
                 if current in priority:
