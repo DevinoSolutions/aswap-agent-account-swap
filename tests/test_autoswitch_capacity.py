@@ -396,9 +396,11 @@ class TestLandingRunway:
         assert _switch(h).trigger == "consume-first"
         assert h.active_number() == 2
 
-    def test_consume_first_drains_the_last_point_of_a_sooner_20x(self, temp_home):
-        # 2026-10-29 legal@: a 20x at 99% resetting before the active one.
-        # One point of a 20x is four 5x-points: 80 s at three a minute.
+    def test_consume_first_never_drains_a_sooner_account_reading_99(self, temp_home):
+        # 2026-11-05 18:36 desktop: consume-first drained cool@ at 99% (its
+        # weekly reset an hour sooner, "runway ~2 min") five minutes after
+        # the last-point clock had left it; it was refused 21 s later. A
+        # 99% reading is the last point, which nothing can time (edge.py).
         h = _harness(
             temp_home, {"1": "20x", "2": "20x", "3": "20x"},
             strategy="consume-first", threshold=99.9,
@@ -408,6 +410,22 @@ class TestLandingRunway:
         outcome = h.tick_with_usage({
             "1": _usage7(30, 50, _R_LATER),
             "2": _usage7(0, 99, _R_SOON),
+            "3": _usage7(0, 10, _R_LATER),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_consume_first_drains_a_sooner_account_with_two_points_left(self, temp_home):
+        # One point more than the last one is still a timed drain.
+        h = _harness(
+            temp_home, {"1": "20x", "2": "20x", "3": "20x"},
+            strategy="consume-first", threshold=99.9,
+        )
+        self._burning(h, 50)
+        h.engine._recent_burns = [(h.clock.now - 600, 3.0 / 60)]
+        outcome = h.tick_with_usage({
+            "1": _usage7(30, 50, _R_LATER),
+            "2": _usage7(0, 98, _R_SOON),
             "3": _usage7(0, 10, _R_LATER),
         })
         assert outcome is TickOutcome.SWITCHED
