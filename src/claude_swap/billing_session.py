@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -488,6 +489,48 @@ class CdpBrowser:
             pass
 
 
+_ND_LOOP = None
+
+
+def _nd_run(coro):
+    """Run a nodriver coroutine on the one loop every nodriver call shares.
+
+    A browser stays bound to the loop that started it, and ``asyncio.run``
+    closes its loop on return, so capture and the token mint after it would
+    fail with "Event loop is closed".
+    """
+    import asyncio
+
+    global _ND_LOOP
+    if _ND_LOOP is None or _ND_LOOP.is_closed():
+        _ND_LOOP = asyncio.new_event_loop()
+    return _ND_LOOP.run_until_complete(coro)
+
+
+async def _nd_stop(browser) -> None:
+    """Close Chrome gracefully, then make sure it is gone.
+
+    ``Browser.close`` lets Chrome write its cookie store, so the profile
+    stays signed in for the next ``aswap login``; a bare ``stop()`` kills it
+    first and the session is lost. The pause lets the loop reap the process,
+    or Python prints "unclosed transport" tracebacks at exit.
+    """
+    import asyncio
+
+    from nodriver import cdp
+
+    try:
+        await asyncio.wait_for(browser.connection.send(cdp.browser.close()), 5)
+    except Exception:
+        pass
+    await asyncio.sleep(1.0)
+    try:
+        browser.stop()
+    except Exception:
+        pass
+    await asyncio.sleep(0.5)
+
+
 class NodriverBrowser:
     """nodriver-based browser that bypasses Cloudflare Turnstile.
 
@@ -516,7 +559,7 @@ class NodriverBrowser:
 
     def close(self) -> None:
         try:
-            self._browser.stop()
+            _nd_run(_nd_stop(self._browser))
         except Exception:
             pass
 
@@ -533,6 +576,44 @@ async def _nd_cookies(browser) -> list[dict]:
         }
         for c in raw
     ]
+
+
+_EMAIL_INPUT = "input#email, input[type=email]"
+_CONTINUE_BUTTON = "button[data-testid=continue], button[type=submit]"
+
+
+async def _nd_prefill_email(tab, email: str, out, wait_s: float = 60.0) -> bool:
+    """Type ``email`` into claude.ai's login form and press Continue.
+
+    Best effort: a profile that is already signed in never shows the form,
+    so a missing field just ends the attempt. The field is a React input, so
+    the text goes in through CDP ``Input.insertText`` (keystrokes are lost).
+    """
+    from nodriver import cdp
+
+    try:
+        field = await tab.select(_EMAIL_INPUT, timeout=wait_s)
+        await field.focus()
+        await tab.send(cdp.input_.insert_text(email))
+        button = await tab.select(_CONTINUE_BUTTON, timeout=5)
+        await button.click()
+    except Exception:
+        return False
+    out(f"Entered {email} and pressed Continue — finish with the code or link claude.ai sends.")
+    return True
+
+
+def _start_prefill(tab, email: str | None, out):
+    import asyncio
+
+    if not email or "@" not in email:
+        return None
+    return asyncio.ensure_future(_nd_prefill_email(tab, email, out))
+
+
+def _stop_prefill(task) -> None:
+    if task is not None and not task.done():
+        task.cancel()
 
 
 async def _nd_capture_session(
@@ -561,8 +642,9 @@ async def _nd_capture_session(
         browser_executable_path=str(exe),
         browser_args=["--no-first-run", "--no-default-browser-check"],
     )
-    await browser.get(f"{CLAUDE}/login")
+    tab = await browser.get(f"{CLAUDE}/login")
     out(f"Sign in to claude.ai as {email} in the window that opened (waiting {int(timeout_s)}s)...")
+    prefill = _start_prefill(tab, email, out)
 
     rejected: set[str] = set()
     deadline = time.monotonic() + timeout_s
@@ -583,7 +665,7 @@ async def _nd_capture_session(
                     if org_ok and email_ok:
                         if keep_browser:
                             return key, NodriverBrowser(browser)
-                        browser.stop()
+                        await _nd_stop(browser)
                         return key
                     rejected.add(key)
                     seen = who or ", ".join(str(o.get("name")) for o in orgs) or "another account"
@@ -591,11 +673,13 @@ async def _nd_capture_session(
             await asyncio.sleep(poll_s)
         raise CaptureError(f"timed out after {int(timeout_s)}s waiting for {email} to sign in")
     except CaptureError:
-        browser.stop()
+        await _nd_stop(browser)
         raise
     except Exception as e:
-        browser.stop()
+        await _nd_stop(browser)
         raise CaptureError(f"browser error: {e}") from None
+    finally:
+        _stop_prefill(prefill)
 
 
 async def _nd_capture_any_session(
@@ -623,9 +707,10 @@ async def _nd_capture_any_session(
         browser_executable_path=str(exe),
         browser_args=["--no-first-run", "--no-default-browser-check"],
     )
-    await browser.get(f"{CLAUDE}/login")
+    tab = await browser.get(f"{CLAUDE}/login")
     label = email_hint or "any account"
     out(f"Sign in to claude.ai as {label} in the window that opened (waiting {int(timeout_s)}s)...")
+    prefill = _start_prefill(tab, email_hint, out)
 
     seen_keys: set[str] = set()
     deadline = time.monotonic() + timeout_s
@@ -648,7 +733,7 @@ async def _nd_capture_any_session(
                         )
                         nd = NodriverBrowser(browser) if keep_browser else None
                         if not keep_browser:
-                            browser.stop()
+                            await _nd_stop(browser)
                         return CapturedLogin(
                             session_key=key,
                             email=who,
@@ -659,11 +744,13 @@ async def _nd_capture_any_session(
             await asyncio.sleep(poll_s)
         raise CaptureError(f"timed out after {int(timeout_s)}s waiting for a sign-in")
     except CaptureError:
-        browser.stop()
+        await _nd_stop(browser)
         raise
     except Exception as e:
-        browser.stop()
+        await _nd_stop(browser)
         raise CaptureError(f"browser error: {e}") from None
+    finally:
+        _stop_prefill(prefill)
 
 
 async def _nd_mint_oauth_tokens(
@@ -711,32 +798,29 @@ async def _nd_mint_oauth_tokens(
 
     srv = http.server.HTTPServer(("127.0.0.1", 0), CallbackHandler)
     port = srv.server_address[1]
-    redirect_uri = f"http://127.0.0.1:{port}/callback"
+    redirect_uri = f"http://localhost:{port}/callback"
     srv_thread = threading.Thread(target=srv.handle_request, daemon=True)
     srv_thread.start()
 
-    authorize_params = urllib.parse.urlencode({
-        "response_type": "code",
-        "client_id": _OAUTH_CLIENT_ID,
-        "redirect_uri": redirect_uri,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "scope": _OAUTH_SCOPES,
-    })
-    authorize_url = f"{_OAUTH_AUTHORIZE}?{authorize_params}"
+    state = secrets.token_urlsafe(32)
+    authorize_url = f"{_OAUTH_AUTHORIZE}?{_authorize_query(redirect_uri, challenge, state)}"
 
     try:
-        await nd_browser.get(authorize_url, new_tab=True)
+        tab = await nd_browser.get(authorize_url, new_tab=True)
     except Exception as e:
         srv.server_close()
         raise OAuthError(f"failed to open the authorize URL: {e}")
 
-    out("Obtaining Claude Code token (auto-granting via your session)...")
+    out("Obtaining Claude Code token (approving the consent screen for you)...")
 
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if auth_code:
             break
+        try:
+            await tab.evaluate(_CLICK_AUTHORIZE_JS)
+        except Exception:
+            pass  # page mid-navigation; try again next tick
         if auth_error:
             srv.server_close()
             raise OAuthError(f"authorize failed: {auth_error[0]}")
@@ -756,12 +840,13 @@ async def _nd_mint_oauth_tokens(
         "redirect_uri": redirect_uri,
         "client_id": _OAUTH_CLIENT_ID,
         "code_verifier": verifier,
+        "state": state,
     }).encode()
 
     req = urllib.request.Request(
         _OAUTH_TOKEN,
         data=token_body,
-        headers={"Content-Type": "application/json", "User-Agent": _UA},
+        headers={"Content-Type": "application/json", "User-Agent": _TOKEN_UA},
         method="POST",
     )
     try:
@@ -832,8 +917,7 @@ def capture_session(
         connect = CdpBrowser.connect
 
     if use_nd:
-        import asyncio
-        return asyncio.run(_nd_capture_session(
+        return _nd_run(_nd_capture_session(
             identity, root, chrome, timeout_s, poll_s, keep_browser,
             out, orgs_fetch, email_fetch,
         ))
@@ -945,8 +1029,7 @@ def capture_any_session(
         connect = CdpBrowser.connect
 
     if use_nd:
-        import asyncio
-        return asyncio.run(_nd_capture_any_session(
+        return _nd_run(_nd_capture_any_session(
             root, email_hint, chrome, timeout_s, poll_s, keep_browser,
             out, orgs_fetch, email_fetch,
         ))
@@ -1023,10 +1106,40 @@ def capture_any_session(
 # a valid claude.ai session, producing access + refresh tokens without the
 # user needing a separate ``claude /login``.
 
-_OAUTH_AUTHORIZE = "https://platform.claude.com/oauth/authorize"
+# Claude Code's own subscription (Pro/Max) login: CLAUDE_AI_AUTHORIZE_URL and
+# its claude.ai scope set. platform.claude.com/oauth/authorize is the Console
+# (API key) login and sends a claude.ai session to a separate sign-in page.
+_OAUTH_AUTHORIZE = "https://claude.com/cai/oauth/authorize"
 _OAUTH_TOKEN = "https://platform.claude.com/v1/oauth/token"
 _OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-_OAUTH_SCOPES = "user:inference user:profile user:office"
+# The token endpoint answers 429 to the browser UA claude.ai needs; aswap's
+# own refreshes (oauth.py) send this one and are served.
+_TOKEN_UA = "claude-swap/1.0"
+_OAUTH_SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+
+# The consent page has "Authorize" and "Decline"; the session is already the
+# account being added, so aswap approves it instead of waiting on a click.
+_CLICK_AUTHORIZE_JS = (
+    "(() => { if (!location.pathname.startsWith('/oauth/authorize')) return false;"
+    " const b = [...document.querySelectorAll('button')]"
+    ".find(x => x.innerText.trim() === 'Authorize' && !x.disabled);"
+    " if (b) b.click(); return !!b; })()"
+)
+
+
+def _authorize_query(redirect_uri: str, challenge: str, state: str) -> str:
+    import urllib.parse
+
+    return urllib.parse.urlencode({
+        "code": "true",
+        "client_id": _OAUTH_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": _OAUTH_SCOPES,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    })
 
 
 class OAuthError(BillingSessionError):
@@ -1065,8 +1178,7 @@ def mint_oauth_tokens(
     Works with both ``NodriverBrowser`` and ``CdpBrowser``.
     """
     if isinstance(browser, NodriverBrowser):
-        import asyncio
-        return asyncio.run(_nd_mint_oauth_tokens(browser._browser, timeout_s, out))
+        return _nd_run(_nd_mint_oauth_tokens(browser._browser, timeout_s, out))
     import http.server
     import threading
     import urllib.parse
@@ -1106,21 +1218,14 @@ def mint_oauth_tokens(
 
     srv = http.server.HTTPServer(("127.0.0.1", 0), CallbackHandler)
     port = srv.server_address[1]
-    redirect_uri = f"http://127.0.0.1:{port}/callback"
+    redirect_uri = f"http://localhost:{port}/callback"
 
     srv_thread = threading.Thread(target=srv.handle_request, daemon=True)
     srv_thread.start()
 
     # --- build authorize URL and open in a new tab ---
-    authorize_params = urllib.parse.urlencode({
-        "response_type": "code",
-        "client_id": _OAUTH_CLIENT_ID,
-        "redirect_uri": redirect_uri,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "scope": _OAUTH_SCOPES,
-    })
-    authorize_url = f"{_OAUTH_AUTHORIZE}?{authorize_params}"
+    state = secrets.token_urlsafe(32)
+    authorize_url = f"{_OAUTH_AUTHORIZE}?{_authorize_query(redirect_uri, challenge, state)}"
 
     try:
         if hasattr(browser, "navigate"):
@@ -1158,6 +1263,7 @@ def mint_oauth_tokens(
         "redirect_uri": redirect_uri,
         "client_id": _OAUTH_CLIENT_ID,
         "code_verifier": verifier,
+        "state": state,
     }).encode()
 
     req = urllib.request.Request(
@@ -1165,7 +1271,7 @@ def mint_oauth_tokens(
         data=token_body,
         headers={
             "Content-Type": "application/json",
-            "User-Agent": _UA,
+            "User-Agent": _TOKEN_UA,
         },
         method="POST",
     )
@@ -1184,18 +1290,35 @@ def mint_oauth_tokens(
     return token_data
 
 
-def build_credential_blob(token_data: dict) -> str:
-    """Build the ``~/.claude.json`` credential JSON from a token-endpoint response."""
+_SUBSCRIPTION_TYPES = {
+    "claude_max": "max",
+    "claude_pro": "pro",
+    "claude_team": "team",
+    "claude_enterprise": "enterprise",
+}
+
+
+def build_credential_blob(token_data: dict, profile: dict | None = None) -> str:
+    """Build the ``~/.claude.json`` credential JSON from a token-endpoint response.
+
+    ``profile`` is ``/api/oauth/profile`` for the new token. Claude Code's own
+    login stores the plan from it (``subscriptionType``, ``rateLimitTier``);
+    without them the slot reads as plan-unknown.
+    """
     from datetime import datetime, timezone
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     scopes = token_data.get("scope", "").split() if token_data.get("scope") else []
-    blob = {
-        "claudeAiOauth": {
-            "accessToken": token_data["access_token"],
-            "refreshToken": token_data.get("refresh_token", ""),
-            "expiresAt": now_ms + token_data.get("expires_in", 3600) * 1000,
-            "scopes": scopes,
-        }
+    oauth = {
+        "accessToken": token_data["access_token"],
+        "refreshToken": token_data.get("refresh_token", ""),
+        "expiresAt": now_ms + token_data.get("expires_in", 3600) * 1000,
+        "scopes": scopes,
     }
-    return json.dumps(blob)
+    org = (profile or {}).get("organization") or {}
+    sub = _SUBSCRIPTION_TYPES.get(org.get("organization_type"))
+    if sub:
+        oauth["subscriptionType"] = sub
+    if org.get("rate_limit_tier"):
+        oauth["rateLimitTier"] = org["rate_limit_tier"]
+    return json.dumps({"claudeAiOauth": oauth})

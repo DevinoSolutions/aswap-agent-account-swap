@@ -8,6 +8,7 @@ import sys
 from datetime import datetime, timezone
 
 from claude_swap import billing_session as bs
+from claude_swap import oauth
 from claude_swap import weekly_anchor as wa
 from claude_swap.billing import billing_text
 from claude_swap.printer import accent, dimmed, error, muted
@@ -86,7 +87,11 @@ def _login(sw, args) -> None:
     if mint and browser is not None:
         try:
             token_data = bs.mint_oauth_tokens(browser, out=print)
-            credentials = bs.build_credential_blob(token_data)
+            try:
+                profile = oauth.request_profile_data(token_data["access_token"])
+            except Exception:
+                profile = None  # plan fields stay unset; the token still works
+            credentials = bs.build_credential_blob(token_data, profile)
             if existing_num:
                 # Update existing account credentials in place.
                 with FileLock(sw.lock_file):
@@ -101,7 +106,7 @@ def _login(sw, args) -> None:
                 # New account: inject into live files and call add_account.
                 _inject_and_add(sw, email, org, credentials)
         except bs.OAuthError as e:
-            print(error(f"OAuth token minting failed: {e}"))
+            error(f"OAuth token minting failed: {e}")
             if existing_num:
                 print(dimmed("  session was saved; run 'aswap add' after 'claude /login' to add CC credentials separately"))
             else:
