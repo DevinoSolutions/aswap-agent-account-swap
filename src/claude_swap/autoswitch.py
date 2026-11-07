@@ -3174,9 +3174,14 @@ class AutoSwitchEngine:
                 runway_refused = True
                 continue
             min_runway = LIMIT_GUARD_S + DRAIN_MIN_USE_S if drain else MIN_LANDING_RUNWAY_S
-            if drain and h < 100.0 - edge.LAST_POINT_PCT:
-                # Already in its last point: nothing in it can be timed (see
-                # edge.py), so draining it is a gamble on a refusal.
+            if drain and h <= 100.0 - edge.LAST_POINT_PCT:
+                # Already in its last point (a 99% reading included): nothing
+                # in it can be timed (see edge.py), so draining it gambles on a
+                # refusal for at most half a point. Measured 2026-10-31..11-05
+                # on the desktop: 18 drains onto 99% accounts, 3 refused
+                # outright and 2 more escaped within a minute; 2026-11-05 18:36
+                # drained back onto cool@ five minutes after the clock had left
+                # it, and it was refused 21 s later.
                 runway = 0.0
             elif (
                 trigger != "consume-first"
