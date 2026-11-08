@@ -49,9 +49,10 @@ def pace_mint(root: Path, *, out=print, rng=random.uniform, now=time.time, sleep
     atomic_write_json(path, {"last": now()})
 
 
-def mint_credentials(browser, root: Path, *, out=print) -> str:
+def mint_credentials(browser, root: Path, *, out=print, paced: bool = True) -> str:
     """Mint a fresh token from a signed-in browser; returns Claude Code's credential JSON."""
-    pace_mint(root, out=out)
+    if paced:
+        pace_mint(root, out=out)
     token_data = bs.mint_oauth_tokens(browser, out=out)
     try:
         profile = oauth.request_profile_data(token_data["access_token"])
@@ -126,12 +127,21 @@ def receive(sw, stream=None) -> str:
     return f"Account-{num} ({email}): stored {' and '.join(stored)}"
 
 
-def push_to_hosts(browser, root: Path, email: str, session_key: str | None, hosts, *, out=print) -> int:
-    """Mint one token per host from ``browser`` and send each; returns how many landed."""
+def push_to_hosts(open_browser, root: Path, email: str, session_key: str | None, hosts, *, out=print) -> int:
+    """Mint one token per host and send each; returns how many landed.
+
+    ``open_browser()`` returns a signed-in browser. Chrome runs only for the
+    mint itself: it is opened after the pacing wait and closed right after.
+    """
     landed = 0
     for host in hosts:
         try:
-            credentials = mint_credentials(browser, root, out=out)
+            pace_mint(root, out=out)
+            browser = open_browser()
+            try:
+                credentials = mint_credentials(browser, root, out=out, paced=False)
+            finally:
+                browser.close()
             report = send(host, email, credentials, session_key)
         except bs.SignedOut:
             raise  # no host can get a token from this browser; the caller signs in again
@@ -192,34 +202,28 @@ def _saved_login(sw, identity) -> str | None:
     return key
 
 
-def _sign_in(sw, identity, args):
-    """Ask for a fresh claude.ai sign-in (email prefilled) and save it."""
+def _sign_in(sw, identity, args) -> str:
+    """Ask for a fresh claude.ai sign-in (email prefilled), save it, close the window."""
     print(f"  its claude.ai login has expired or was never saved: sign in as {identity[0]} in the window")
-    key, browser = bs.capture_session(
-        identity, sw.backup_dir, chrome=args.chrome, timeout_s=args.timeout, keep_browser=True,
-    )
+    key = bs.capture_session(identity, sw.backup_dir, chrome=args.chrome, timeout_s=args.timeout)
     sw._sessions.put(identity, key)
-    return key, browser
+    return key
 
 
 def _push_account(sw, identity, hosts, args) -> int:
     email = identity[0]
-    key = _saved_login(sw, identity)
-    if key:
-        browser = bs.open_signed_in(sw.backup_dir, email, key, chrome=args.chrome)
-    else:
-        key, browser = _sign_in(sw, identity, args)
+    key = _saved_login(sw, identity) or _sign_in(sw, identity, args)
+
+    def opener():
+        return bs.open_signed_in(sw.backup_dir, email, key, chrome=args.chrome)
+
     try:
-        try:
-            return push_to_hosts(browser, sw.backup_dir, email, key, hosts)
-        except bs.SignedOut:
-            # The check above passed but claude.ai still wants a sign-in.
-            sw._sessions.mark(identity, "expired")
-            browser.close()
-            key, browser = _sign_in(sw, identity, args)
-            return push_to_hosts(browser, sw.backup_dir, email, key, hosts)
-    finally:
-        browser.close()
+        return push_to_hosts(opener, sw.backup_dir, email, key, hosts)
+    except bs.SignedOut:
+        # The check passed but claude.ai still wants a sign-in.
+        sw._sessions.mark(identity, "expired")
+        key = _sign_in(sw, identity, args)
+        return push_to_hosts(opener, sw.backup_dir, email, key, hosts)
 
 
 def token_command(argv: list[str]) -> None:

@@ -558,6 +558,9 @@ class NodriverBrowser:
         )
 
     def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return  # closing twice would only wait on a Chrome that is gone
+        self._closed = True
         try:
             _nd_run(_nd_stop(self._browser))
         except Exception:

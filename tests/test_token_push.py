@@ -137,17 +137,42 @@ class TestReceive:
 
 
 class TestPushToHosts:
-    def test_each_host_gets_its_own_mint(self, tmp_path: Path, monkeypatch):
-        mints = iter(["blob-1", "blob-2"])
-        monkeypatch.setattr(tp, "mint_credentials", lambda browser, root, out=print: next(mints))
+    def _wire(self, monkeypatch, events):
+        """Record pace / open / mint / close / send in order."""
+        monkeypatch.setattr(tp, "pace_mint", lambda root, out=print: events.append("pace"))
+        n = iter(range(1, 10))
+
+        def mint(browser, root, out=print, paced=True):
+            assert not paced and not browser.closed
+            events.append("mint")
+            return f"blob-{next(n)}"
+
+        monkeypatch.setattr(tp, "mint_credentials", mint)
+
+        class Browser(_FakeBrowser):
+            def close(self):
+                events.append("close")
+                super().close()
+
+        def opener():
+            events.append("open")
+            return Browser()
+
+        return opener
+
+    def test_each_host_gets_its_own_mint_with_chrome_open_only_for_it(self, tmp_path: Path, monkeypatch):
+        events = []
+        opener = self._wire(monkeypatch, events)
         sent = []
         monkeypatch.setattr(tp, "send", lambda host, email, creds, key: sent.append((host, creds)) or "ok")
-        landed = tp.push_to_hosts(object(), tmp_path, "a@example.com", "sk", ["h1", "h2"], out=lambda *_: None)
+        landed = tp.push_to_hosts(opener, tmp_path, "a@example.com", "sk", ["h1", "h2"], out=lambda *_: None)
         assert landed == 2
         assert sent == [("h1", "blob-1"), ("h2", "blob-2")]
+        # The pacing wait happens with Chrome closed.
+        assert events == ["pace", "open", "mint", "close"] * 2
 
     def test_one_failing_host_does_not_stop_the_rest(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setattr(tp, "mint_credentials", lambda browser, root, out=print: "blob")
+        opener = self._wire(monkeypatch, [])
 
         def send(host, email, creds, key):
             if host == "down":
@@ -155,7 +180,19 @@ class TestPushToHosts:
             return "ok"
 
         monkeypatch.setattr(tp, "send", send)
-        assert tp.push_to_hosts(object(), tmp_path, "a@example.com", None, ["down", "up"], out=lambda *_: None) == 1
+        assert tp.push_to_hosts(opener, tmp_path, "a@example.com", None, ["down", "up"], out=lambda *_: None) == 1
+
+    def test_chrome_is_closed_when_the_mint_fails(self, tmp_path: Path, monkeypatch):
+        events = []
+        opener = self._wire(monkeypatch, events)
+
+        def mint(browser, root, out=print, paced=True):
+            raise tp.bs.SignedOut("asked to sign in")
+
+        monkeypatch.setattr(tp, "mint_credentials", mint)
+        with pytest.raises(tp.bs.SignedOut):
+            tp.push_to_hosts(opener, tmp_path, "a@example.com", None, ["h1"], out=lambda *_: None)
+        assert events == ["pace", "open", "close"]
 
 
 class TestPushCommand:
@@ -180,11 +217,12 @@ class TestPushCommand:
             return log["browsers"][-1]
 
         def capture_session(identity, root, chrome=None, timeout_s=0, keep_browser=False):
+            assert not keep_browser  # the sign-in window closes once the login is saved
             log["signed_in"].append((identity, timeout_s))
-            log["browsers"].append(_FakeBrowser())
-            return "sk-fresh", log["browsers"][-1]
+            return "sk-fresh"
 
-        def push_to_hosts(browser, root, email, key, hosts, out=print):
+        def push_to_hosts(open_browser, root, email, key, hosts, out=print):
+            open_browser().close()
             if signed_out_once and not log["signed_in"]:
                 raise tp.bs.SignedOut("asked to sign in")
             log["pushed"].append((key, hosts))
@@ -212,7 +250,7 @@ class TestPushCommand:
     def test_an_expired_login_asks_for_a_sign_in_and_saves_it(self, temp_home: Path, monkeypatch):
         sw, log = self._setup(monkeypatch, orgs=tp.bs.SessionExpired("401"))
         assert self._push(sw) == 0
-        assert log["opened"] == []
+        assert log["opened"] == ["sk-fresh"]
         assert log["signed_in"] == [(self.IDENTITY, 600.0)]
         assert log["pushed"] == [("sk-fresh", ("h1",))]
         assert sw._sessions.get(self.IDENTITY)["sessionKey"] == "sk-fresh"
@@ -230,7 +268,7 @@ class TestPushCommand:
     def test_signed_out_at_the_consent_page_signs_in_and_retries(self, temp_home: Path, monkeypatch):
         sw, log = self._setup(monkeypatch, signed_out_once=True)
         assert self._push(sw) == 0
-        assert log["opened"] == ["sk-saved"]
+        assert log["opened"] == ["sk-saved", "sk-fresh"]
         assert log["signed_in"] == [(self.IDENTITY, 600.0)]
         assert log["pushed"] == [("sk-fresh", ("h1",))]
         assert all(b.closed for b in log["browsers"])
@@ -289,21 +327,31 @@ class _FakeBrowser:
 class TestLoginPushes:
     def _login(self, sw, argv, monkeypatch):
         browser = _FakeBrowser()
+        reopened = []
         monkeypatch.setattr(billing_cli.bs, "capture_session", lambda *a, **kw: ("sk-login", browser))
+
+        def open_signed_in(root, email, key, chrome=None):
+            # The login window must be gone before Chrome is opened again.
+            assert browser.closed
+            reopened.append((email, key))
+            return _FakeBrowser()
+
+        monkeypatch.setattr(billing_cli.bs, "open_signed_in", open_signed_in)
+        monkeypatch.setattr(tp, "pace_mint", lambda root, out=print: None)
         mints = iter([_blob("at-laptop", "rt-laptop"), _blob("at-h1", "rt-h1")])
-        monkeypatch.setattr(tp, "mint_credentials", lambda b, root, out=print: next(mints))
+        monkeypatch.setattr(tp, "mint_credentials", lambda b, root, out=print, paced=True: next(mints))
         sent = []
         monkeypatch.setattr(tp, "send", lambda host, email, creds, key: sent.append((host, creds, key)) or "ok")
         monkeypatch.setattr(sw._billing, "refresh", lambda *a, **kw: None)
         with patch.object(billing_cli, "_switcher", return_value=sw):
             billing_cli.billing_command(argv)
-        return browser, sent
+        return browser, sent, reopened
 
     def test_login_keeps_its_token_and_pushes_a_different_one(self, temp_home: Path, monkeypatch):
         sw = _switcher()
         sw.add_account_from_token("sk-ant-oat01-old", email="a@example.com")
         set_setting(sw.backup_dir, "login.pushTo", "h1")
-        browser, sent = self._login(sw, ["login", "a@example.com"], monkeypatch)
+        browser, sent, reopened = self._login(sw, ["login", "a@example.com"], monkeypatch)
         num, email, _ = sw.resolve_account("a@example.com")
         mine = json.loads(sw._read_account_credentials(num, email))["claudeAiOauth"]
         assert mine["refreshToken"] == "rt-laptop"
@@ -311,13 +359,15 @@ class TestLoginPushes:
             ("h1", "rt-h1", "sk-login"),
         ]
         assert browser.closed
+        assert reopened == [("a@example.com", "sk-login")]
 
     def test_no_push_skips_the_setting(self, temp_home: Path, monkeypatch):
         sw = _switcher()
         sw.add_account_from_token("sk-ant-oat01-old", email="a@example.com")
         set_setting(sw.backup_dir, "login.pushTo", "h1")
-        _browser, sent = self._login(sw, ["login", "a@example.com", "--no-push"], monkeypatch)
-        assert sent == []
+        browser, sent, reopened = self._login(sw, ["login", "a@example.com", "--no-push"], monkeypatch)
+        assert sent == [] and reopened == []
+        assert browser.closed
 
     def test_login_waits_ten_minutes_for_a_sign_in_code(self):
         seen = []

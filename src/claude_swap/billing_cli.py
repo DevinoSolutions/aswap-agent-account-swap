@@ -85,8 +85,12 @@ def _login(sw, args) -> None:
 
     # --- mint an OAuth token and store credentials ---
     if mint and browser is not None:
+        minted = False
         try:
             credentials = tp.mint_credentials(browser, sw.backup_dir)
+            # Chrome is only needed again for another mint; closed, it frees
+            # its memory through the pacing wait before each host's token.
+            browser.close()
             if existing_num:
                 # Update existing account credentials in place.
                 with FileLock(sw.lock_file):
@@ -100,14 +104,7 @@ def _login(sw, args) -> None:
             else:
                 # New account: inject into live files and call add_account.
                 _inject_and_add(sw, email, org, credentials)
-            # Each other machine gets a token of its own (a shared refresh
-            # token would be spent by whichever machine refreshes first).
-            hosts = () if args.no_push else tp.configured_hosts(sw.backup_dir, args.push_to)
-            if hosts:
-                try:
-                    tp.push_to_hosts(browser, sw.backup_dir, email, key, hosts)
-                except bs.SignedOut as e:
-                    error(f"No tokens pushed ({e}); run 'aswap token push {email}'")
+            minted = True
         except bs.OAuthError as e:
             error(f"OAuth token minting failed: {e}")
             if existing_num:
@@ -116,7 +113,18 @@ def _login(sw, args) -> None:
                 print(dimmed("  session was saved but the account was not added to aswap"))
                 print(dimmed(f"  to add it manually: claude /login as {email}, then aswap add"))
         finally:
-            browser.close()
+            browser.close()  # already closed on success; this covers a failed mint
+        # Each other machine gets a token of its own (a shared refresh token
+        # would be spent by whichever machine refreshes first).
+        hosts = () if args.no_push else tp.configured_hosts(sw.backup_dir, args.push_to)
+        if minted and hosts:
+            try:
+                tp.push_to_hosts(
+                    lambda: bs.open_signed_in(sw.backup_dir, email, key, chrome=args.chrome),
+                    sw.backup_dir, email, key, hosts,
+                )
+            except bs.SignedOut as e:
+                error(f"No tokens pushed ({e}); run 'aswap token push {email}'")
     elif not existing_num and not mint:
         print(dimmed(f"  session saved; to add this account: claude /login as {email}, then aswap add"))
 
