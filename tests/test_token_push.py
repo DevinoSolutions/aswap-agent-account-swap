@@ -305,6 +305,46 @@ class TestSignedOutDetection:
         assert not isinstance(e.value, tp.bs.SignedOut)
 
 
+class TestStopChrome:
+    """Closing waits for Chrome to exit and closes its transport, however slow it quits."""
+
+    def test_slow_quitting_chrome_is_reaped(self):
+        import asyncio
+        import sys
+
+        import nodriver  # noqa: F401 - warm the slow import so it cannot pad the pause
+
+        class Connection:
+            async def send(self, cmd):
+                return None
+
+        class Browser:
+            connection = Connection()
+
+            def stop(self):
+                pass  # nodriver's terminate can fail silently; the wait must not rely on it
+
+        async def run():
+            # A "Chrome" that takes 3 s to quit: longer than the old fixed 1.5 s pause.
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", "import time; time.sleep(3)",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            browser = Browser()
+            browser._process = proc
+            await tp.bs._nd_stop(browser)
+            return proc
+
+        loop = asyncio.new_event_loop()
+        try:
+            proc = loop.run_until_complete(run())
+        finally:
+            loop.close()
+        assert proc.returncode is not None
+        assert proc._transport.is_closing()
+
+
 class TestHosts:
     def test_parse_hosts(self):
         assert parse_hosts(" amin-desktop, mac  ,amin-desktop ") == ("amin-desktop", "mac")

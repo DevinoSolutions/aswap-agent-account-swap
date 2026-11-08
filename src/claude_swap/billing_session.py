@@ -512,23 +512,43 @@ async def _nd_stop(browser) -> None:
 
     ``Browser.close`` lets Chrome write its cookie store, so the profile
     stays signed in for the next ``aswap login``; a bare ``stop()`` kills it
-    first and the session is lost. The pause lets the loop reap the process,
-    or Python prints "unclosed transport" tracebacks at exit.
+    first and the session is lost.
+
+    nodriver's ``stop()`` never waits for Chrome nor closes its subprocess
+    transport. A Chrome slower to quit than a fixed pause left that transport
+    open until interpreter exit, where it printed "I/O operation on closed
+    pipe" tracebacks, so this waits for the exit and closes it explicitly.
     """
     import asyncio
 
     from nodriver import cdp
 
+    proc = getattr(browser, "_process", None)
     try:
         await asyncio.wait_for(browser.connection.send(cdp.browser.close()), 5)
     except Exception:
         pass
-    await asyncio.sleep(1.0)
+    await _nd_wait_exit(proc, 10)
     try:
         browser.stop()
     except Exception:
         pass
-    await asyncio.sleep(0.5)
+    await _nd_wait_exit(proc, 5)
+    transport = getattr(proc, "_transport", None)
+    if transport is not None:
+        transport.close()  # kills Chrome if it is somehow still running
+    await asyncio.sleep(0.5)  # lets stop()'s connection-close task and the pipes finish
+
+
+async def _nd_wait_exit(proc, timeout_s: float) -> None:
+    import asyncio
+
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout_s)
+    except Exception:
+        pass
 
 
 class NodriverBrowser:
