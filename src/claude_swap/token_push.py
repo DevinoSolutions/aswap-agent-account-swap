@@ -28,9 +28,6 @@ from claude_swap.settings import atomic_write_json, load_login_settings, parse_h
 
 MINT_GAP_S = (60.0, 90.0)
 PACE_FILE = "oauth_mint_pace.json"
-# A pushed account must already be signed in in its browser profile; this is
-# only how long to let that profile load, not a wait for a human.
-PUSH_OPEN_TIMEOUT_S = 90.0
 
 
 class PushError(Exception):
@@ -168,18 +165,16 @@ def _push(sw, args) -> int:
     for num, email, org in targets:
         identity = (email, org or "")
         print(f"Account-{num}: {accent(email)}")
-        if not sw._sessions.get(identity):
+        key = (sw._sessions.get(identity) or {}).get("sessionKey")
+        if not key:
             print(dimmed(f"  no saved claude.ai login; run 'aswap login {email}' first"))
-            failed += 1
+            failed += len(hosts)
             continue
         try:
-            key, browser = bs.capture_session(
-                identity, sw.backup_dir, chrome=args.chrome,
-                timeout_s=PUSH_OPEN_TIMEOUT_S, keep_browser=True,
-            )
+            browser = bs.open_signed_in(sw.backup_dir, email, key, chrome=args.chrome)
         except bs.BillingSessionError as e:
-            error(f"  could not open its signed-in browser ({e}); run 'aswap login {email}'")
-            failed += 1
+            error(f"  could not open its browser ({e})")
+            failed += len(hosts)
             continue
         try:
             landed = push_to_hosts(browser, sw.backup_dir, email, key, hosts)

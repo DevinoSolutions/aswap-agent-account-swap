@@ -158,6 +158,38 @@ class TestPushToHosts:
         assert tp.push_to_hosts(object(), tmp_path, "a@example.com", None, ["down", "up"], out=lambda *_: None) == 1
 
 
+class TestPushCommand:
+    def test_uses_the_saved_login_never_the_login_page(self, temp_home: Path, monkeypatch):
+        sw = _switcher()
+        sw.add_account_from_token("sk-ant-oat01-old", email="a@example.com")
+        sw._sessions.put(("a@example.com", ""), "sk-saved")
+        opened = []
+        browser = _FakeBrowser()
+        monkeypatch.setattr(tp.bs, "open_signed_in",
+                            lambda root, email, key, chrome=None: opened.append((email, key)) or browser)
+        monkeypatch.setattr(tp.bs, "capture_session", lambda *a, **kw: pytest.fail("login page opened"))
+        pushed = []
+        monkeypatch.setattr(tp, "push_to_hosts",
+                            lambda b, root, email, key, hosts, out=print: pushed.append((email, key, hosts)) or len(hosts))
+        with patch("claude_swap.switcher.ClaudeAccountSwitcher", return_value=sw), \
+                pytest.raises(SystemExit) as done:
+            tp.token_command(["push", "a@example.com", "--to", "h1"])
+        assert done.value.code == 0
+        assert opened == [("a@example.com", "sk-saved")]
+        assert pushed == [("a@example.com", "sk-saved", ("h1",))]
+        assert browser.closed
+
+    def test_an_account_without_a_saved_login_fails(self, temp_home: Path, monkeypatch, capsys):
+        sw = _switcher()
+        sw.add_account_from_token("sk-ant-oat01-old", email="a@example.com")
+        monkeypatch.setattr(tp.bs, "open_signed_in", lambda *a, **kw: pytest.fail("opened a browser"))
+        with patch("claude_swap.switcher.ClaudeAccountSwitcher", return_value=sw), \
+                pytest.raises(SystemExit) as done:
+            tp.token_command(["push", "a@example.com", "--to", "h1"])
+        assert done.value.code == 1
+        assert "aswap login a@example.com" in capsys.readouterr().out
+
+
 class TestHosts:
     def test_parse_hosts(self):
         assert parse_hosts(" amin-desktop, mac  ,amin-desktop ") == ("amin-desktop", "mac")

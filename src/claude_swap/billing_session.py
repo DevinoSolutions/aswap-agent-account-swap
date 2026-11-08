@@ -578,6 +578,41 @@ async def _nd_cookies(browser) -> list[dict]:
     ]
 
 
+async def _nd_open_signed_in(root: Path, email: str, session_key: str, chrome: str | None):
+    import nodriver
+    from nodriver import cdp
+
+    exe = find_chrome(chrome)
+    profile = profile_dir(root, email)
+    profile.mkdir(parents=True, exist_ok=True)
+    browser = await nodriver.start(
+        user_data_dir=str(profile),
+        browser_executable_path=str(exe),
+        browser_args=["--no-first-run", "--no-default-browser-check"],
+    )
+    cookie = cdp.network.CookieParam(
+        name="sessionKey", value=session_key, domain=".claude.ai", path="/",
+        secure=True, http_only=True, same_site=cdp.network.CookieSameSite.LAX,
+        expires=cdp.network.TimeSinceEpoch(time.time() + 30 * 86400),
+    )
+    try:
+        await browser.cookies.set_all([cookie])
+    except Exception as e:
+        await _nd_stop(browser)
+        raise CaptureError(f"could not load the saved claude.ai login into the browser: {e}") from None
+    return NodriverBrowser(browser)
+
+
+def open_signed_in(root: Path, email: str, session_key: str, *, chrome: str | None = None) -> NodriverBrowser:
+    """Open ``email``'s browser profile signed in with a saved claude.ai session.
+
+    For minting without a human: the saved ``sessionKey`` is set as the
+    profile's cookie, so a profile whose own cookie was lost still works and
+    the login page (and its sign-in email) is never involved.
+    """
+    return _nd_run(_nd_open_signed_in(root, email, session_key, chrome))
+
+
 _EMAIL_INPUT = "input#email, input[type=email]"
 _CONTINUE_BUTTON = "button[data-testid=continue], button[type=submit]"
 
