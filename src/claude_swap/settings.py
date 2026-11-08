@@ -117,6 +117,9 @@ class UiSettings:
 
     theme: str = "auto"
     view: str = "combined"
+    # ``aswap list`` order: "slot" (account number) or "priority" (the order
+    # auto prefers switch targets, most preferred first).
+    list_order: str = "slot"
 
 
 @dataclass(frozen=True)
@@ -263,6 +266,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "ui", "view", "view", "choice",
             choices=("combined", "claude", "codex"),
             help="Dashboard view: both providers, or only one",
+        ),
+        SettingSpec(
+            "ui", "listOrder", "list_order", "choice", choices=("slot", "priority"),
+            help="aswap list order: slot number, or auto's switch priority (most preferred first)",
         ),
         SettingSpec(
             "login", "pushTo", "push_to", "string",
@@ -440,7 +447,14 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
             view, default.view,
         )
         view = default.view
-    return UiSettings(theme=theme, view=view)
+    list_order = section.get("listOrder", default.list_order)
+    if list_order not in SETTING_SPECS["ui.listOrder"].choices:
+        _logger.warning(
+            "settings.json: unsupported ui.listOrder %r; using %r",
+            list_order, default.list_order,
+        )
+        list_order = default.list_order
+    return UiSettings(theme=theme, view=view, list_order=list_order)
 
 
 def load_login_settings(backup_root: Path) -> LoginSettings:

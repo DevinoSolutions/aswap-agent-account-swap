@@ -2736,6 +2736,44 @@ class ClaudeAccountSwitcher:
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
 
+    def switch_priority_order(self, accounts_info: list, entries: dict) -> list[str]:
+        """Slots in auto's preference order as a switch target (``ui.listOrder
+        priority``), from the same settings, usage and billing auto reads."""
+        from claude_swap.autoswitch import priority_order, tier_capacity
+        from claude_swap.settings import parse_priority
+
+        settings = load_settings(self.backup_dir)
+        models = parse_model_names(settings.model)
+        nums = [str(i[0]) for i in accounts_info]
+        usage = {
+            n: (entries[n].last_good if entries[n].sentinel is None else None)
+            for n in nums
+        }
+        switchable = set(self.switchable_account_numbers())
+        unusable = {
+            n for n in nums
+            if n not in switchable
+            or (self.account_kind_for(n) == "api_key" and not settings.include_api_key_accounts)
+        }
+        by_email = {str(i[1]).lower(): str(i[0]) for i in accounts_info}
+        priority = [
+            num for name in parse_priority(settings.priority)
+            if (num := name if name in nums else by_email.get(name.lower())) is not None
+        ]
+        perish = self.perish_inputs()
+        return priority_order(
+            nums,
+            consume_first=settings.strategy == "consume-first",
+            usage=usage,
+            headroom={n: oauth.account_headroom(usage[n], models) for n in nums},
+            perish=perish,
+            caps={n: tier_capacity(v["tier"]) for n, v in perish.items() if v.get("tier")},
+            priority=priority,
+            threshold=settings.threshold,
+            unusable=unusable,
+            now=time.time(),
+        )
+
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
 
@@ -7305,7 +7343,19 @@ class ClaudeAccountSwitcher:
             )
 
         seq_data = self._get_sequence_data() or {}
-        print(bolded("Accounts:"))
+        from claude_swap.settings import load_ui_settings
+
+        by_priority = load_ui_settings(self.backup_dir).list_order == "priority"
+        if by_priority:
+            order = self.switch_priority_order(accounts_info, entries)
+            position = {num: i for i, num in enumerate(order)}
+            accounts_info = sorted(accounts_info, key=lambda info: position[str(info[0])])
+            print(bolded("Accounts:") + " " + dimmed(
+                f"(auto's switch priority, {load_settings(self.backup_dir).strategy}: "
+                "first = preferred)"
+            ))
+        else:
+            print(bolded("Accounts:"))
         placement = self._placement_line()
         if placement:
             print(placement)
@@ -7320,7 +7370,8 @@ class ClaudeAccountSwitcher:
             needs_login = self._needs_login_from_data(seq_data, str(num))
             if needs_login:
                 markers += f" {yellowed('(needs login)')}"
-            print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
+            rank = f"{dimmed(f'#{i + 1}')} " if by_priority else ""
+            print(f"  {rank}{num}: {label} {muted(f'[{tag}]')}{markers}")
             bills = billing_text(billing.get(str(num)))
             week = weekly_text(weekly.get(str(num)))
             for line in _usage_entry_lines(entries[str(num)], bills, week):

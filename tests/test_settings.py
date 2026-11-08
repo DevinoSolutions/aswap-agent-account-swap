@@ -229,6 +229,13 @@ class TestUiSettings:
         assert set_setting(tmp_path, "ui.view", "codex") == "codex"
         assert load_ui_settings(tmp_path).view == "codex"
 
+    def test_list_order_round_trips_and_clamps(self, tmp_path: Path):
+        assert load_ui_settings(tmp_path).list_order == "slot"
+        assert set_setting(tmp_path, "ui.listOrder", "priority") == "priority"
+        assert load_ui_settings(tmp_path).list_order == "priority"
+        settings_path(tmp_path).write_text(json.dumps({"ui": {"listOrder": "random"}}))
+        assert load_ui_settings(tmp_path).list_order == "slot"
+
     def test_invalid_theme_does_not_reset_view(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
             json.dumps({"ui": {"theme": "chartreuse", "view": "codex"}})

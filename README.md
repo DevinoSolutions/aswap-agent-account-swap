@@ -398,6 +398,7 @@ aswap config                              # list effective settings ("(default)"
 aswap config get autoswitch.threshold
 aswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 aswap config set ui.view codex             # combined (default), claude, or codex
+aswap config set ui.listOrder priority     # aswap list in auto's switch order (#1 = next pick); default slot
 aswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
 aswap config set profiles.persistent true # keep session profiles logged in across rotations
 aswap config set autoswitch.enabled false # observe only: never change the active account
