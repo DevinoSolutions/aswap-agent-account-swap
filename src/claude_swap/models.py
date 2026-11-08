@@ -162,6 +162,9 @@ class AccountsSnapshot:
     active_number: str | None
     accounts: tuple[AccountSnapshot, ...]
     taken_at: float
+    # True when ``accounts`` is in auto's switch priority (ui.listOrder
+    # priority): views number the rows and label slots "acc #N".
+    ranked: bool = False
 
 
 @dataclass

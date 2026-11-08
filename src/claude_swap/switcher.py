@@ -2390,7 +2390,8 @@ class ClaudeAccountSwitcher:
             )
         from claude_swap.settings import load_ui_settings
 
-        if load_ui_settings(self.backup_dir).list_order == "priority":
+        ranked = load_ui_settings(self.backup_dir).list_order == "priority"
+        if ranked:
             position = {
                 num: i
                 for i, num in enumerate(self.switch_priority_order(accounts_info, entries))
@@ -2400,6 +2401,7 @@ class ClaudeAccountSwitcher:
             active_number=active_number,
             accounts=tuple(accounts),
             taken_at=self._usage_store.clock(),
+            ranked=ranked,
         )
 
     def _billing_views(
@@ -7378,8 +7380,8 @@ class ClaudeAccountSwitcher:
             needs_login = self._needs_login_from_data(seq_data, str(num))
             if needs_login:
                 markers += f" {yellowed('(needs login)')}"
-            rank = f"{dimmed(f'#{i + 1}')} " if by_priority else ""
-            print(f"  {rank}{num}: {label} {muted(f'[{tag}]')}{markers}")
+            slot = f"{i + 1:>2}. acc #{num}" if by_priority else f"{num}"
+            print(f"  {slot}: {label} {muted(f'[{tag}]')}{markers}")
             bills = billing_text(billing.get(str(num)))
             week = weekly_text(weekly.get(str(num)))
             for line in _usage_entry_lines(entries[str(num)], bills, week):

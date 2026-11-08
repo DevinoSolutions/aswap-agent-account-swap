@@ -124,6 +124,7 @@ class FakeSwitcher:
         )
         self.calls: list[tuple] = []
         self.fetch_sets: list[set[str] | None] = []
+        self.ranked = False
 
     # -- surface the TUI consumes ------------------------------------------
 
@@ -133,6 +134,7 @@ class FakeSwitcher:
             active_number=self.active,
             accounts=tuple(self._accounts),
             taken_at=time.time(),
+            ranked=self.ranked,
         )
 
     def current_account_number(self) -> str | None:
@@ -829,6 +831,28 @@ class TestDashboard:
             # the mini line has no bars — bar glyphs only in the active card
             mini_part = panel.split("user2@example.com", 1)[1]
             assert "━" not in mini_part
+            assert "acc #" not in panel
+
+    async def test_ranked_snapshot_numbers_rows_and_labels_slots(self, tmp_path):
+        fake = FakeSwitcher(
+            [
+                make_account(17, active=True, entry=make_entry(10.0, 13.0)),
+                make_account(18, entry=make_entry(0.0, 54.0)),
+                make_account(1, entry=make_entry(0.0, 0.0)),
+            ],
+            tmp_path,
+        )
+        fake.ranked = True
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.widgets import AccountsPanel
+
+            lines = AccountsPanel.render(app.screen.query_one(AccountsPanel)).plain.splitlines()
+            heads = [line.strip() for line in lines if "acc #" in line]
+            assert [h.split("@")[0] for h in heads] == [
+                "1. acc #17  user17", "2. acc #18  user18", "3. acc #1   user1",
+            ]
 
     async def test_disabled_marker_on_active_card_and_mini(self, tmp_path):
         # A disabled account is still shown; it's just annotated so the user
