@@ -2619,6 +2619,30 @@ class TestAccountsSnapshot:
         assert all(acc.usage.sentinel is not None for acc in snap.accounts)
         assert isinstance(snap.taken_at, float)
 
+    def test_priority_list_order_sorts_the_dashboard(self, temp_home, mock_claude_config, monkeypatch):
+        from claude_swap.settings import set_setting
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["sequence"] = [1, 2, 3]
+        data["accounts"] = {
+            "1": {"email": "test@example.com", "uuid": "test-uuid-1234"},
+            "2": {"email": "b@example.com", "uuid": "uuid-2"},
+            "3": {"email": "c@example.com", "uuid": "uuid-3"},
+        }
+        switcher._write_json(switcher.sequence_file, data)
+        monkeypatch.setattr(
+            switcher, "switch_priority_order", lambda info, entries: ["3", "1", "2"]
+        )
+
+        assert [a.number for a in switcher.accounts_snapshot(fetch=set()).accounts] == ["1", "2", "3"]
+        set_setting(switcher.backup_dir, "ui.listOrder", "priority")
+        snap = switcher.accounts_snapshot(fetch=set())
+        assert [a.number for a in snap.accounts] == ["3", "1", "2"]
+        assert snap.active_number == "1"
+
 
 # ---------------------------------------------------------------------------
 # CLI wiring

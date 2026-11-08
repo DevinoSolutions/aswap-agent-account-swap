@@ -2388,6 +2388,14 @@ class ClaudeAccountSwitcher:
                     weekly=weekly.get(n),
                 )
             )
+        from claude_swap.settings import load_ui_settings
+
+        if load_ui_settings(self.backup_dir).list_order == "priority":
+            position = {
+                num: i
+                for i, num in enumerate(self.switch_priority_order(accounts_info, entries))
+            }
+            accounts.sort(key=lambda acc: position[acc.number])
         return AccountsSnapshot(
             active_number=active_number,
             accounts=tuple(accounts),
