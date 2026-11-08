@@ -412,9 +412,17 @@ class TestViews:
         assert view["nextAt"] == "2026-10-17T03:00:00+00:00"
         assert set(view["tiers"]) == {"max_5x", "max_20x"}
         text = wa.weekly_text(view)
-        assert text.startswith("Sat 03:00 UTC")
+        # Stored in UTC, shown in local time.
+        assert "UTC" not in text
+        assert text.startswith(wa.anchor_label({"weekday": 5, "hhmm": "03:00"}))
         assert "· 20x" in text
-        assert "[5x: Thu 10:00 UTC]" in text
+        assert f"[5x: {wa.anchor_label({'weekday': 3, 'hhmm': '10:00'})}]" in text
+
+    def test_anchor_label_is_local_for_people_and_utc_for_machines(self):
+        anchor = {"weekday": 5, "hhmm": "03:00"}  # Sat 03:00 UTC
+        assert wa.anchor_label(anchor, local=False) == "Sat 03:00 UTC"
+        when = wa.next_occurrence(anchor, datetime.now(timezone.utc)).astimezone()
+        assert wa.anchor_label(anchor) == f"{wa.DAY_NAMES[when.weekday()]} {when:%H:%M}"
 
     def test_no_row_no_view(self):
         assert wa.weekly_view(None) is None

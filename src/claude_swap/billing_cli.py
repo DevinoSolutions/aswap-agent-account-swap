@@ -392,6 +392,7 @@ def _plan(sw, args) -> None:
             "state": state,
             "tier": tier,
             "anchor": wa.anchor_label(anchor, local=False),
+            "anchorLocal": wa.anchor_label(anchor),
             "nextResetInHours": round((plan["nextReset"] - now).total_seconds() / 3600, 1),
             "recommendedAt": plan["recommendedAt"].isoformat(),
             "quotas": plan["quotas"],
@@ -415,7 +416,7 @@ def _plan(sw, args) -> None:
         print(dimmed("Nothing to buy, renew differently or upgrade right now."))
         return
     for r in out:
-        print(f"  {r['slot']}: {r['email']}  [{r['state']}, {wa.tier_label(wa.normalize_tier(r['tier']))}]  weekly reset {r['anchor']}")
+        print(f"  {r['slot']}: {r['email']}  [{r['state']}, {wa.tier_label(wa.normalize_tier(r['tier']))}]  weekly reset {r['anchorLocal']}")
         if r["state"] not in ("active", "disabled"):
             when =datetime.fromisoformat(r["recommendedAt"]).astimezone()
             print(f"     buy now -> {r['quotasIfNow']} weekly quotas (next reset in {r['nextResetInHours']}h)")

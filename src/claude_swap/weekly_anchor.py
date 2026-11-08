@@ -122,12 +122,14 @@ def next_occurrence(anchor: dict, now: datetime) -> datetime:
 
 
 def anchor_label(anchor: dict, *, local: bool = True) -> str:
-    """``Thu 23:00 UTC (Thu 19:00 local)``."""
-    utc = f"{DAY_NAMES[anchor['weekday']]} {anchor['hhmm']} UTC"
+    """``Thu 19:00`` in local time, or ``Thu 23:00 UTC`` for machine output.
+
+    Anchors are stored in UTC; people read local time.
+    """
     if not local:
-        return utc
+        return f"{DAY_NAMES[anchor['weekday']]} {anchor['hhmm']} UTC"
     when = next_occurrence(anchor, datetime.now(timezone.utc)).astimezone()
-    return f"{utc} ({DAY_NAMES[when.weekday()]} {when:%H:%M} local)"
+    return f"{DAY_NAMES[when.weekday()]} {when:%H:%M}"
 
 
 def add_months(anchor: datetime, months: int) -> datetime:
@@ -755,7 +757,7 @@ def weekly_view(row: dict | None, now: datetime | None = None) -> dict | None:
 
 
 def weekly_text(view: dict | None) -> str | None:
-    """``Thu 23:00 UTC (Thu 19:00 local) · 20x  [5x: Wed 05:00 UTC]``."""
+    """``Thu 19:00 · 20x  [5x: Wed 01:00]``, in local time."""
     if not view:
         return None
     text = anchor_label(view["anchor"])
@@ -765,7 +767,7 @@ def weekly_text(view: dict | None) -> str | None:
     if view.get("moved"):
         text += " · moved"
     others = [
-        f"{tier_label(name)}: {DAY_NAMES[t['anchor']['weekday']]} {t['anchor']['hhmm']} UTC"
+        f"{tier_label(name)}: {anchor_label(t['anchor'])}"
         for name, t in (view.get("tiers") or {}).items()
         if name not in (tier, UNKNOWN_TIER)
     ]

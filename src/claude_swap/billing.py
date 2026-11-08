@@ -607,7 +607,8 @@ def _log_cancel_change(num: str, email: str, before: dict | None, after: dict) -
     if was == now:
         return
     if now:
-        end = after.get("currentPeriodEnd") or "?"
+        parsed = _parse_iso(after.get("currentPeriodEnd") or "")
+        end = f"{parsed.astimezone():%a %b {parsed.astimezone().day} %H:%M}" if parsed else "?"
         _logger.info(
             "📅 Account %s (%s): cancellation confirmed by claude.ai, plan ends %s; "
             "consume-first treats that as its reset",

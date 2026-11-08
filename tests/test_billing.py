@@ -627,7 +627,7 @@ class TestCancelLog:
             bs,
             "fetch_subscription_details",
             lambda key, org: {
-                "periodEnd": "2099-01-01T00:00:00+00:00",
+                "periodEnd": "2099-01-01T12:00:00+00:00",
                 "cancelAtPeriodEnd": cancelling,
                 "status": "active", "interval": "monthly", "keys": [],
             },
@@ -644,5 +644,8 @@ class TestCancelLog:
         self._refresh(tmp_path, monkeypatch, cache, False)
         lines = [r.getMessage() for r in caplog.records if "📅" in r.getMessage()]
         assert len(lines) == 2
-        assert "cancellation confirmed" in lines[0] and "2099-01-01" in lines[0]
+        # Stored in UTC, logged in local time.
+        local = datetime.fromisoformat("2099-01-01T12:00:00+00:00").astimezone()
+        assert "cancellation confirmed" in lines[0]
+        assert f"plan ends {local:%a %b} {local.day} {local:%H:%M};" in lines[0]
         assert "no longer cancelling" in lines[1]
