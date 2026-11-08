@@ -133,6 +133,8 @@ def push_to_hosts(browser, root: Path, email: str, session_key: str | None, host
         try:
             credentials = mint_credentials(browser, root, out=out)
             report = send(host, email, credentials, session_key)
+        except bs.SignedOut:
+            raise  # no host can get a token from this browser; the caller signs in again
         except (bs.BillingSessionError, PushError) as e:
             error(f"{host}: no token pushed ({e})")
             continue
@@ -165,23 +167,59 @@ def _push(sw, args) -> int:
     for num, email, org in targets:
         identity = (email, org or "")
         print(f"Account-{num}: {accent(email)}")
-        key = (sw._sessions.get(identity) or {}).get("sessionKey")
-        if not key:
-            print(dimmed(f"  no saved claude.ai login; run 'aswap login {email}' first"))
-            failed += len(hosts)
-            continue
         try:
-            browser = bs.open_signed_in(sw.backup_dir, email, key, chrome=args.chrome)
+            landed = _push_account(sw, identity, hosts, args)
         except bs.BillingSessionError as e:
-            error(f"  could not open its browser ({e})")
-            failed += len(hosts)
-            continue
-        try:
-            landed = push_to_hosts(browser, sw.backup_dir, email, key, hosts)
-        finally:
-            browser.close()
+            error(f"  no token pushed ({e})")
+            landed = 0
         failed += len(hosts) - landed
     return 1 if failed else 0
+
+
+def _saved_login(sw, identity) -> str | None:
+    """The saved claude.ai session when it still works (or cannot be checked)."""
+    row = sw._sessions.get(identity) or {}
+    key = row.get("sessionKey")
+    if not key or row.get("status") == "expired":
+        return None
+    try:
+        bs.fetch_organizations(key)
+    except bs.SessionExpired:
+        sw._sessions.mark(identity, "expired")
+        return None
+    except bs.BillingSessionError:
+        pass  # unreachable or rate-limited: the consent page will tell
+    return key
+
+
+def _sign_in(sw, identity, args):
+    """Ask for a fresh claude.ai sign-in (email prefilled) and save it."""
+    print(f"  its claude.ai login has expired or was never saved: sign in as {identity[0]} in the window")
+    key, browser = bs.capture_session(
+        identity, sw.backup_dir, chrome=args.chrome, timeout_s=args.timeout, keep_browser=True,
+    )
+    sw._sessions.put(identity, key)
+    return key, browser
+
+
+def _push_account(sw, identity, hosts, args) -> int:
+    email = identity[0]
+    key = _saved_login(sw, identity)
+    if key:
+        browser = bs.open_signed_in(sw.backup_dir, email, key, chrome=args.chrome)
+    else:
+        key, browser = _sign_in(sw, identity, args)
+    try:
+        try:
+            return push_to_hosts(browser, sw.backup_dir, email, key, hosts)
+        except bs.SignedOut:
+            # The check above passed but claude.ai still wants a sign-in.
+            sw._sessions.mark(identity, "expired")
+            browser.close()
+            key, browser = _sign_in(sw, identity, args)
+            return push_to_hosts(browser, sw.backup_dir, email, key, hosts)
+    finally:
+        browser.close()
 
 
 def token_command(argv: list[str]) -> None:
@@ -199,6 +237,9 @@ def token_command(argv: list[str]) -> None:
     p.add_argument("--all", action="store_true", help="every account")
     p.add_argument("--to", metavar="HOST[,HOST]", help="default: the login.pushTo setting")
     p.add_argument("--chrome", metavar="PATH")
+    # 600 s: a claude.ai sign-in code stays valid for ten minutes.
+    p.add_argument("--timeout", type=float, default=600.0,
+                   help="how long to wait for a sign-in when the saved login has expired")
     sub.add_parser("receive", help="store a pushed token read from stdin (run by push over SSH)")
     args = parser.parse_args(argv)
     if args.action is None:

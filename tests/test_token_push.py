@@ -159,35 +159,112 @@ class TestPushToHosts:
 
 
 class TestPushCommand:
-    def test_uses_the_saved_login_never_the_login_page(self, temp_home: Path, monkeypatch):
-        sw = _switcher()
-        sw.add_account_from_token("sk-ant-oat01-old", email="a@example.com")
-        sw._sessions.put(("a@example.com", ""), "sk-saved")
-        opened = []
-        browser = _FakeBrowser()
-        monkeypatch.setattr(tp.bs, "open_signed_in",
-                            lambda root, email, key, chrome=None: opened.append((email, key)) or browser)
-        monkeypatch.setattr(tp.bs, "capture_session", lambda *a, **kw: pytest.fail("login page opened"))
-        pushed = []
-        monkeypatch.setattr(tp, "push_to_hosts",
-                            lambda b, root, email, key, hosts, out=print: pushed.append((email, key, hosts)) or len(hosts))
-        with patch("claude_swap.switcher.ClaudeAccountSwitcher", return_value=sw), \
-                pytest.raises(SystemExit) as done:
-            tp.token_command(["push", "a@example.com", "--to", "h1"])
-        assert done.value.code == 0
-        assert opened == [("a@example.com", "sk-saved")]
-        assert pushed == [("a@example.com", "sk-saved", ("h1",))]
-        assert browser.closed
+    IDENTITY = ("a@example.com", "")
 
-    def test_an_account_without_a_saved_login_fails(self, temp_home: Path, monkeypatch, capsys):
+    def _setup(self, monkeypatch, *, saved="sk-saved", orgs=None, signed_out_once=False):
+        """A slot, its saved login, and fakes for every browser/network step."""
         sw = _switcher()
         sw.add_account_from_token("sk-ant-oat01-old", email="a@example.com")
-        monkeypatch.setattr(tp.bs, "open_signed_in", lambda *a, **kw: pytest.fail("opened a browser"))
+        if saved:
+            sw._sessions.put(self.IDENTITY, saved)
+        log = {"opened": [], "signed_in": [], "pushed": [], "browsers": []}
+
+        def fetch_orgs(key):
+            if orgs is not None:
+                raise orgs
+            return [{"uuid": "x"}]
+
+        def open_signed_in(root, email, key, chrome=None):
+            log["opened"].append(key)
+            log["browsers"].append(_FakeBrowser())
+            return log["browsers"][-1]
+
+        def capture_session(identity, root, chrome=None, timeout_s=0, keep_browser=False):
+            log["signed_in"].append((identity, timeout_s))
+            log["browsers"].append(_FakeBrowser())
+            return "sk-fresh", log["browsers"][-1]
+
+        def push_to_hosts(browser, root, email, key, hosts, out=print):
+            if signed_out_once and not log["signed_in"]:
+                raise tp.bs.SignedOut("asked to sign in")
+            log["pushed"].append((key, hosts))
+            return len(hosts)
+
+        monkeypatch.setattr(tp.bs, "fetch_organizations", fetch_orgs)
+        monkeypatch.setattr(tp.bs, "open_signed_in", open_signed_in)
+        monkeypatch.setattr(tp.bs, "capture_session", capture_session)
+        monkeypatch.setattr(tp, "push_to_hosts", push_to_hosts)
+        return sw, log
+
+    def _push(self, sw, *extra):
         with patch("claude_swap.switcher.ClaudeAccountSwitcher", return_value=sw), \
                 pytest.raises(SystemExit) as done:
-            tp.token_command(["push", "a@example.com", "--to", "h1"])
-        assert done.value.code == 1
-        assert "aswap login a@example.com" in capsys.readouterr().out
+            tp.token_command(["push", "a@example.com", "--to", "h1", *extra])
+        return done.value.code
+
+    def test_a_working_saved_login_needs_no_sign_in(self, temp_home: Path, monkeypatch):
+        sw, log = self._setup(monkeypatch)
+        assert self._push(sw) == 0
+        assert log["opened"] == ["sk-saved"] and log["signed_in"] == []
+        assert log["pushed"] == [("sk-saved", ("h1",))]
+        assert all(b.closed for b in log["browsers"])
+
+    def test_an_expired_login_asks_for_a_sign_in_and_saves_it(self, temp_home: Path, monkeypatch):
+        sw, log = self._setup(monkeypatch, orgs=tp.bs.SessionExpired("401"))
+        assert self._push(sw) == 0
+        assert log["opened"] == []
+        assert log["signed_in"] == [(self.IDENTITY, 600.0)]
+        assert log["pushed"] == [("sk-fresh", ("h1",))]
+        assert sw._sessions.get(self.IDENTITY)["sessionKey"] == "sk-fresh"
+
+    def test_no_saved_login_asks_for_a_sign_in(self, temp_home: Path, monkeypatch):
+        sw, log = self._setup(monkeypatch, saved=None)
+        assert self._push(sw, "--timeout", "120") == 0
+        assert log["signed_in"] == [(self.IDENTITY, 120.0)]
+
+    def test_unreachable_check_still_tries_the_saved_login(self, temp_home: Path, monkeypatch):
+        sw, log = self._setup(monkeypatch, orgs=tp.bs.SessionBlocked("429"))
+        assert self._push(sw) == 0
+        assert log["opened"] == ["sk-saved"] and log["signed_in"] == []
+
+    def test_signed_out_at_the_consent_page_signs_in_and_retries(self, temp_home: Path, monkeypatch):
+        sw, log = self._setup(monkeypatch, signed_out_once=True)
+        assert self._push(sw) == 0
+        assert log["opened"] == ["sk-saved"]
+        assert log["signed_in"] == [(self.IDENTITY, 600.0)]
+        assert log["pushed"] == [("sk-fresh", ("h1",))]
+        assert all(b.closed for b in log["browsers"])
+
+
+class TestSignedOutDetection:
+    """The mint stops within seconds when the consent page bounces to /login."""
+
+    def _mint(self, on_login_page: bool, timeout_s: float):
+        import asyncio
+
+        class Tab:
+            async def evaluate(self, js):
+                return on_login_page if js == tp.bs._ON_LOGIN_PAGE_JS else False
+
+        class Browser:
+            async def get(self, url, new_tab=False):
+                return Tab()
+
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                tp.bs._nd_mint_oauth_tokens(Browser(), timeout_s=timeout_s, out=lambda *_: None))
+        finally:
+            loop.close()
+
+    def test_login_page_raises_signed_out(self):
+        with pytest.raises(tp.bs.SignedOut):
+            self._mint(on_login_page=True, timeout_s=10.0)
+
+    def test_consent_page_keeps_waiting(self):
+        with pytest.raises(tp.bs.OAuthError, match="timed out") as e:
+            self._mint(on_login_page=False, timeout_s=4.0)
+        assert not isinstance(e.value, tp.bs.SignedOut)
 
 
 class TestHosts:

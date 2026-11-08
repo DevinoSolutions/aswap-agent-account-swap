@@ -104,7 +104,10 @@ def _login(sw, args) -> None:
             # token would be spent by whichever machine refreshes first).
             hosts = () if args.no_push else tp.configured_hosts(sw.backup_dir, args.push_to)
             if hosts:
-                tp.push_to_hosts(browser, sw.backup_dir, email, key, hosts)
+                try:
+                    tp.push_to_hosts(browser, sw.backup_dir, email, key, hosts)
+                except bs.SignedOut as e:
+                    error(f"No tokens pushed ({e}); run 'aswap token push {email}'")
         except bs.OAuthError as e:
             error(f"OAuth token minting failed: {e}")
             if existing_num:

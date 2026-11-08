@@ -849,16 +849,21 @@ async def _nd_mint_oauth_tokens(
     out("Obtaining Claude Code token (approving the consent screen for you)...")
 
     deadline = time.monotonic() + timeout_s
+    on_login = 0
     while time.monotonic() < deadline:
         if auth_code:
             break
         try:
             await tab.evaluate(_CLICK_AUTHORIZE_JS)
+            on_login = on_login + 1 if await tab.evaluate(_ON_LOGIN_PAGE_JS) else 0
         except Exception:
             pass  # page mid-navigation; try again next tick
         if auth_error:
             srv.server_close()
             raise OAuthError(f"authorize failed: {auth_error[0]}")
+        if on_login >= _SIGNED_OUT_TICKS:
+            srv.server_close()
+            raise SignedOut("claude.ai asked to sign in again: the saved login has expired")
         await asyncio.sleep(0.5)
     else:
         srv.server_close()
@@ -1162,6 +1167,12 @@ _CLICK_AUTHORIZE_JS = (
 )
 
 
+# A signed-out browser is sent from the consent page to claude.ai/login. Seen
+# for 3 s straight (not a redirect passing through), the mint stops waiting.
+_ON_LOGIN_PAGE_JS = "location.hostname.endsWith('claude.ai') && location.pathname.startsWith('/login')"
+_SIGNED_OUT_TICKS = 6
+
+
 def _authorize_query(redirect_uri: str, challenge: str, state: str) -> str:
     import urllib.parse
 
@@ -1179,6 +1190,10 @@ def _authorize_query(redirect_uri: str, challenge: str, state: str) -> str:
 
 class OAuthError(BillingSessionError):
     """The OAuth token minting flow failed."""
+
+
+class SignedOut(OAuthError):
+    """The browser's claude.ai login is gone: the consent page sent it to sign in."""
 
 
 def _generate_pkce() -> tuple[str, str]:
