@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timezone
 
 from claude_swap import billing_session as bs
-from claude_swap import oauth
+from claude_swap import token_push as tp
 from claude_swap import weekly_anchor as wa
 from claude_swap.billing import billing_text
 from claude_swap.printer import accent, dimmed, error, muted
@@ -86,12 +86,7 @@ def _login(sw, args) -> None:
     # --- mint an OAuth token and store credentials ---
     if mint and browser is not None:
         try:
-            token_data = bs.mint_oauth_tokens(browser, out=print)
-            try:
-                profile = oauth.request_profile_data(token_data["access_token"])
-            except Exception:
-                profile = None  # plan fields stay unset; the token still works
-            credentials = bs.build_credential_blob(token_data, profile)
+            credentials = tp.mint_credentials(browser, sw.backup_dir)
             if existing_num:
                 # Update existing account credentials in place.
                 with FileLock(sw.lock_file):
@@ -105,6 +100,11 @@ def _login(sw, args) -> None:
             else:
                 # New account: inject into live files and call add_account.
                 _inject_and_add(sw, email, org, credentials)
+            # Each other machine gets a token of its own (a shared refresh
+            # token would be spent by whichever machine refreshes first).
+            hosts = () if args.no_push else tp.configured_hosts(sw.backup_dir, args.push_to)
+            if hosts:
+                tp.push_to_hosts(browser, sw.backup_dir, email, key, hosts)
         except bs.OAuthError as e:
             error(f"OAuth token minting failed: {e}")
             if existing_num:
@@ -437,9 +437,13 @@ def billing_command(argv: list[str]) -> None:
     p.add_argument("account", nargs="?", metavar="NUM|EMAIL",
                    help="existing slot/email, or a new email; omit to sign in as anyone")
     p.add_argument("--chrome", metavar="PATH")
-    p.add_argument("--timeout", type=float, default=300.0)
+    # 600 s: a claude.ai sign-in code stays valid for ten minutes.
+    p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--no-token", action="store_true",
                    help="skip minting a Claude Code OAuth token (session only)")
+    p.add_argument("--push-to", metavar="HOST[,HOST]",
+                   help="also give these SSH hosts a token of their own (default: login.pushTo)")
+    p.add_argument("--no-push", action="store_true", help="skip login.pushTo for this login")
     p = sub.add_parser("status", help="sessions, billing and weekly reset per account")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser(

@@ -15,6 +15,7 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    LoginSettings,
     ProfileSettings,
     UiSettings,
     effective_settings,
@@ -261,6 +262,7 @@ class TestSettingSpecs:
             "autoswitch": AutoSwitchSettings(),
             "profiles": ProfileSettings(),
             "ui": UiSettings(),
+            "login": LoginSettings(),
         }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)

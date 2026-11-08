@@ -2045,6 +2045,11 @@ def main() -> None:
 
         billing_command(["login", *argv[1:]])
         return
+    if argv and argv[0] == "token":
+        from claude_swap.token_push import token_command
+
+        token_command(argv[1:])
+        return
     if argv and argv[0] == "map":
         _map_command(argv[1:])
         return
