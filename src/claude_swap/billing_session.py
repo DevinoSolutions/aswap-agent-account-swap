@@ -640,15 +640,15 @@ _EMAIL_INPUT = "input#email, input[type=email]"
 _CONTINUE_BUTTON = "button[data-testid=continue], button[type=submit]"
 
 
-async def _nd_prefill_email(tab, email: str, out, wait_s: float = 60.0, inbox_config=None) -> bool:
+async def _nd_prefill_email(tab, email: str, out, wait_s: float = 60.0, inbox_root: Path | None = None) -> bool:
     """Type ``email`` into claude.ai's login form and press Continue.
 
     Best effort: a profile that is already signed in never shows the form,
     so a missing field just ends the attempt. The field is a React input, so
     the text goes in through CDP ``Input.insertText`` (keystrokes are lost).
 
-    With a login inbox configured (``aswap inbox set``), the magic link
-    claude.ai mails is read from that inbox and opened in this tab.
+    With login mailboxes connected (``aswap inbox add``), the magic link
+    claude.ai mails is read from them and opened in this tab.
     """
     import asyncio
     import threading
@@ -659,12 +659,11 @@ async def _nd_prefill_email(tab, email: str, out, wait_s: float = 60.0, inbox_co
         field = await tab.select(_EMAIL_INPUT, timeout=wait_s)
     except Exception:
         return False
-    inbox = await asyncio.to_thread(_open_inbox, inbox_config, out)
+    sources, snapshots = await asyncio.to_thread(_snapshot_inboxes, inbox_root, out)
     # Set when this task ends (a manual sign-in cancels it), so the polling
     # thread stops instead of holding the process open until its timeout.
     stop = threading.Event()
     try:
-        after_uid = await asyncio.to_thread(inbox.latest_uid) if inbox else 0
         try:
             await field.focus()
             await tab.send(cdp.input_.insert_text(email))
@@ -672,19 +671,20 @@ async def _nd_prefill_email(tab, email: str, out, wait_s: float = 60.0, inbox_co
             await button.click()
         except Exception:
             return False
-        if inbox is None:
+        if not sources:
             out(f"Entered {email} and pressed Continue — finish with the code or link claude.ai sends.")
             return True
-        out(f"Entered {email} and pressed Continue — watching {inbox.config.user} for the sign-in link...")
-        link = await asyncio.to_thread(_await_link, inbox, email, after_uid, stop)
-        inbox = None  # _await_link closed it
+        watched = ", ".join(s.address for s in sources)
+        out(f"Entered {email} and pressed Continue — watching {watched} for the sign-in link...")
+        link = await asyncio.to_thread(_await_link, sources, email, snapshots, stop, out)
+        sources = []  # _await_link closed them
     except Exception as e:  # inbox trouble never blocks a manual sign-in
         out(f"Login inbox: {e} — finish with the code or link claude.ai sends.")
         return True
     finally:
         stop.set()
-        if inbox is not None:
-            inbox.close()
+        for source in sources:
+            source.close()
     if not link:
         out("No sign-in link reached the login inbox — finish with the code or link claude.ai sends.")
         return True
@@ -693,38 +693,42 @@ async def _nd_prefill_email(tab, email: str, out, wait_s: float = 60.0, inbox_co
     return True
 
 
-def _await_link(inbox, email: str, after_uid: int, stop) -> str | None:
-    """Wait on its own thread for the link, then close the inbox there."""
-    try:
-        return inbox.wait_for_link(
-            email, after_uid, stop=stop.is_set, sleep=stop.wait,
-        )
-    finally:
-        inbox.close()
-
-
-def _open_inbox(config, out):
-    """An ``Inbox`` on ``config``, or None (unset, or unreachable: reported)."""
+def _snapshot_inboxes(root: Path | None, out) -> tuple[list, list]:
+    """Open every connected mailbox and note what it holds before Continue."""
     from claude_swap import inbox
 
-    if config is None:
-        return None
+    if root is None:
+        return [], []
+    sources, snapshots = [], []
+    for source in inbox.open_sources(root, out):
+        try:
+            snapshots.append(source.snapshot())
+            sources.append(source)
+        except inbox.InboxError as e:
+            out(f"Login inbox {source.address} unreadable ({e}) — skipping it.")
+            source.close()
+    return sources, snapshots
+
+
+def _await_link(sources: list, email: str, snapshots: list, stop, out) -> str | None:
+    """Wait on its own thread for the link, then close the mailboxes there."""
+    from claude_swap import inbox
+
     try:
-        return inbox.Inbox(config)
-    except inbox.InboxError as e:
-        out(f"Login inbox unreachable ({e}) — sign in by hand.")
-        return None
+        return inbox.wait_for_link(
+            sources, email, snapshots, stop=stop.is_set, sleep=stop.wait, out=out,
+        )
+    finally:
+        for source in sources:
+            source.close()
 
 
 def _start_prefill(tab, email: str | None, out, root: Path | None = None):
     import asyncio
 
-    from claude_swap.inbox import load_inbox
-
     if not email or "@" not in email:
         return None
-    config = load_inbox(root) if root is not None else None
-    return asyncio.ensure_future(_nd_prefill_email(tab, email, out, inbox_config=config))
+    return asyncio.ensure_future(_nd_prefill_email(tab, email, out, inbox_root=root))
 
 
 def _stop_prefill(task) -> None:

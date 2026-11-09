@@ -1,18 +1,21 @@
-"""Read claude.ai sign-in links from a shared IMAP inbox.
+"""Read claude.ai sign-in links from your own mailboxes.
 
-Every account's Anthropic mail is forwarded to one mailbox (``aswap inbox
-set``). After ``aswap login`` presses Continue, aswap watches that mailbox
-for the magic link claude.ai just sent and opens it in the login window, so
-signing in needs no hands.
+You forward each account's Anthropic mail (with your mail provider's own
+rules) to one or more mailboxes and connect them with ``aswap inbox add``:
+Gmail and Outlook through OAuth with read-only mail access, or any server
+over IMAP. After ``aswap login`` presses Continue, aswap watches every
+connected mailbox for the magic link claude.ai just sent and opens it in the
+login window, so signing in needs no hands.
 
 A link is ``https://claude.ai/magic-link#<nonce>:<base64 email>``: the email
 it signs in is inside the link, so a forwarded copy is matched by its own
-link, not by headers a forwarder may rewrite. Only messages that arrive after
-the request (a higher IMAP UID than the inbox held before Continue) count, so
-an older, already-used link is never opened.
+link, not by headers a forwarder may rewrite. Only mail that arrives after
+the request counts (each mailbox is snapshotted before Continue), so an
+older, already-used link is never opened.
 
-The IMAP password is as sensitive as the session keys beside it: stored in
-``<root>/login_inbox.json`` the same way, never logged, never printed.
+Mailbox credentials (IMAP passwords, OAuth refresh tokens) are as sensitive
+as the session keys beside them: stored in ``<root>/login_inbox.json`` the
+same way, never logged, never printed.
 """
 
 from __future__ import annotations
@@ -29,63 +32,99 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap import statedb
+from claude_swap.locking import FileLock
 from claude_swap.settings import atomic_write_json
 
 FILE_NAME = "login_inbox.json"
 DEFAULT_HOST = "imap.gmail.com"
 SENDER_DOMAIN = "mail.anthropic.com"
+KINDS = ("google", "outlook", "imap")
 
 _LINK = re.compile(r"https://claude\.ai/magic-link#[0-9A-Za-z]+:[0-9A-Za-z+/=_-]+")
 
 
 class InboxError(Exception):
-    """The inbox could not be reached or read."""
+    """A mailbox could not be reached or read."""
 
 
-@dataclass(frozen=True)
-class InboxConfig:
-    user: str
-    password: str
-    host: str = DEFAULT_HOST
-    port: int = 993
+# --- store -------------------------------------------------------------------
+#
+# {"version": 2, "sources": [{"kind": "google"|"outlook"|"imap",
+#                             "address": ..., <kind-specific fields>}, ...]}
+# Version 1 held a single IMAP mailbox at the top level.
 
 
 def _path(root: Path) -> Path:
     return Path(root) / FILE_NAME
 
 
-def load_inbox(root: Path) -> InboxConfig | None:
-    """The configured inbox, or None when ``aswap inbox set`` never ran."""
+def _lock(root: Path) -> FileLock:
+    return FileLock(Path(root) / ".login_inbox.lock")
+
+
+def _valid(row: object) -> bool:
+    return (
+        isinstance(row, dict)
+        and row.get("kind") in KINDS
+        and isinstance(row.get("address"), str)
+        and bool(row["address"])
+    )
+
+
+def load_sources(root: Path) -> list[dict]:
+    """Every connected mailbox; empty when none (or the file is unreadable)."""
     try:
         raw = json.loads(statedb.read_text(_path(root)))
     except (OSError, ValueError, UnicodeDecodeError):
-        return None
+        return []
     if not isinstance(raw, dict):
-        return None
-    user, password = raw.get("user"), raw.get("password")
-    if not (isinstance(user, str) and user and isinstance(password, str) and password):
-        return None
-    host = raw.get("host") if isinstance(raw.get("host"), str) and raw.get("host") else DEFAULT_HOST
-    port = raw.get("port") if isinstance(raw.get("port"), int) else 993
-    return InboxConfig(user=user, password=password, host=host, port=port)
+        return []
+    if "sources" not in raw and isinstance(raw.get("user"), str):  # version 1
+        raw = {"sources": [{"kind": "imap", "address": raw["user"], **raw}]}
+    rows = raw.get("sources")
+    return [r for r in rows if _valid(r)] if isinstance(rows, list) else []
 
 
-def save_inbox(root: Path, config: InboxConfig) -> None:
-    atomic_write_json(_path(root), {
-        "version": 1,
-        "user": config.user,
-        "password": config.password,
-        "host": config.host,
-        "port": config.port,
-    })
+def _save(root: Path, rows: list[dict]) -> None:
+    atomic_write_json(_path(root), {"version": 2, "sources": rows})
 
 
-def forget_inbox(root: Path) -> bool:
-    try:
-        _path(root).unlink()
-    except FileNotFoundError:
-        return False
-    return True
+def _same(row: dict, kind: str, address: str) -> bool:
+    return row["kind"] == kind and row["address"].lower() == address.lower()
+
+
+def add_source(root: Path, row: dict) -> None:
+    """Connect a mailbox, replacing an earlier connection to the same one."""
+    with _lock(root):
+        rows = [r for r in load_sources(root) if not _same(r, row["kind"], row["address"])]
+        _save(root, [*rows, row])
+
+
+def update_source(root: Path, kind: str, address: str, **fields) -> None:
+    """Merge ``fields`` into one connection (a rotated refresh token)."""
+    with _lock(root):
+        rows = load_sources(root)
+        for r in rows:
+            if _same(r, kind, address):
+                r.update(fields)
+        _save(root, rows)
+
+
+def remove_sources(root: Path, address: str | None) -> int:
+    """Disconnect the mailbox at ``address`` (every mailbox when None)."""
+    with _lock(root):
+        rows = load_sources(root)
+        keep = [] if address is None else [
+            r for r in rows if r["address"].lower() != address.lower()
+        ]
+        if keep:
+            _save(root, keep)
+        else:
+            try:
+                _path(root).unlink()
+            except FileNotFoundError:
+                pass
+        return len(rows) - len(keep)
 
 
 # --- parsing -----------------------------------------------------------------
@@ -105,6 +144,11 @@ def link_email(link: str) -> str | None:
     return None
 
 
+def text_links(text: str) -> list[str]:
+    """Every claude.ai magic link in ``text``, in order, without repeats."""
+    return list(dict.fromkeys(_LINK.findall(text)))
+
+
 def message_links(raw: bytes) -> list[str]:
     """Every claude.ai magic link in one RFC 822 message, in order."""
     msg = email.message_from_bytes(raw, policy=email.policy.default)
@@ -116,27 +160,62 @@ def message_links(raw: bytes) -> list[str]:
             text = part.get_content()
         except (LookupError, ValueError):
             continue
-        for link in _LINK.findall(text):
+        for link in text_links(text):
             if link not in found:
                 found.append(link)
     return found
 
 
-def _sender_ok(raw: bytes) -> bool:
-    """From Anthropic, either directly or as a forward that kept the sender."""
-    msg = email.message_from_bytes(raw, policy=email.policy.default)
-    headers = " ".join(str(msg.get(h, "")) for h in ("From", "X-Original-Sender", "Reply-To"))
-    return SENDER_DOMAIN in headers.lower() or b"@" + SENDER_DOMAIN.encode() in raw
+def from_anthropic(text: str | bytes) -> bool:
+    """Sent by Anthropic, directly or as a forward (which keeps the original
+    sender's address, or its mail.anthropic.com links, in the body)."""
+    if isinstance(text, bytes):
+        return SENDER_DOMAIN.encode() in text.lower()
+    return SENDER_DOMAIN in text.lower()
 
 
-# --- IMAP --------------------------------------------------------------------
+def pick_link(links: list[str], account_email: str) -> str | None:
+    """The last of ``links`` that signs in ``account_email``."""
+    want = account_email.strip().lower()
+    return next((link for link in reversed(links) if link_email(link) == want), None)
+
+
+# --- sources -------------------------------------------------------------------
+#
+# A source is one connected mailbox: ``address``, ``snapshot()`` (what the
+# mailbox holds now), ``find_link(email, snapshot)`` (a link that arrived
+# since) and ``close()``. IMAP lives here; Gmail and Outlook in inbox_oauth.
+
+
+@dataclass(frozen=True)
+class InboxConfig:
+    """An IMAP mailbox."""
+
+    user: str
+    password: str
+    host: str = DEFAULT_HOST
+    port: int = 993
+
+
+def imap_row(config: InboxConfig) -> dict:
+    return {
+        "kind": "imap", "address": config.user, "password": config.password,
+        "host": config.host, "port": config.port,
+    }
+
+
+def _imap_config(row: dict) -> InboxConfig:
+    host = row.get("host") if isinstance(row.get("host"), str) and row.get("host") else DEFAULT_HOST
+    port = row.get("port") if isinstance(row.get("port"), int) else 993
+    return InboxConfig(user=row["address"], password=str(row.get("password") or ""), host=host, port=port)
 
 
 class Inbox:
-    """One IMAP connection to the shared login inbox (INBOX folder)."""
+    """One IMAP connection to a mailbox's INBOX folder."""
 
     def __init__(self, config: InboxConfig, *, imap_factory=imaplib.IMAP4_SSL) -> None:
         self.config = config
+        self.address = config.user
         try:
             self._imap = imap_factory(config.host, config.port, timeout=30)
             self._imap.login(config.user, config.password)
@@ -171,6 +250,8 @@ class Inbox:
         uids = self._uids("ALL")
         return uids[-1] if uids else 0
 
+    snapshot = latest_uid
+
     def _fetch(self, uid: int) -> bytes | None:
         try:
             status, data = self._imap.uid("FETCH", str(uid), "(BODY.PEEK[])")
@@ -185,42 +266,73 @@ class Inbox:
 
     def find_link(self, account_email: str, after_uid: int) -> str | None:
         """Newest magic link for ``account_email`` in mail newer than ``after_uid``."""
-        want = account_email.strip().lower()
         for uid in reversed(self._uids(f"UID {after_uid + 1}:*")):
             if uid <= after_uid:  # "N:*" always returns the last message
                 continue
             raw = self._fetch(uid)
-            if raw is None or not _sender_ok(raw):
+            if raw is None or not from_anthropic(raw):
                 continue
-            for link in reversed(message_links(raw)):
-                if link_email(link) == want:
-                    return link
-        return None
-
-    def wait_for_link(
-        self,
-        account_email: str,
-        after_uid: int,
-        *,
-        timeout_s: float = 180.0,
-        poll_s: float = 4.0,
-        stop=lambda: False,
-        clock=time.monotonic,
-        sleep=time.sleep,
-    ) -> str | None:
-        """Poll until the link arrives; None when ``timeout_s`` runs out or
-        ``stop()`` turns true."""
-        deadline = clock() + timeout_s
-        while not stop():
-            link = self.find_link(account_email, after_uid)
-            if link or clock() >= deadline:
+            link = pick_link(message_links(raw), account_email)
+            if link:
                 return link
-            sleep(poll_s)
         return None
 
     def anthropic_count(self) -> int:
         """How many messages from Anthropic the inbox holds."""
         return len(self._uids(f'FROM "{SENDER_DOMAIN}"'))
+
+
+def open_source(root: Path, row: dict):
+    """A live source for one stored connection (raises InboxError)."""
+    if row["kind"] == "imap":
+        return Inbox(_imap_config(row))
+    from claude_swap import inbox_oauth
+
+    return inbox_oauth.open_api_source(root, row)
+
+
+def open_sources(root: Path, out) -> list:
+    """Every connected mailbox that answers; one that does not is reported."""
+    sources = []
+    for row in load_sources(root):
+        try:
+            sources.append(open_source(root, row))
+        except InboxError as e:
+            out(f"Login inbox {row['address']} unreachable ({e}) — skipping it.")
+    return sources
+
+
+def wait_for_link(
+    sources: list,
+    account_email: str,
+    snapshots: list,
+    *,
+    timeout_s: float = 180.0,
+    poll_s: float = 4.0,
+    stop=lambda: False,
+    out=lambda _m: None,
+    clock=time.monotonic,
+    sleep=time.sleep,
+) -> str | None:
+    """Poll every source until one holds the link; None when ``timeout_s``
+    runs out, ``stop()`` turns true or every source has failed."""
+    live = list(zip(sources, snapshots))
+    deadline = clock() + timeout_s
+    while live and not stop():
+        for pair in list(live):
+            source, snap = pair
+            try:
+                link = source.find_link(account_email, snap)
+            except InboxError as e:
+                out(f"Login inbox {source.address}: {e} — no longer watching it.")
+                live.remove(pair)
+                continue
+            if link:
+                return link
+        if clock() >= deadline:
+            return None
+        sleep(poll_s)
+    return None
 
 
 # --- CLI -----------------------------------------------------------------------
@@ -231,61 +343,104 @@ def inbox_command(argv: list[str]) -> None:
     import getpass
     import sys
 
-    from claude_swap.printer import accent, error
+    from claude_swap.printer import accent, dimmed, error
     from claude_swap.switcher import ClaudeAccountSwitcher
 
     parser = argparse.ArgumentParser(
         prog="aswap inbox",
-        description="The shared mailbox aswap login reads claude.ai sign-in links from.",
+        description=(
+            "Mailboxes aswap login reads claude.ai sign-in links from. Forward each "
+            "account's mail from mail.anthropic.com to one of them with your mail "
+            "provider's rules."
+        ),
     )
     sub = parser.add_subparsers(dest="action")
-    p = sub.add_parser("set", help="save the mailbox and its IMAP (app) password")
-    p.add_argument("user", metavar="EMAIL")
-    p.add_argument("--host", default=DEFAULT_HOST, help=f"IMAP server (default {DEFAULT_HOST})")
-    p.add_argument("--port", type=int, default=993)
-    p.add_argument("--password-stdin", action="store_true",
+    add = sub.add_parser("add", help="connect a mailbox (several are fine)")
+    kinds = add.add_subparsers(dest="kind")
+    g = kinds.add_parser("google", help="Gmail / Google Workspace, read-only OAuth (gmail.readonly)")
+    g.add_argument("--client-file", metavar="PATH",
+                   help="OAuth client JSON downloaded from Google Cloud (Desktop app)")
+    g.add_argument("--client-id")
+    g.add_argument("--client-secret")
+    g.add_argument("--hint", metavar="EMAIL", help="the address to sign in with")
+    o = kinds.add_parser("outlook", help="Outlook.com / Microsoft 365, read-only OAuth (Mail.Read)")
+    o.add_argument("--client-id", help="Application (client) ID of your Entra app registration")
+    o.add_argument("--tenant", help="common (default), consumers, organizations or a tenant ID")
+    o.add_argument("--hint", metavar="EMAIL", help="the address to sign in with")
+    i = kinds.add_parser("imap", help="any IMAP server, with a (app) password")
+    i.add_argument("user", metavar="EMAIL")
+    i.add_argument("--host", default=DEFAULT_HOST, help=f"IMAP server (default {DEFAULT_HOST})")
+    i.add_argument("--port", type=int, default=993)
+    i.add_argument("--password-stdin", action="store_true",
                    help="read the password from stdin instead of prompting")
-    sub.add_parser("test", help="sign in to the mailbox and count Anthropic mail")
-    sub.add_parser("show", help="print the configured mailbox (never the password)")
-    sub.add_parser("forget", help="delete the saved mailbox and password")
+    sub.add_parser("list", help="the connected mailboxes (never their credentials)")
+    sub.add_parser("test", help="read each connected mailbox once")
+    rm = sub.add_parser("remove", help="disconnect a mailbox and delete its credentials")
+    rm.add_argument("address", nargs="?", metavar="EMAIL")
+    rm.add_argument("--all", action="store_true", help="every mailbox")
     args = parser.parse_args(argv)
     if args.action is None:
-        parser.error("a subcommand is required: set, test, show, forget")
+        parser.error("a subcommand is required: add, list, test, remove")
 
     root = ClaudeAccountSwitcher().backup_dir
-    if args.action == "set":
-        if args.password_stdin:
-            password = sys.stdin.readline().strip()
-        else:
-            password = getpass.getpass(f"IMAP password for {args.user}: ").strip()
-        password = password.replace(" ", "")  # Google shows app passwords in groups of 4
-        if not password:
-            error("Error: no password given")
-            sys.exit(1)
-        config = InboxConfig(user=args.user, password=password, host=args.host, port=args.port)
+
+    if args.action == "add":
+        if args.kind is None:
+            add.error("a mailbox kind is required: google, outlook, imap")
         try:
-            with Inbox(config):
-                pass
+            if args.kind == "imap":
+                if args.password_stdin:
+                    password = sys.stdin.readline().strip()
+                else:
+                    password = getpass.getpass(f"IMAP password for {args.user}: ").strip()
+                password = password.replace(" ", "")  # Google shows app passwords in groups of 4
+                if not password:
+                    raise InboxError("no password given")
+                config = InboxConfig(user=args.user, password=password, host=args.host, port=args.port)
+                with Inbox(config):
+                    pass
+                row = imap_row(config)
+            else:
+                from claude_swap import inbox_oauth
+
+                row = inbox_oauth.connect(root, args, out=print)
         except InboxError as e:
-            error(f"Error: sign-in failed, nothing saved: {e}")
+            error(f"Error: {e} — nothing saved")
             sys.exit(1)
-        save_inbox(root, config)
-        print(f"{accent('Saved')} login inbox {args.user} ({args.host})")
+        add_source(root, row)
+        print(f"{accent('Connected')} {row['address']} ({row['kind']})")
         return
-    config = load_inbox(root)
-    if args.action == "forget":
-        print("Forgot the login inbox" if forget_inbox(root) else "No login inbox was set")
+
+    rows = load_sources(root)
+    if args.action == "remove":
+        if not args.address and not args.all:
+            rm.error("name a mailbox, or pass --all")
+        n = remove_sources(root, None if args.all else args.address)
+        print(f"Disconnected {n} mailbox(es)" if n else "No such mailbox")
+        if n and any(r["kind"] != "imap" for r in rows):
+            print(dimmed("  aswap's access stays granted until you remove it in the account's "
+                         "security settings (Google: myaccount.google.com/permissions; "
+                         "Microsoft: account.live.com/consent/Manage)"))
         return
-    if config is None:
-        print("No login inbox set (aswap inbox set EMAIL)")
+    if not rows:
+        print("No mailbox connected (aswap inbox add google|outlook|imap)")
         sys.exit(1)
-    if args.action == "show":
-        print(f"{config.user} on {config.host}:{config.port}")
+    if args.action == "list":
+        for r in rows:
+            where = f" on {r.get('host', DEFAULT_HOST)}" if r["kind"] == "imap" else ""
+            print(f"  {r['address']}  ({r['kind']}{where})")
         return
-    try:
-        with Inbox(config) as inbox:
-            count = inbox.anthropic_count()
-    except InboxError as e:
-        error(f"Error: {e}")
+    failed = False
+    for r in rows:
+        try:
+            source = open_source(root, r)
+            try:
+                source.snapshot()
+            finally:
+                source.close()
+            print(f"  {accent('OK')} {r['address']} ({r['kind']})")
+        except InboxError as e:
+            failed = True
+            error(f"  {r['address']} ({r['kind']}): {e}")
+    if failed:
         sys.exit(1)
-    print(f"{accent('OK')} {config.user}: signed in; {count} message(s) from Anthropic in INBOX")
