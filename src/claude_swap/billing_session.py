@@ -640,33 +640,91 @@ _EMAIL_INPUT = "input#email, input[type=email]"
 _CONTINUE_BUTTON = "button[data-testid=continue], button[type=submit]"
 
 
-async def _nd_prefill_email(tab, email: str, out, wait_s: float = 60.0) -> bool:
+async def _nd_prefill_email(tab, email: str, out, wait_s: float = 60.0, inbox_config=None) -> bool:
     """Type ``email`` into claude.ai's login form and press Continue.
 
     Best effort: a profile that is already signed in never shows the form,
     so a missing field just ends the attempt. The field is a React input, so
     the text goes in through CDP ``Input.insertText`` (keystrokes are lost).
+
+    With a login inbox configured (``aswap inbox set``), the magic link
+    claude.ai mails is read from that inbox and opened in this tab.
     """
+    import asyncio
+    import threading
+
     from nodriver import cdp
 
     try:
         field = await tab.select(_EMAIL_INPUT, timeout=wait_s)
-        await field.focus()
-        await tab.send(cdp.input_.insert_text(email))
-        button = await tab.select(_CONTINUE_BUTTON, timeout=5)
-        await button.click()
     except Exception:
         return False
-    out(f"Entered {email} and pressed Continue — finish with the code or link claude.ai sends.")
+    inbox = await asyncio.to_thread(_open_inbox, inbox_config, out)
+    # Set when this task ends (a manual sign-in cancels it), so the polling
+    # thread stops instead of holding the process open until its timeout.
+    stop = threading.Event()
+    try:
+        after_uid = await asyncio.to_thread(inbox.latest_uid) if inbox else 0
+        try:
+            await field.focus()
+            await tab.send(cdp.input_.insert_text(email))
+            button = await tab.select(_CONTINUE_BUTTON, timeout=5)
+            await button.click()
+        except Exception:
+            return False
+        if inbox is None:
+            out(f"Entered {email} and pressed Continue — finish with the code or link claude.ai sends.")
+            return True
+        out(f"Entered {email} and pressed Continue — watching {inbox.config.user} for the sign-in link...")
+        link = await asyncio.to_thread(_await_link, inbox, email, after_uid, stop)
+        inbox = None  # _await_link closed it
+    except Exception as e:  # inbox trouble never blocks a manual sign-in
+        out(f"Login inbox: {e} — finish with the code or link claude.ai sends.")
+        return True
+    finally:
+        stop.set()
+        if inbox is not None:
+            inbox.close()
+    if not link:
+        out("No sign-in link reached the login inbox — finish with the code or link claude.ai sends.")
+        return True
+    out("Sign-in link arrived; opening it.")
+    await tab.get(link)
     return True
 
 
-def _start_prefill(tab, email: str | None, out):
+def _await_link(inbox, email: str, after_uid: int, stop) -> str | None:
+    """Wait on its own thread for the link, then close the inbox there."""
+    try:
+        return inbox.wait_for_link(
+            email, after_uid, stop=stop.is_set, sleep=stop.wait,
+        )
+    finally:
+        inbox.close()
+
+
+def _open_inbox(config, out):
+    """An ``Inbox`` on ``config``, or None (unset, or unreachable: reported)."""
+    from claude_swap import inbox
+
+    if config is None:
+        return None
+    try:
+        return inbox.Inbox(config)
+    except inbox.InboxError as e:
+        out(f"Login inbox unreachable ({e}) — sign in by hand.")
+        return None
+
+
+def _start_prefill(tab, email: str | None, out, root: Path | None = None):
     import asyncio
+
+    from claude_swap.inbox import load_inbox
 
     if not email or "@" not in email:
         return None
-    return asyncio.ensure_future(_nd_prefill_email(tab, email, out))
+    config = load_inbox(root) if root is not None else None
+    return asyncio.ensure_future(_nd_prefill_email(tab, email, out, inbox_config=config))
 
 
 def _stop_prefill(task) -> None:
@@ -702,7 +760,7 @@ async def _nd_capture_session(
     )
     tab = await browser.get(f"{CLAUDE}/login")
     out(f"Sign in to claude.ai as {email} in the window that opened (waiting {int(timeout_s)}s)...")
-    prefill = _start_prefill(tab, email, out)
+    prefill = _start_prefill(tab, email, out, root)
 
     rejected: set[str] = set()
     deadline = time.monotonic() + timeout_s
@@ -768,7 +826,7 @@ async def _nd_capture_any_session(
     tab = await browser.get(f"{CLAUDE}/login")
     label = email_hint or "any account"
     out(f"Sign in to claude.ai as {label} in the window that opened (waiting {int(timeout_s)}s)...")
-    prefill = _start_prefill(tab, email_hint, out)
+    prefill = _start_prefill(tab, email_hint, out, root)
 
     seen_keys: set[str] = set()
     deadline = time.monotonic() + timeout_s

@@ -2050,6 +2050,11 @@ def main() -> None:
 
         token_command(argv[1:])
         return
+    if argv and argv[0] == "inbox":
+        from claude_swap.inbox import inbox_command
+
+        inbox_command(argv[1:])
+        return
     if argv and argv[0] == "map":
         _map_command(argv[1:])
         return
