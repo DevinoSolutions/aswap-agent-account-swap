@@ -398,6 +398,17 @@ class TestExact:
         )
         assert view["nextBillingAt"] and not billing.is_cancelled(view)
 
+    def test_no_plan(self):
+        none = billing.billing_view(self._rec(subscriptionStatus="none", currentPeriodEnd=None), self.NOW)
+        assert billing.has_no_plan(none)
+        assert billing.billing_text(none) == "no paid plan"
+        assert billing.account_mark(none, self.NOW) == billing.CANCELLED_MARK
+        lapsed = billing.billing_view(self._rec(subscriptionStatus="canceled", currentPeriodEnd=None), self.NOW)
+        assert billing.has_no_plan(lapsed)
+        assert not billing.has_no_plan(billing.billing_view(self._rec(cancelAtPeriodEnd=True), self.NOW))
+        assert not billing.has_no_plan(billing.billing_view(self._rec(), self.NOW))
+        assert not billing.has_no_plan(None)
+
     def test_expired_session_note(self):
         view = billing.billing_view(self._rec(), self.NOW, session_state="expired")
         assert "billing login" in billing.billing_text(view)

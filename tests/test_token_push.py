@@ -305,6 +305,32 @@ class TestSignedOutDetection:
         assert not isinstance(e.value, tp.bs.SignedOut)
 
 
+class TestNoPlanDetection:
+    """An account without a paid plan gets a paywall page, not the consent page."""
+
+    def test_paywall_raises_no_plan_fast(self):
+        import asyncio
+        import time
+
+        class Tab:
+            async def evaluate(self, js):
+                return js == tp.bs._NO_PLAN_JS
+
+        class Browser:
+            async def get(self, url, new_tab=False):
+                return Tab()
+
+        loop = asyncio.new_event_loop()
+        start = time.monotonic()
+        try:
+            with pytest.raises(tp.bs.NoPlan):
+                loop.run_until_complete(
+                    tp.bs._nd_mint_oauth_tokens(Browser(), timeout_s=30.0, out=lambda *_: None))
+        finally:
+            loop.close()
+        assert time.monotonic() - start < 10
+
+
 class TestStopChrome:
     """Closing waits for Chrome to exit and closes its transport, however slow it quits."""
 
@@ -407,6 +433,41 @@ class TestLoginPushes:
         set_setting(sw.backup_dir, "login.pushTo", "h1")
         browser, sent, reopened = self._login(sw, ["login", "a@example.com", "--no-push"], monkeypatch)
         assert sent == [] and reopened == []
+        assert browser.closed
+
+    def test_no_plan_saves_the_session_and_skips_the_mint(self, temp_home: Path, monkeypatch, capsys):
+        sw = _switcher()
+        sw.add_account_from_token("sk-ant-oat01-old", email="a@example.com")
+        browser = _FakeBrowser()
+        monkeypatch.setattr(billing_cli.bs, "capture_session", lambda *a, **kw: ("sk-login", browser))
+        monkeypatch.setattr(sw._billing, "refresh", lambda *a, **kw: None)
+        num, email, org = sw.resolve_account("a@example.com")
+        monkeypatch.setattr(sw, "_billing_views", lambda info: {num: {"subscriptionStatus": "none"}})
+        minted = []
+        monkeypatch.setattr(tp, "mint_credentials", lambda *a, **kw: minted.append(1))
+        with patch.object(billing_cli, "_switcher", return_value=sw):
+            billing_cli.billing_command(["login", "a@example.com"])
+        out = capsys.readouterr()
+        assert minted == [] and browser.closed
+        assert "has no paid plan" in out.err + out.out
+        assert sw._sessions.get((email, org or ""))["sessionKey"] == "sk-login"
+
+    def test_paywall_during_the_mint_says_no_plan(self, temp_home: Path, monkeypatch, capsys):
+        sw = _switcher()
+        sw.add_account_from_token("sk-ant-oat01-old", email="a@example.com")
+        browser = _FakeBrowser()
+        monkeypatch.setattr(billing_cli.bs, "capture_session", lambda *a, **kw: ("sk-login", browser))
+        monkeypatch.setattr(sw._billing, "refresh", lambda *a, **kw: None)
+
+        def paywall(*a, **kw):
+            raise tp.bs.NoPlan("plan required")
+
+        monkeypatch.setattr(tp, "mint_credentials", paywall)
+        with patch.object(billing_cli, "_switcher", return_value=sw):
+            billing_cli.billing_command(["login", "a@example.com", "--no-push"])
+        out = capsys.readouterr()
+        text = out.err + out.out
+        assert "has no paid plan" in text and "claude /login" not in text
         assert browser.closed
 
     def test_login_waits_ten_minutes_for_a_sign_in_code(self):
