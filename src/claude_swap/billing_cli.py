@@ -151,7 +151,7 @@ def _inject_and_add(sw, email: str, org_uuid: str, credentials: str) -> None:
     try:
         # Write the minted credential.
         cred_path.parent.mkdir(parents=True, exist_ok=True)
-        cred_path.write_text(credentials, encoding="utf-8")
+        _write_private(cred_path, credentials)
 
         # Write a config that ``add_account`` can read for identity fields.
         import json as _json
@@ -171,13 +171,24 @@ def _inject_and_add(sw, email: str, org_uuid: str, credentials: str) -> None:
     finally:
         # Restore original files so we don't clobber the live CC login.
         if old_creds is not None:
-            cred_path.write_text(old_creds, encoding="utf-8")
+            _write_private(cred_path, old_creds)
         elif cred_path.exists():
             cred_path.unlink()
         if old_config is not None:
             config_path.write_text(old_config, encoding="utf-8")
         elif config_path.exists():
             config_path.unlink()
+
+
+def _write_private(path, text: str) -> None:
+    """Write a credential file readable by the owner only (0o600 off Windows)."""
+    import os
+
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    if os.name != "nt":
+        os.chmod(path, 0o600)
 
 
 def _refresh(sw, args) -> None:

@@ -511,3 +511,20 @@ class TestRefreshCommand:
             billing_cli.billing_command(["refresh"])
         out = capsys.readouterr().out
         assert "cannot be confirmed" in out
+
+
+class TestWritePrivate:
+    def test_credential_file_is_owner_only(self, tmp_path):
+        import os
+        import stat
+
+        import pytest
+
+        from claude_swap.billing_cli import _write_private
+
+        path = tmp_path / ".credentials.json"
+        _write_private(path, "{}")
+        assert path.read_text(encoding="utf-8") == "{}"
+        if os.name == "nt":
+            pytest.skip("POSIX permission bits")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
