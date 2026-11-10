@@ -976,8 +976,9 @@ def _perishable_ts(
 ) -> float | None:
     """When this account's weekly quota is lost, as a consume-first sort key.
 
-    Normally its weekly reset. A subscription scheduled to end sooner loses
-    the quota at its end, so that wins ("ending first"). With no readable
+    Normally its weekly reset. A paid period ending sooner (a cancel, or a
+    renewal: accounts are cancelled before they renew) loses the quota at
+    its end, so that wins ("ending first"). With no readable
     ``resets_at`` the remembered weekly anchor stands in, so a freshly
     re-added account ranks correctly on its first tick.
     """

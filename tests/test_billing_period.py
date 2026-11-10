@@ -475,6 +475,29 @@ class TestRefreshCommand:
         assert "cancellation confirmed" in out
         assert h.switcher.perish_inputs()["4"]["endsAt"] is not None
 
+    def test_renewal_before_weekly_reset_is_when_quota_perishes(self, temp_home, monkeypatch):
+        from claude_swap.autoswitch import _perishable_ts
+        from tests.test_autoswitch import EngineHarness
+
+        h = EngineHarness(temp_home)
+        h.seed(4, "soon@example.com")
+        h.seed(5, "later@example.com")
+        now = datetime.now(timezone.utc)
+        renew = now + timedelta(days=1)
+        records = {
+            "4": {"source": "exact", "subscriptionStatus": "active", "cancelAtPeriodEnd": False,
+                  "currentPeriodEnd": renew.isoformat()},
+            "5": {"source": "exact", "subscriptionStatus": "active", "cancelAtPeriodEnd": False,
+                  "currentPeriodEnd": (now + timedelta(days=20)).isoformat()},
+        }
+        monkeypatch.setattr(h.switcher._billing, "records", lambda ids: {k: v for k, v in records.items() if k in ids})
+        inputs = h.switcher.perish_inputs(now.timestamp())
+        assert abs(inputs["4"]["endsAt"] - renew.timestamp()) < 1
+        week = lambda d: {"seven_day": {"resets_at": (now + timedelta(days=d)).isoformat()}}
+        soon = _perishable_ts(inputs, "4", week(4), now.timestamp())
+        later = _perishable_ts(inputs, "5", week(2), now.timestamp())
+        assert soon < later  # renews tomorrow beats a weekly reset in 2 days
+
     def test_without_a_session_nothing_is_confirmed(self, temp_home, capsys, monkeypatch):
         from unittest.mock import patch
 

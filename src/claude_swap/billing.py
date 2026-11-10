@@ -269,6 +269,19 @@ def ends_at_ts(view: dict | None) -> float | None:
     return parsed.timestamp() if parsed else None
 
 
+def period_end_ts(view: dict | None, now: float) -> float | None:
+    """Epoch the current paid period ends (renewal or scheduled end), or None.
+
+    consume-first treats it as when weekly quota perishes: accounts are
+    cancelled before they renew, so quota unused by then is lost.
+    """
+    value = (view or {}).get("endsAt") or (view or {}).get("nextBillingAt")
+    parsed = _parse_iso(value) if isinstance(value, str) else None
+    if parsed is None or parsed.timestamp() <= now:
+        return None
+    return parsed.timestamp()
+
+
 CANCELLED_MARK = "❌"  # fully ended
 CANCELLING_MARK = "⏳"  # cancelled, paid time still left
 _CANCELLED_STATUSES = frozenset({"canceled", "cancelled"})

@@ -2664,7 +2664,8 @@ class ClaudeAccountSwitcher:
         }
 
     def perish_inputs(self, now: float | None = None) -> dict[str, dict]:
-        """Per slot: ``endsAt`` (scheduled subscription end) and ``anchorNext``
+        """Per slot: ``endsAt`` (when the paid period ends: confirmed end,
+        recorded cancel or next renewal, whichever is first) and ``anchorNext``
         (next remembered weekly reset), both epoch seconds or None, and
         ``tier`` (the profile's rate-limit tier, or None).
 
@@ -2673,7 +2674,7 @@ class ClaudeAccountSwitcher:
         """
         from datetime import datetime, timezone
 
-        from claude_swap.billing import confirmed_end_ts
+        from claude_swap.billing import confirmed_end_ts, period_end_ts
         from claude_swap.weekly_anchor import current_anchor, next_occurrence
 
         data = self._get_sequence_data() or {}
@@ -2689,9 +2690,22 @@ class ClaudeAccountSwitcher:
         now_dt = datetime.fromtimestamp(now_ts, timezone.utc)
         out: dict[str, dict] = {}
         for num, identity in identities.items():
-            # Only a confirmed, current cancellation moves consume-first.
+            row = anchors.get(f"{identity[0]}|{identity[1]}")
             ends = confirmed_end_ts(records.get(num), now_ts)
-            anchor = current_anchor(anchors.get(f"{identity[0]}|{identity[1]}"))
+            # The billing period's end counts too, renewing or not (owner
+            # 2026-11-10: melodymix@ renewing in 1.5 days sat 6th behind
+            # accounts resetting in 3+). Accounts are cancelled before they
+            # renew, so weekly quota still unused at the period end is lost.
+            period_end = period_end_ts(
+                billing_view(
+                    records.get(num), now_ts,
+                    period_start=period_start(row), cancelled_at=(row or {}).get("cancelledAt"),
+                ),
+                now_ts,
+            )
+            if period_end is not None and (ends is None or period_end < ends):
+                ends = period_end
+            anchor = current_anchor(row)
             nxt = next_occurrence(anchor, now_dt).timestamp() if anchor else None
             tier = (records.get(num) or {}).get("rateLimitTier")
             if ends is not None or nxt is not None or tier:
