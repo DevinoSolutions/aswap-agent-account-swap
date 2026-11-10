@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from claude_swap import billing_session as bs
 from claude_swap import token_push as tp
 from claude_swap import weekly_anchor as wa
-from claude_swap.billing import billing_text
+from claude_swap.billing import billing_text, has_no_plan
 from claude_swap.printer import accent, dimmed, error, muted
 
 
@@ -71,6 +71,7 @@ def _login(sw, args) -> None:
 
     # --- save the billing session ---
     sw._sessions.put(identity, key)
+    view = None
     if existing_num:
         info = [i for i in sw._build_accounts_info() if str(i[0]) == existing_num]
         sw._billing.refresh(info, force=True)
@@ -82,6 +83,12 @@ def _login(sw, args) -> None:
             print(dimmed(f"  subscription_details keys: {rec.get('detailKeys')}"))
     else:
         print(f"{accent('Saved')} claude.ai session for {email} (new account)")
+
+    if mint and browser is not None and has_no_plan(view):
+        # claude.ai would show "a Pro or Max plan is required" and never call back.
+        browser.close()
+        browser = None
+        _say_no_plan(email)
 
     # --- mint an OAuth token and store credentials ---
     if mint and browser is not None:
@@ -105,6 +112,8 @@ def _login(sw, args) -> None:
                 # New account: inject into live files and call add_account.
                 _inject_and_add(sw, email, org, credentials)
             minted = True
+        except bs.NoPlan:
+            _say_no_plan(email)
         except bs.OAuthError as e:
             error(f"OAuth token minting failed: {e}")
             if existing_num:
@@ -127,6 +136,11 @@ def _login(sw, args) -> None:
                 error(f"No tokens pushed ({e}); run 'aswap token push {email}'")
     elif not existing_num and not mint:
         print(dimmed(f"  session saved; to add this account: claude /login as {email}, then aswap add"))
+
+
+def _say_no_plan(email: str) -> None:
+    error(f"No Claude Code token: {email} has no paid plan (Claude Code needs Pro or Max)")
+    print(dimmed("  the claude.ai session was saved; buy a plan, then run 'aswap login' again for the token"))
 
 
 def _inject_and_add(sw, email: str, org_uuid: str, credentials: str) -> None:

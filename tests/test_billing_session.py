@@ -160,6 +160,22 @@ class TestHttp:
         _serve(monkeypatch, 404, "{}")
         assert bs.fetch_subscription_details("sk", "org")["status"] == "none"
 
+    def test_permission_error_with_a_working_session_is_no_plan(self, monkeypatch):
+        # Measured 2026-11-10 on a lapsed account: organizations 200,
+        # subscription_details 403 permission_error.
+        def fake(url, headers, timeout):
+            if url.endswith("/subscription_details"):
+                return 403, '{"type":"error","error":{"type":"permission_error","message":"Missing permissions."}}'
+            return 200, '[{"uuid": "org"}]'
+
+        monkeypatch.setattr(bs, "_http_get", fake)
+        assert bs.fetch_subscription_details("sk", "org")["status"] == "none"
+
+    def test_permission_error_with_a_dead_session_is_expired(self, monkeypatch):
+        _serve(monkeypatch, 403, '{"type":"error","error":{"type":"permission_error"}}')
+        with pytest.raises(bs.SessionExpired):
+            bs.fetch_subscription_details("sk", "org")
+
     def test_sends_the_cookie(self, monkeypatch):
         seen = {}
         _serve(monkeypatch, 200, '[{"uuid": "org-1"}]', seen)

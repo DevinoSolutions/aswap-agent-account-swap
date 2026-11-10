@@ -284,7 +284,8 @@ def period_end_ts(view: dict | None, now: float) -> float | None:
 
 CANCELLED_MARK = "❌"  # fully ended
 CANCELLING_MARK = "⏳"  # cancelled, paid time still left
-_CANCELLED_STATUSES = frozenset({"canceled", "cancelled"})
+# "none": claude.ai has no subscription for the organization (lapsed to free).
+_CANCELLED_STATUSES = frozenset({"canceled", "cancelled", "none"})
 
 
 def is_cancelled(view: dict | None) -> bool:
@@ -370,7 +371,20 @@ def billing_text(view: dict | None) -> str | None:
         mark = "~" if view.get("nextBillingEstimated", True) else ""
         return f"renews {mark}{_when(next_at)}{note}"
     status = view.get("subscriptionStatus") or "unknown"
+    if status == "none":
+        return f"no paid plan{note}"
     return f"subscription {status.replace('_', ' ')}{note}"
+
+
+def has_no_plan(view: dict | None) -> bool:
+    """claude.ai says the plan is over (cancelled and lapsed, or none at all).
+
+    Such an account cannot connect Claude Code, so ``aswap login`` saves the
+    claude.ai session and skips minting a token.
+    """
+    if not view or view.get("endsAt") or view.get("nextBillingAt"):
+        return False
+    return view.get("subscriptionStatus") in _CANCELLED_STATUSES
 
 
 class BillingCache:

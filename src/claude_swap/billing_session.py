@@ -63,6 +63,14 @@ class SessionExpired(BillingSessionError):
     """The session key no longer authenticates (signed out / rotated)."""
 
 
+class PermissionDenied(SessionExpired):
+    """A 403 ``permission_error``: the session may be fine but lack access.
+
+    A subclass of ``SessionExpired`` so callers that do not care keep
+    treating it as a dead session.
+    """
+
+
 class SessionBlocked(BillingSessionError):
     """A transient refusal (Cloudflare challenge, 429): retry later."""
 
@@ -251,6 +259,8 @@ def _request(path: str, session_key: str, timeout: float = 40.0) -> object:
             raise SessionBlocked(f"claude.ai refused ({status}); retry later")
         if status == 404:
             raise FileNotFoundError(path)
+        if status == 403 and '"permission_error"' in body:
+            raise PermissionDenied(f"claude.ai refused access ({status})")
         if status in (401, 403):
             raise SessionExpired(f"claude.ai session rejected ({status})")
         raise BillingSessionError(f"claude.ai HTTP {status}")
@@ -280,11 +290,22 @@ def fetch_account_email(session_key: str) -> str | None:
 
 
 def fetch_subscription_details(session_key: str, org_uuid: str) -> dict:
-    """Parsed subscription details; ``status: "none"`` when there is none."""
+    """Parsed subscription details; ``status: "none"`` when there is none.
+
+    A free organization (never paid, or lapsed) answers 403
+    ``permission_error`` with a working session (measured 2026-11-10 on a
+    lapsed account: /api/organizations 200, subscription_details 403). That
+    is "no subscription", not a dead session, once the session is shown to
+    still work.
+    """
+    none = {"periodEnd": None, "cancelAtPeriodEnd": None, "status": "none", "interval": None, "keys": []}
     try:
         data = _request(f"/api/organizations/{org_uuid}/subscription_details", session_key)
     except FileNotFoundError:
-        return {"periodEnd": None, "cancelAtPeriodEnd": None, "status": "none", "interval": None, "keys": []}
+        return none
+    except PermissionDenied:
+        fetch_organizations(session_key)  # raises SessionExpired if the session is dead
+        return none
     return parse_subscription_details(data)
 
 
@@ -934,13 +955,14 @@ async def _nd_mint_oauth_tokens(
     out("Obtaining Claude Code token (approving the consent screen for you)...")
 
     deadline = time.monotonic() + timeout_s
-    on_login = 0
+    on_login = no_plan = 0
     while time.monotonic() < deadline:
         if auth_code:
             break
         try:
             await tab.evaluate(_CLICK_AUTHORIZE_JS)
             on_login = on_login + 1 if await tab.evaluate(_ON_LOGIN_PAGE_JS) else 0
+            no_plan = no_plan + 1 if await tab.evaluate(_NO_PLAN_JS) else 0
         except Exception:
             pass  # page mid-navigation; try again next tick
         if auth_error:
@@ -949,6 +971,9 @@ async def _nd_mint_oauth_tokens(
         if on_login >= _SIGNED_OUT_TICKS:
             srv.server_close()
             raise SignedOut("claude.ai asked to sign in again: the saved login has expired")
+        if no_plan >= _NO_PLAN_TICKS:
+            srv.server_close()
+            raise NoPlan("claude.ai says a Pro or Max plan is required to connect Claude Code")
         await asyncio.sleep(0.5)
     else:
         srv.server_close()
@@ -1257,6 +1282,15 @@ _CLICK_AUTHORIZE_JS = (
 _ON_LOGIN_PAGE_JS = "location.hostname.endsWith('claude.ai') && location.pathname.startsWith('/login')"
 _SIGNED_OUT_TICKS = 6
 
+# An account without a paid plan gets "Claude Max, Ultra, or Pro is required
+# to connect to Claude Code" instead of the consent page (seen 2026-11-10 on
+# a lapsed account); no callback ever comes, so stop at once.
+_NO_PLAN_JS = (
+    "(() => { const t = (document.body && document.body.innerText) || '';"
+    " return /required to connect to Claude Code/i.test(t); })()"
+)
+_NO_PLAN_TICKS = 2
+
 
 def _authorize_query(redirect_uri: str, challenge: str, state: str) -> str:
     import urllib.parse
@@ -1279,6 +1313,10 @@ class OAuthError(BillingSessionError):
 
 class SignedOut(OAuthError):
     """The browser's claude.ai login is gone: the consent page sent it to sign in."""
+
+
+class NoPlan(OAuthError):
+    """The account has no paid plan, so Claude Code cannot be connected."""
 
 
 def _generate_pkce() -> tuple[str, str]:
