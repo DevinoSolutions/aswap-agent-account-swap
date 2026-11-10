@@ -358,6 +358,46 @@ class TestExact:
         assert not billing.is_cancelled(billing.billing_view(past_due, self.NOW))
         assert not billing.is_cancelled(None)
 
+    def test_marks(self):
+        ending = billing.billing_view(self._rec(cancelAtPeriodEnd=True), self.NOW)
+        assert billing.account_mark(ending, self.NOW) == billing.CANCELLING_MARK
+        lapsed = billing.billing_view(self._rec(subscriptionStatus="canceled", currentPeriodEnd=None), self.NOW)
+        assert billing.account_mark(lapsed, self.NOW) == billing.CANCELLED_MARK
+        renewing = billing.billing_view(self._rec(), self.NOW)
+        end = _dt("2026-10-20T09:00:00").timestamp()
+        assert billing.account_mark(renewing, end - 2 * 86400) == billing.RENEWS_SOON_MARK
+        assert billing.account_mark(renewing, end - 4 * 86400) is None
+        assert billing.account_mark(None) is None
+
+    def test_recorded_cancel_on_exact_record(self):
+        rec = self._rec(fetchedAt=_dt("2026-10-08T00:00:00").timestamp())
+        view = billing.billing_view(rec, self.NOW, cancelled_at="2026-10-09T00:00:00+00:00")
+        assert view["endsAt"] == "2026-10-20T09:00:00+00:00" and view["nextBillingAt"] is None
+        assert billing.billing_text(view).endswith("(cancel recorded)")
+        # A claude.ai reading after the recorded cancel wins.
+        rec["fetchedAt"] = _dt("2026-10-09T01:00:00").timestamp()
+        view = billing.billing_view(rec, self.NOW, cancelled_at="2026-10-09T00:00:00+00:00")
+        assert view["endsAt"] is None and view["nextBillingAt"]
+
+    def test_recorded_cancel_on_estimate(self):
+        rec = {"subscriptionStatus": "active", "subscriptionCreatedAt": "2026-07-12T14:28:34Z"}
+        # Cancelled Oct 9 inside the Sep 12 -> Oct 12 period: ends Oct 12.
+        view = billing.billing_view(rec, self.NOW, cancelled_at="2026-10-09T00:00:00+00:00")
+        assert view["endsAt"] == "2026-10-12T14:28:34+00:00"
+        assert billing.account_mark(view, self.NOW) == billing.CANCELLING_MARK
+        # Past that end: ended.
+        later = _dt("2026-10-13T00:00:00").timestamp()
+        view = billing.billing_view(rec, later, cancelled_at="2026-10-09T00:00:00+00:00")
+        assert view["endsAt"] is None and view["nextBillingAt"] is None
+        assert billing.account_mark(view, later) == billing.CANCELLED_MARK
+        assert billing.billing_text(view) == "cancelled (recorded)"
+        # A purchase after the cancel voids it.
+        view = billing.billing_view(
+            rec, later, period_start=("2026-10-12T20:00:00+00:00", "paid"),
+            cancelled_at="2026-10-09T00:00:00+00:00",
+        )
+        assert view["nextBillingAt"] and not billing.is_cancelled(view)
+
     def test_expired_session_note(self):
         view = billing.billing_view(self._rec(), self.NOW, session_state="expired")
         assert "billing login" in billing.billing_text(view)

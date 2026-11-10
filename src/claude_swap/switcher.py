@@ -62,11 +62,10 @@ from claude_swap.billing import (
     PLAN_RECHECK_MIN_S,
     PLAN_REFRESH_S,
     SESSION_BILLING_SCAN_S,
-    CANCELLED_MARK,
     BillingCache,
+    account_mark,
     billing_text,
     billing_view,
-    is_cancelled,
     looks_lapsed,
 )
 from claude_swap.billing_session import SessionStore
@@ -2422,16 +2421,16 @@ class ClaudeAccountSwitcher:
                 remembered = self._anchors.rows()
             except Exception:
                 remembered = {}
-            return {
-                num: billing_view(
+            views = {}
+            for num, rec in records.items():
+                row = remembered.get(f"{identities[num][0]}|{identities[num][1]}")
+                views[num] = billing_view(
                     rec,
                     session_state=self._billing.session_state(identities[num]),
-                    period_start=period_start(
-                        remembered.get(f"{identities[num][0]}|{identities[num][1]}")
-                    ),
+                    period_start=period_start(row),
+                    cancelled_at=(row or {}).get("cancelledAt"),
                 )
-                for num, rec in records.items()
-            }
+            return views
         except Exception:
             self._logger.debug("Billing refresh failed", exc_info=True)
             return {}
@@ -7383,8 +7382,9 @@ class ClaudeAccountSwitcher:
             if needs_login:
                 markers += f" {yellowed('(needs login)')}"
             slot = f"{i + 1:>2}. acc #{num}" if by_priority else f"{num}"
-            if is_cancelled(billing.get(str(num))):
-                label = f"{CANCELLED_MARK} {label}"
+            mark = account_mark(billing.get(str(num)))
+            if mark:
+                label = f"{mark} {label}"
             print(f"  {slot}: {label} {muted(f'[{tag}]')}{markers}")
             bills = billing_text(billing.get(str(num)))
             week = weekly_text(weekly.get(str(num)))

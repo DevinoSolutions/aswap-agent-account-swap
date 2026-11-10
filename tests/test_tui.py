@@ -744,18 +744,21 @@ class TestMiniAccountText:
         acc = make_account(1, entry=entry)
         assert "(ahead)" in mini_account_text(acc, now).plain
 
-    def test_cancelled_account_gets_x_mark(self):
+    def test_account_marks(self):
         from claude_swap.tui.widgets import account_card_text, mini_account_text
 
         now = time.time()
-        ending = dataclasses.replace(make_account(1), billing={"endsAt": _iso_in(86400)})
-        lapsed = dataclasses.replace(make_account(2), billing={"subscriptionStatus": "canceled"})
-        renewing = dataclasses.replace(make_account(3), billing={"nextBillingAt": _iso_in(86400)})
-        for acc in (ending, lapsed):
-            assert f"❌ {acc.email}" in mini_account_text(acc, now).plain
-            assert f"❌ {acc.email}" in account_card_text(acc, 100, now=now).plain
-        assert "❌" not in mini_account_text(renewing, now).plain
-        assert "❌" not in account_card_text(renewing, 100, now=now).plain
+        cases = {
+            "⏳": dataclasses.replace(make_account(1), billing={"endsAt": _iso_in(86400)}),
+            "❌": dataclasses.replace(make_account(2), billing={"subscriptionStatus": "canceled"}),
+            "⏰": dataclasses.replace(make_account(3), billing={"nextBillingAt": _iso_in(2 * 86400)}),
+        }
+        for mark, acc in cases.items():
+            assert f"{mark} {acc.email}" in mini_account_text(acc, now).plain
+            assert f"{mark} {acc.email}" in account_card_text(acc, 100, now=now).plain
+        later = dataclasses.replace(make_account(4), billing={"nextBillingAt": _iso_in(10 * 86400)})
+        for text in (mini_account_text(later, now).plain, account_card_text(later, 100, now=now).plain):
+            assert not any(m in text for m in cases)
 
     def test_five_hour_never_shows_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text

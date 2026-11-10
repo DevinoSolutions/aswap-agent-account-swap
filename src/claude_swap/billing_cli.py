@@ -325,6 +325,31 @@ def _paid(sw, args) -> None:
         )
 
 
+def _cancelled(sw, args) -> None:
+    """Record a cancel made on claude.ai, for accounts aswap cannot read."""
+    when = None if args.clear else _parse_when(args.at)
+    recorded: set[str] = set()
+    for account in args.accounts:
+        identities = _identities_for(sw, account)
+        if not identities:
+            error(f"Error: no account or remembered identity matches {account}")
+            sys.exit(1)
+        for identity in identities:
+            sw._anchors.set_cancelled(identity, when.isoformat() if when else None)
+            recorded.add(identity[0].lower())
+            if when is None:
+                print(f"cleared the recorded cancel for {identity[0]}")
+            else:
+                print(f"{accent('Recorded')} cancel for {identity[0]} at {when.astimezone():%a %b %d %H:%M} local")
+    if when is None:
+        return
+    info = sw._build_accounts_info()
+    views = sw._billing_views(info)
+    for num, email, *_ in info:
+        if email.lower() in recorded:
+            print(f"  {num}: {email}  {billing_text(views.get(str(num))) or 'unknown'}")
+
+
 def _parse_ts(value) -> datetime | None:
     if not value:
         return None
@@ -477,13 +502,20 @@ def billing_command(argv: list[str]) -> None:
     p.add_argument("account", metavar="NUM|EMAIL")
     p.add_argument("when", nargs="?", help="purchase date/time, local (YYYY-MM-DD or 'YYYY-MM-DD HH:MM'); default now")
     p.add_argument("--clear", action="store_true", help="forget the recorded purchase")
+    p = sub.add_parser(
+        "cancelled",
+        help="record that accounts were cancelled on claude.ai (for accounts without a billing session)",
+    )
+    p.add_argument("accounts", nargs="+", metavar="NUM|EMAIL")
+    p.add_argument("--at", help="cancel date/time, local (YYYY-MM-DD or 'YYYY-MM-DD HH:MM'); default now")
+    p.add_argument("--clear", action="store_true", help="forget the recorded cancel (e.g. resubscribed)")
     p = sub.add_parser("forget", help="drop an account's claude.ai session")
     p.add_argument("account", metavar="NUM|EMAIL")
     p = sub.add_parser("forget-anchor", help="drop a remembered weekly reset")
     p.add_argument("email")
     args = parser.parse_args(argv)
     if args.action is None:
-        parser.error("a subcommand is required: login, status, refresh, tier, plan, paid, forget, forget-anchor")
+        parser.error("a subcommand is required: login, status, refresh, tier, plan, paid, cancelled, forget, forget-anchor")
     try:
         sw = _switcher(args.debug)
         if args.action == "login":
@@ -498,6 +530,8 @@ def billing_command(argv: list[str]) -> None:
             _plan(sw, args)
         elif args.action == "paid":
             _paid(sw, args)
+        elif args.action == "cancelled":
+            _cancelled(sw, args)
         elif args.action == "forget":
             _num, email, org = sw.resolve_account(args.account)
             print("forgot session" if sw._sessions.forget((email, org or "")) else "no session stored")

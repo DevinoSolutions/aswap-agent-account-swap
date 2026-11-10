@@ -395,21 +395,47 @@ class TestCancelledMarkInList:
         h = EngineHarness(temp_home)
         h.seed(3, "ending@example.com")
         h.seed(4, "lapsed@example.com")
-        h.seed(5, "paying@example.com")
-        ends = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        h.seed(5, "soon@example.com")
+        h.seed(6, "paying@example.com")
+        now = datetime.now(timezone.utc)
+        ends = (now + timedelta(days=2)).isoformat()
         views = {
             "3": {"subscriptionStatus": "active", "endsAt": ends},
             "4": {"subscriptionStatus": "canceled"},
             "5": {"subscriptionStatus": "active", "nextBillingAt": ends},
+            "6": {"subscriptionStatus": "active", "nextBillingAt": (now + timedelta(days=9)).isoformat()},
         }
         capsys.readouterr()
         with patch.object(h.switcher, "_billing_views", return_value=views), \
              patch.object(h.switcher, "usage_entries_by_account", return_value={}):
             h.switcher.list_accounts()
         out = capsys.readouterr().out
-        assert "❌ ending@example.com" in out
+        assert "⏳ ending@example.com" in out
         assert "❌ lapsed@example.com" in out
-        assert "❌ paying@example.com" not in out and "paying@example.com" in out
+        assert "⏰ soon@example.com" in out
+        assert ": paying@example.com" in out
+
+    def test_cancelled_command_marks_an_estimated_account(self, temp_home, capsys):
+        from unittest.mock import patch
+
+        from claude_swap import billing_cli
+        from tests.test_autoswitch import EngineHarness
+
+        h = EngineHarness(temp_home)
+        h.seed(3, "est@example.com")
+        anchor = datetime.now(timezone.utc) - timedelta(days=28)
+        num, email, org = h.switcher.resolve_account("3")
+        h.switcher._anchors.set_period_start((email, org or ""), anchor.isoformat())
+        with patch.object(billing_cli, "_switcher", return_value=h.switcher):
+            billing_cli.billing_command(["cancelled", "3"])
+        out = capsys.readouterr().out
+        assert "Recorded cancel for est@example.com" in out
+        [row] = [r for r in h.switcher._anchors.rows().values() if r["email"] == "est@example.com"]
+        assert row["cancelledAt"]
+        with patch.object(billing_cli, "_switcher", return_value=h.switcher):
+            billing_cli.billing_command(["cancelled", "3", "--clear"])
+        [row] = [r for r in h.switcher._anchors.rows().values() if r["email"] == "est@example.com"]
+        assert row["cancelledAt"] is None
 
 
 class TestRefreshCommand:
