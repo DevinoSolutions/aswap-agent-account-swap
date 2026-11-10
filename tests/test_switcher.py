@@ -1034,7 +1034,10 @@ class TestListAccountsUsage:
         assert "account2@example.com" in output
         assert "├ 5h:" in output
         assert "7d:" in output
-        assert "Weekly: Fri 00:00 UTC" in output  # the poll was remembered
+        # the poll was remembered, and is shown in local time
+        from claude_swap.weekly_anchor import anchor_label
+
+        assert f"Weekly: {anchor_label({'weekday': 4, 'hhmm': '00:00'})}" in output
         assert "10%" in output
         assert "50%" in output
 

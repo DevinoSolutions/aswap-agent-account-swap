@@ -976,8 +976,9 @@ def _perishable_ts(
 ) -> float | None:
     """When this account's weekly quota is lost, as a consume-first sort key.
 
-    Normally its weekly reset. A subscription scheduled to end sooner loses
-    the quota at its end, so that wins ("ending first"). With no readable
+    Normally its weekly reset. A paid period ending sooner (a cancel, or a
+    renewal: accounts are cancelled before they renew) loses the quota at
+    its end, so that wins ("ending first"). With no readable
     ``resets_at`` the remembered weekly anchor stands in, so a freshly
     re-added account ranks correctly on its first tick.
     """
@@ -991,6 +992,65 @@ def _perishable_ts(
     if end is not None and end > now and (ts is None or end < ts):
         return end
     return ts
+
+
+def strategy_key(
+    consume_first: bool, perish_ts: float | None, headroom: float, cap: float
+) -> tuple:
+    """A target's sort key under the strategy; ascending = preferred.
+
+    consume-first: soonest-perishing quota first (unknown sorts last), most
+    headroom breaks ties. best: most headroom. Shared by the engine's ranking
+    and ``aswap list``'s priority order, so the two cannot drift apart.
+    """
+    if consume_first:
+        return (perish_ts if perish_ts is not None else float("inf"), -headroom * cap)
+    return (-headroom * cap,)
+
+
+def priority_order(
+    nums: Sequence[str],
+    *,
+    consume_first: bool,
+    usage: dict[str, dict | str | None],
+    headroom: dict[str, float | None],
+    perish: dict[str, dict],
+    caps: dict[str, float],
+    priority: Sequence[str],
+    threshold: float,
+    unusable: set[str],
+    now: float,
+) -> list[str]:
+    """Every account, most preferred switch target first (for display).
+
+    The ``autoswitch.priority`` accounts with room come first, in their
+    order; then accounts below the threshold by the strategy's key; then
+    those at or over it or in their last point (auto lands there only when
+    nothing better is left), at their limit, unreadable, and unusable
+    (disabled, API key). Slot order
+    breaks ties. It ranks on the strategy alone: a tick's runway and
+    no-return rules can still pass over the first entry.
+    """
+    rank = {n: i for i, n in enumerate(priority)}
+
+    def key(num: str) -> tuple:
+        h = headroom.get(num)
+        if num in unusable:
+            return (5,)
+        if h is None:
+            return (4,)
+        if h <= 0:
+            return (3,)
+        if num in rank:
+            return (0, rank[num])
+        perish_ts = _perishable_ts(perish, num, usage.get(num), now) if consume_first else None
+        # A last point cannot be timed (edge.py): auto takes one only as an
+        # escape, after every account with real room.
+        last_point = h <= 100.0 - edge.LAST_POINT_PCT
+        tier = 1 if (100.0 - h) < threshold and not last_point else 2
+        return (tier, *strategy_key(consume_first, perish_ts, h, caps.get(num, DEFAULT_CAPACITY)))
+
+    return sorted(nums, key=key)
 
 
 def _binding_recovery_ts(
@@ -3158,12 +3218,11 @@ class AutoSwitchEngine:
                     if by_recovery
                     else (1, -h * cap, recovery_ts)
                 )
-            elif consume_first:
-                # Soonest weekly reset first (unknown resets sort last), most
-                # headroom breaks ties, then sequence order.
-                key = (reset_ts if reset_ts is not None else float("inf"), -h * cap)
             else:
-                key = (-h * cap,)
+                # consume-first: soonest weekly reset first (unknown resets sort
+                # last), most headroom breaks ties; best: most headroom. Then
+                # sequence order.
+                key = strategy_key(consume_first, reset_ts, h, cap)
             runway = self._runway_s(num, h, landing=True)
             # Draining perishable quota: see DRAIN_MIN_USE_S.
             drain = (

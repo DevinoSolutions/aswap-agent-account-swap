@@ -8,6 +8,7 @@ import sys
 from datetime import datetime, timezone
 
 from claude_swap import billing_session as bs
+from claude_swap import token_push as tp
 from claude_swap import weekly_anchor as wa
 from claude_swap.billing import billing_text
 from claude_swap.printer import accent, dimmed, error, muted
@@ -20,18 +21,174 @@ def _switcher(debug: bool):
 
 
 def _login(sw, args) -> None:
-    num, email, org = sw.resolve_account(args.account)
-    identity = (email, org or "")
-    key = bs.capture_session(identity, sw.backup_dir, chrome=args.chrome, timeout_s=args.timeout)
+    from claude_swap.locking import FileLock
+    from claude_swap.switcher import AccountNotFoundError
+
+    mint = not args.no_token
+    account = getattr(args, "account", None)
+
+    # --- resolve identity: existing account, or open login for anyone ---
+    existing_num = None
+    if account:
+        try:
+            existing_num, email, org = sw.resolve_account(account)
+        except AccountNotFoundError:
+            email, org = account, ""  # treat as email hint for a new account
+
+    if existing_num:
+        # Known account: constrained capture.
+        print(f"Account-{existing_num}: {accent(email)}")
+        identity = (email, org or "")
+        if mint:
+            key, browser = bs.capture_session(
+                identity, sw.backup_dir, chrome=args.chrome,
+                timeout_s=args.timeout, keep_browser=True,
+            )
+        else:
+            key = bs.capture_session(
+                identity, sw.backup_dir, chrome=args.chrome,
+                timeout_s=args.timeout,
+            )
+            browser = None
+    else:
+        # New or unknown account: accept whoever signs in.
+        captured = bs.capture_any_session(
+            sw.backup_dir, email_hint=account, chrome=args.chrome,
+            timeout_s=args.timeout, keep_browser=mint,
+        )
+        key = captured.session_key
+        email = captured.email
+        org = captured.org_uuid
+        browser = captured.browser
+        print(f"Signed in as: {accent(email)}")
+        # Check if this account already exists under a different identifier.
+        identity = (email, org or "")
+        seq = sw._get_sequence_data() or {}
+        for slot_num, rec in seq.get("accounts", {}).items():
+            if rec.get("email", "").lower() == email.lower():
+                existing_num = slot_num
+                break
+
+    # --- save the billing session ---
     sw._sessions.put(identity, key)
-    info = [i for i in sw._build_accounts_info() if str(i[0]) == num]
-    sw._billing.refresh(info, force=True)
-    view = sw._billing_views(info).get(num)
-    print(f"{accent('Saved')} claude.ai session for Account-{num} ({email})")
-    print(f"  {billing_text(view) or 'no billing data returned'}")
-    rec = sw._billing.records({num: identity}).get(num) or {}
-    if rec.get("source") != "exact":
-        print(dimmed(f"  subscription_details keys: {rec.get('detailKeys')}"))
+    if existing_num:
+        info = [i for i in sw._build_accounts_info() if str(i[0]) == existing_num]
+        sw._billing.refresh(info, force=True)
+        view = sw._billing_views(info).get(existing_num)
+        print(f"{accent('Saved')} claude.ai session for Account-{existing_num} ({email})")
+        print(f"  {billing_text(view) or 'no billing data returned'}")
+        rec = sw._billing.records({existing_num: identity}).get(existing_num) or {}
+        if rec.get("source") != "exact":
+            print(dimmed(f"  subscription_details keys: {rec.get('detailKeys')}"))
+    else:
+        print(f"{accent('Saved')} claude.ai session for {email} (new account)")
+
+    # --- mint an OAuth token and store credentials ---
+    if mint and browser is not None:
+        minted = False
+        try:
+            credentials = tp.mint_credentials(browser, sw.backup_dir)
+            # Chrome is only needed again for another mint; closed, it frees
+            # its memory through the pacing wait before each host's token.
+            browser.close()
+            if existing_num:
+                # Update existing account credentials in place.
+                with FileLock(sw.lock_file):
+                    sw._write_account_credentials(
+                        existing_num, email, credentials, reason="login-mint",
+                    )
+                    sw._usage_store.clear_dead_token(
+                        [existing_num], {existing_num: identity},
+                    )
+                print(f"{accent('Minted')} Claude Code token for Account-{existing_num}")
+            else:
+                # New account: inject into live files and call add_account.
+                _inject_and_add(sw, email, org, credentials)
+            minted = True
+        except bs.OAuthError as e:
+            error(f"OAuth token minting failed: {e}")
+            if existing_num:
+                print(dimmed("  session was saved; run 'aswap add' after 'claude /login' to add CC credentials separately"))
+            else:
+                print(dimmed("  session was saved but the account was not added to aswap"))
+                print(dimmed(f"  to add it manually: claude /login as {email}, then aswap add"))
+        finally:
+            browser.close()  # already closed on success; this covers a failed mint
+        # Each other machine gets a token of its own (a shared refresh token
+        # would be spent by whichever machine refreshes first).
+        hosts = () if args.no_push else tp.configured_hosts(sw.backup_dir, args.push_to)
+        if minted and hosts:
+            try:
+                tp.push_to_hosts(
+                    lambda: bs.open_signed_in(sw.backup_dir, email, key, chrome=args.chrome),
+                    sw.backup_dir, email, key, hosts,
+                )
+            except bs.SignedOut as e:
+                error(f"No tokens pushed ({e}); run 'aswap token push {email}'")
+    elif not existing_num and not mint:
+        print(dimmed(f"  session saved; to add this account: claude /login as {email}, then aswap add"))
+
+
+def _inject_and_add(sw, email: str, org_uuid: str, credentials: str) -> None:
+    """Write minted credentials to the live files so ``add_account`` can pick them up."""
+    from claude_swap.credentials import get_credentials_path
+
+    cred_path = get_credentials_path()
+    config_path = sw._get_claude_config_path()
+
+    # Back up whatever's there now.
+    old_creds = None
+    old_config = None
+    try:
+        old_creds = cred_path.read_text(encoding="utf-8")
+    except (OSError, FileNotFoundError):
+        pass
+    try:
+        old_config = config_path.read_text(encoding="utf-8")
+    except (OSError, FileNotFoundError):
+        pass
+
+    try:
+        # Write the minted credential.
+        cred_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_private(cred_path, credentials)
+
+        # Write a config that ``add_account`` can read for identity fields.
+        import json as _json
+
+        config_blob = _json.dumps({
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": "",
+                "organizationUuid": org_uuid or None,
+                "organizationName": None,
+            }
+        })
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(config_blob, encoding="utf-8")
+
+        sw.add_account()
+    finally:
+        # Restore original files so we don't clobber the live CC login.
+        if old_creds is not None:
+            _write_private(cred_path, old_creds)
+        elif cred_path.exists():
+            cred_path.unlink()
+        if old_config is not None:
+            config_path.write_text(old_config, encoding="utf-8")
+        elif config_path.exists():
+            config_path.unlink()
+
+
+def _write_private(path, text: str) -> None:
+    """Write a credential file readable by the owner only (0o600 off Windows)."""
+    import os
+
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    if os.name != "nt":
+        os.chmod(path, 0o600)
 
 
 def _refresh(sw, args) -> None:
@@ -54,7 +211,7 @@ def _refresh(sw, args) -> None:
         if confirmed:
             note = accent("  cancellation confirmed: auto treats the end as its reset")
         elif session != "ok":
-            note = dimmed("  (no claude.ai session: a cancellation cannot be confirmed; aswap billing login)")
+            note = dimmed("  (no claude.ai session: a cancellation cannot be confirmed; aswap login)")
         else:
             note = ""
         print(f"  {num}: {email}  {billing_text(views.get(key)) or 'unknown'}{note}")
@@ -179,6 +336,31 @@ def _paid(sw, args) -> None:
         )
 
 
+def _cancelled(sw, args) -> None:
+    """Record a cancel made on claude.ai, for accounts aswap cannot read."""
+    when = None if args.clear else _parse_when(args.at)
+    recorded: set[str] = set()
+    for account in args.accounts:
+        identities = _identities_for(sw, account)
+        if not identities:
+            error(f"Error: no account or remembered identity matches {account}")
+            sys.exit(1)
+        for identity in identities:
+            sw._anchors.set_cancelled(identity, when.isoformat() if when else None)
+            recorded.add(identity[0].lower())
+            if when is None:
+                print(f"cleared the recorded cancel for {identity[0]}")
+            else:
+                print(f"{accent('Recorded')} cancel for {identity[0]} at {when.astimezone():%a %b %d %H:%M} local")
+    if when is None:
+        return
+    info = sw._build_accounts_info()
+    views = sw._billing_views(info)
+    for num, email, *_ in info:
+        if email.lower() in recorded:
+            print(f"  {num}: {email}  {billing_text(views.get(str(num))) or 'unknown'}")
+
+
 def _parse_ts(value) -> datetime | None:
     if not value:
         return None
@@ -246,6 +428,7 @@ def _plan(sw, args) -> None:
             "state": state,
             "tier": tier,
             "anchor": wa.anchor_label(anchor, local=False),
+            "anchorLocal": wa.anchor_label(anchor),
             "nextResetInHours": round((plan["nextReset"] - now).total_seconds() / 3600, 1),
             "recommendedAt": plan["recommendedAt"].isoformat(),
             "quotas": plan["quotas"],
@@ -269,7 +452,7 @@ def _plan(sw, args) -> None:
         print(dimmed("Nothing to buy, renew differently or upgrade right now."))
         return
     for r in out:
-        print(f"  {r['slot']}: {r['email']}  [{r['state']}, {wa.tier_label(wa.normalize_tier(r['tier']))}]  weekly reset {r['anchor']}")
+        print(f"  {r['slot']}: {r['email']}  [{r['state']}, {wa.tier_label(wa.normalize_tier(r['tier']))}]  weekly reset {r['anchorLocal']}")
         if r["state"] not in ("active", "disabled"):
             when =datetime.fromisoformat(r["recommendedAt"]).astimezone()
             print(f"     buy now -> {r['quotasIfNow']} weekly quotas (next reset in {r['nextResetInHours']}h)")
@@ -298,10 +481,17 @@ def billing_command(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(prog="aswap billing", description="Exact billing, weekly resets, resubscribe planning.")
     parser.add_argument("--debug", action="store_true")
     sub = parser.add_subparsers(dest="action")
-    p = sub.add_parser("login", help="capture a claude.ai session for an account (opens Chrome)")
-    p.add_argument("account", metavar="NUM|EMAIL")
+    p = sub.add_parser("login", help="sign in: capture session + mint CC token (opens Chrome)")
+    p.add_argument("account", nargs="?", metavar="NUM|EMAIL",
+                   help="existing slot/email, or a new email; omit to sign in as anyone")
     p.add_argument("--chrome", metavar="PATH")
-    p.add_argument("--timeout", type=float, default=300.0)
+    # 600 s: a claude.ai sign-in code stays valid for ten minutes.
+    p.add_argument("--timeout", type=float, default=600.0)
+    p.add_argument("--no-token", action="store_true",
+                   help="skip minting a Claude Code OAuth token (session only)")
+    p.add_argument("--push-to", metavar="HOST[,HOST]",
+                   help="also give these SSH hosts a token of their own (default: login.pushTo)")
+    p.add_argument("--no-push", action="store_true", help="skip login.pushTo for this login")
     p = sub.add_parser("status", help="sessions, billing and weekly reset per account")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser(
@@ -323,13 +513,20 @@ def billing_command(argv: list[str]) -> None:
     p.add_argument("account", metavar="NUM|EMAIL")
     p.add_argument("when", nargs="?", help="purchase date/time, local (YYYY-MM-DD or 'YYYY-MM-DD HH:MM'); default now")
     p.add_argument("--clear", action="store_true", help="forget the recorded purchase")
+    p = sub.add_parser(
+        "cancelled",
+        help="record that accounts were cancelled on claude.ai (for accounts without a billing session)",
+    )
+    p.add_argument("accounts", nargs="+", metavar="NUM|EMAIL")
+    p.add_argument("--at", help="cancel date/time, local (YYYY-MM-DD or 'YYYY-MM-DD HH:MM'); default now")
+    p.add_argument("--clear", action="store_true", help="forget the recorded cancel (e.g. resubscribed)")
     p = sub.add_parser("forget", help="drop an account's claude.ai session")
     p.add_argument("account", metavar="NUM|EMAIL")
     p = sub.add_parser("forget-anchor", help="drop a remembered weekly reset")
     p.add_argument("email")
     args = parser.parse_args(argv)
     if args.action is None:
-        parser.error("a subcommand is required: login, status, refresh, tier, plan, paid, forget, forget-anchor")
+        parser.error("a subcommand is required: login, status, refresh, tier, plan, paid, cancelled, forget, forget-anchor")
     try:
         sw = _switcher(args.debug)
         if args.action == "login":
@@ -344,6 +541,8 @@ def billing_command(argv: list[str]) -> None:
             _plan(sw, args)
         elif args.action == "paid":
             _paid(sw, args)
+        elif args.action == "cancelled":
+            _cancelled(sw, args)
         elif args.action == "forget":
             _num, email, org = sw.resolve_account(args.account)
             print("forgot session" if sw._sessions.forget((email, org or "")) else "no session stored")

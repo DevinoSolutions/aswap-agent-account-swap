@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -386,6 +386,58 @@ class TestPlanCommand:
         assert "buy now" not in out
 
 
+class TestCancelledMarkInList:
+    def test_list_marks_cancelled_accounts(self, temp_home, capsys):
+        from unittest.mock import patch
+
+        from tests.test_autoswitch import EngineHarness
+
+        h = EngineHarness(temp_home)
+        h.seed(3, "ending@example.com")
+        h.seed(4, "lapsed@example.com")
+        h.seed(5, "soon@example.com")
+        h.seed(6, "paying@example.com")
+        now = datetime.now(timezone.utc)
+        ends = (now + timedelta(days=2)).isoformat()
+        views = {
+            "3": {"subscriptionStatus": "active", "endsAt": ends},
+            "4": {"subscriptionStatus": "canceled"},
+            "5": {"subscriptionStatus": "active", "nextBillingAt": ends},
+            "6": {"subscriptionStatus": "active", "nextBillingAt": (now + timedelta(days=9)).isoformat()},
+        }
+        capsys.readouterr()
+        with patch.object(h.switcher, "_billing_views", return_value=views), \
+             patch.object(h.switcher, "usage_entries_by_account", return_value={}):
+            h.switcher.list_accounts()
+        out = capsys.readouterr().out
+        assert "⏳ ending@example.com" in out
+        assert "❌ lapsed@example.com" in out
+        assert "⏰ soon@example.com" in out
+        assert ": paying@example.com" in out
+
+    def test_cancelled_command_marks_an_estimated_account(self, temp_home, capsys):
+        from unittest.mock import patch
+
+        from claude_swap import billing_cli
+        from tests.test_autoswitch import EngineHarness
+
+        h = EngineHarness(temp_home)
+        h.seed(3, "est@example.com")
+        anchor = datetime.now(timezone.utc) - timedelta(days=28)
+        num, email, org = h.switcher.resolve_account("3")
+        h.switcher._anchors.set_period_start((email, org or ""), anchor.isoformat())
+        with patch.object(billing_cli, "_switcher", return_value=h.switcher):
+            billing_cli.billing_command(["cancelled", "3"])
+        out = capsys.readouterr().out
+        assert "Recorded cancel for est@example.com" in out
+        [row] = [r for r in h.switcher._anchors.rows().values() if r["email"] == "est@example.com"]
+        assert row["cancelledAt"]
+        with patch.object(billing_cli, "_switcher", return_value=h.switcher):
+            billing_cli.billing_command(["cancelled", "3", "--clear"])
+        [row] = [r for r in h.switcher._anchors.rows().values() if r["email"] == "est@example.com"]
+        assert row["cancelledAt"] is None
+
+
 class TestRefreshCommand:
     @staticmethod
     def _real_refresh_no_profile(monkeypatch):
@@ -423,6 +475,29 @@ class TestRefreshCommand:
         assert "cancellation confirmed" in out
         assert h.switcher.perish_inputs()["4"]["endsAt"] is not None
 
+    def test_renewal_before_weekly_reset_is_when_quota_perishes(self, temp_home, monkeypatch):
+        from claude_swap.autoswitch import _perishable_ts
+        from tests.test_autoswitch import EngineHarness
+
+        h = EngineHarness(temp_home)
+        h.seed(4, "soon@example.com")
+        h.seed(5, "later@example.com")
+        now = datetime.now(timezone.utc)
+        renew = now + timedelta(days=1)
+        records = {
+            "4": {"source": "exact", "subscriptionStatus": "active", "cancelAtPeriodEnd": False,
+                  "currentPeriodEnd": renew.isoformat()},
+            "5": {"source": "exact", "subscriptionStatus": "active", "cancelAtPeriodEnd": False,
+                  "currentPeriodEnd": (now + timedelta(days=20)).isoformat()},
+        }
+        monkeypatch.setattr(h.switcher._billing, "records", lambda ids: {k: v for k, v in records.items() if k in ids})
+        inputs = h.switcher.perish_inputs(now.timestamp())
+        assert abs(inputs["4"]["endsAt"] - renew.timestamp()) < 1
+        week = lambda d: {"seven_day": {"resets_at": (now + timedelta(days=d)).isoformat()}}
+        soon = _perishable_ts(inputs, "4", week(4), now.timestamp())
+        later = _perishable_ts(inputs, "5", week(2), now.timestamp())
+        assert soon < later  # renews tomorrow beats a weekly reset in 2 days
+
     def test_without_a_session_nothing_is_confirmed(self, temp_home, capsys, monkeypatch):
         from unittest.mock import patch
 
@@ -436,3 +511,20 @@ class TestRefreshCommand:
             billing_cli.billing_command(["refresh"])
         out = capsys.readouterr().out
         assert "cannot be confirmed" in out
+
+
+class TestWritePrivate:
+    def test_credential_file_is_owner_only(self, tmp_path):
+        import os
+        import stat
+
+        import pytest
+
+        from claude_swap.billing_cli import _write_private
+
+        path = tmp_path / ".credentials.json"
+        _write_private(path, "{}")
+        assert path.read_text(encoding="utf-8") == "{}"
+        if os.name == "nt":
+            pytest.skip("POSIX permission bits")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600

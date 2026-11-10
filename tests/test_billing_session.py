@@ -287,6 +287,95 @@ class TestCapture:
         assert browser.closed
 
 
+# --- login email prefill -------------------------------------------------------
+
+
+class FakeElement:
+    def __init__(self, log, name):
+        self._log, self._name = log, name
+
+    async def focus(self):
+        self._log.append(("focus", self._name))
+
+    async def click(self):
+        self._log.append(("click", self._name))
+
+
+class FakeTab:
+    def __init__(self, has_form=True):
+        self.log: list = []
+        self._has_form = has_form
+
+    async def select(self, selector, timeout=10):
+        if not self._has_form:
+            raise TimeoutError(selector)
+        name = "email" if selector == bs._EMAIL_INPUT else "continue"
+        return FakeElement(self.log, name)
+
+    async def send(self, command):
+        self.log.append(("send", command))
+
+
+class TestPrefillEmail:
+    def _run(self, tab, email="a@example.com"):
+        import asyncio
+
+        messages: list[str] = []
+        ok = asyncio.run(bs._nd_prefill_email(tab, email, messages.append, wait_s=0))
+        return ok, messages
+
+    def test_types_the_email_then_presses_continue(self):
+        tab = FakeTab()
+        ok, messages = self._run(tab)
+        assert ok
+        steps = [s[0] if s[0] == "send" else s for s in tab.log]
+        assert steps == [("focus", "email"), "send", ("click", "continue")]
+        assert any("a@example.com" in m for m in messages)
+
+    def test_signed_in_profile_without_a_form_is_left_alone(self):
+        tab = FakeTab(has_form=False)
+        ok, messages = self._run(tab)
+        assert not ok
+        assert tab.log == [] and messages == []
+
+    def test_capture_and_mint_share_one_event_loop(self):
+        # A nodriver browser is bound to the loop that started it: the mint
+        # after capture used to fail with "Event loop is closed".
+        import asyncio
+
+        async def loop_id():
+            return id(asyncio.get_running_loop())
+
+        assert bs._nd_run(loop_id()) == bs._nd_run(loop_id())
+
+    def test_no_email_starts_no_prefill(self):
+        assert bs._start_prefill(FakeTab(), None, print) is None
+        assert bs._start_prefill(FakeTab(), "7", print) is None
+
+
+class TestOAuthMint:
+    def test_authorize_url_is_the_subscription_login(self):
+        from urllib.parse import parse_qs
+
+        q = parse_qs(bs._authorize_query("http://localhost:1/callback", "ch", "st"))
+        assert bs._OAUTH_AUTHORIZE == "https://claude.com/cai/oauth/authorize"
+        assert q["code"] == ["true"] and q["state"] == ["st"]
+        assert "user:inference" in q["scope"][0].split()
+        assert "user:sessions:claude_code" in q["scope"][0].split()
+
+    def test_credential_carries_the_plan_from_the_profile(self):
+        token = {"access_token": "at", "refresh_token": "rt", "expires_in": 60, "scope": "user:inference"}
+        profile = {"organization": {"organization_type": "claude_max", "rate_limit_tier": "default_claude_max_20x"}}
+        oauth = json.loads(bs.build_credential_blob(token, profile))["claudeAiOauth"]
+        assert oauth["subscriptionType"] == "max"
+        assert oauth["rateLimitTier"] == "default_claude_max_20x"
+
+    def test_credential_without_a_profile_still_builds(self):
+        token = {"access_token": "at", "refresh_token": "rt", "expires_in": 60}
+        oauth = json.loads(bs.build_credential_blob(token))["claudeAiOauth"]
+        assert oauth["accessToken"] == "at" and "subscriptionType" not in oauth
+
+
 # --- switcher integration ------------------------------------------------------
 
 from claude_swap.switcher import ClaudeAccountSwitcher  # noqa: E402

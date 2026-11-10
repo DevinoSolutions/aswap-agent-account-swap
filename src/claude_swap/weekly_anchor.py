@@ -122,12 +122,14 @@ def next_occurrence(anchor: dict, now: datetime) -> datetime:
 
 
 def anchor_label(anchor: dict, *, local: bool = True) -> str:
-    """``Thu 23:00 UTC (Thu 19:00 local)``."""
-    utc = f"{DAY_NAMES[anchor['weekday']]} {anchor['hhmm']} UTC"
+    """``Thu 19:00`` in local time, or ``Thu 23:00 UTC`` for machine output.
+
+    Anchors are stored in UTC; people read local time.
+    """
     if not local:
-        return utc
+        return f"{DAY_NAMES[anchor['weekday']]} {anchor['hhmm']} UTC"
     when = next_occurrence(anchor, datetime.now(timezone.utc)).astimezone()
-    return f"{utc} ({DAY_NAMES[when.weekday()]} {when:%H:%M} local)"
+    return f"{DAY_NAMES[when.weekday()]} {when:%H:%M}"
 
 
 def add_months(anchor: datetime, months: int) -> datetime:
@@ -479,6 +481,10 @@ class WeeklyAnchorStore:
         """Record (or with ``when=None`` clear) the current period's start."""
         self._update(identity, {"periodStart": when, "periodSource": source if when else None})
 
+    def set_cancelled(self, identity: Identity, when: str | None) -> None:
+        """Record (or with ``when=None`` clear) a cancel made by hand."""
+        self._update(identity, {"cancelledAt": when})
+
     def mark_removed(self, identity: Identity, slot: int) -> None:
         if self.get(identity) is None:
             return  # nothing remembered; nothing to annotate
@@ -569,6 +575,9 @@ def _merge_row(mine: dict, theirs: dict) -> dict:
     if starts:  # the latest known period start wins, whichever machine saw it
         latest = max(starts, key=lambda r: _parse(r["periodStart"]) or datetime.min.replace(tzinfo=timezone.utc))
         merged["periodStart"], merged["periodSource"] = latest["periodStart"], latest.get("periodSource")
+    cancels = [r["cancelledAt"] for r in (mine, theirs) if isinstance(r.get("cancelledAt"), str)]
+    if cancels:  # the latest recorded cancel wins, whichever machine saw it
+        merged["cancelledAt"] = max(cancels, key=lambda v: _parse(v) or datetime.min.replace(tzinfo=timezone.utc))
     tiers = dict(mine.get("tiers") or {})
     for name, block in (theirs.get("tiers") or {}).items():
         tiers[name] = _merge_tier(tiers.get(name), block)
@@ -755,7 +764,7 @@ def weekly_view(row: dict | None, now: datetime | None = None) -> dict | None:
 
 
 def weekly_text(view: dict | None) -> str | None:
-    """``Thu 23:00 UTC (Thu 19:00 local) · 20x  [5x: Wed 05:00 UTC]``."""
+    """``Thu 19:00 · 20x  [5x: Wed 01:00]``, in local time."""
     if not view:
         return None
     text = anchor_label(view["anchor"])
@@ -765,7 +774,7 @@ def weekly_text(view: dict | None) -> str | None:
     if view.get("moved"):
         text += " · moved"
     others = [
-        f"{tier_label(name)}: {DAY_NAMES[t['anchor']['weekday']]} {t['anchor']['hhmm']} UTC"
+        f"{tier_label(name)}: {anchor_label(t['anchor'])}"
         for name, t in (view.get("tiers") or {}).items()
         if name not in (tier, UNKNOWN_TIER)
     ]

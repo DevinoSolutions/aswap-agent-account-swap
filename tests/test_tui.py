@@ -124,6 +124,7 @@ class FakeSwitcher:
         )
         self.calls: list[tuple] = []
         self.fetch_sets: list[set[str] | None] = []
+        self.ranked = False
 
     # -- surface the TUI consumes ------------------------------------------
 
@@ -133,6 +134,7 @@ class FakeSwitcher:
             active_number=self.active,
             accounts=tuple(self._accounts),
             taken_at=time.time(),
+            ranked=self.ranked,
         )
 
     def current_account_number(self) -> str | None:
@@ -742,6 +744,22 @@ class TestMiniAccountText:
         acc = make_account(1, entry=entry)
         assert "(ahead)" in mini_account_text(acc, now).plain
 
+    def test_account_marks(self):
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        now = time.time()
+        cases = {
+            "⏳": dataclasses.replace(make_account(1), billing={"endsAt": _iso_in(86400)}),
+            "❌": dataclasses.replace(make_account(2), billing={"subscriptionStatus": "canceled"}),
+            "⏰": dataclasses.replace(make_account(3), billing={"nextBillingAt": _iso_in(2 * 86400)}),
+        }
+        for mark, acc in cases.items():
+            assert f"{mark} {acc.email}" in mini_account_text(acc, now).plain
+            assert f"{mark} {acc.email}" in account_card_text(acc, 100, now=now).plain
+        later = dataclasses.replace(make_account(4), billing={"nextBillingAt": _iso_in(10 * 86400)})
+        for text in (mini_account_text(later, now).plain, account_card_text(later, 100, now=now).plain):
+            assert not any(m in text for m in cases)
+
     def test_five_hour_never_shows_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text
 
@@ -829,6 +847,28 @@ class TestDashboard:
             # the mini line has no bars — bar glyphs only in the active card
             mini_part = panel.split("user2@example.com", 1)[1]
             assert "━" not in mini_part
+            assert "acc #" not in panel
+
+    async def test_ranked_snapshot_numbers_rows_and_labels_slots(self, tmp_path):
+        fake = FakeSwitcher(
+            [
+                make_account(17, active=True, entry=make_entry(10.0, 13.0)),
+                make_account(18, entry=make_entry(0.0, 54.0)),
+                make_account(1, entry=make_entry(0.0, 0.0)),
+            ],
+            tmp_path,
+        )
+        fake.ranked = True
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.widgets import AccountsPanel
+
+            lines = AccountsPanel.render(app.screen.query_one(AccountsPanel)).plain.splitlines()
+            heads = [line.strip() for line in lines if "acc #" in line]
+            assert [h.split("@")[0] for h in heads] == [
+                "1. acc #17  user17", "2. acc #18  user18", "3. acc #1   user1",
+            ]
 
     async def test_disabled_marker_on_active_card_and_mini(self, tmp_path):
         # A disabled account is still shown; it's just annotated so the user
@@ -2618,6 +2658,30 @@ class TestAccountsSnapshot:
         assert all(not acc.switchable for acc in snap.accounts)
         assert all(acc.usage.sentinel is not None for acc in snap.accounts)
         assert isinstance(snap.taken_at, float)
+
+    def test_priority_list_order_sorts_the_dashboard(self, temp_home, mock_claude_config, monkeypatch):
+        from claude_swap.settings import set_setting
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["sequence"] = [1, 2, 3]
+        data["accounts"] = {
+            "1": {"email": "test@example.com", "uuid": "test-uuid-1234"},
+            "2": {"email": "b@example.com", "uuid": "uuid-2"},
+            "3": {"email": "c@example.com", "uuid": "uuid-3"},
+        }
+        switcher._write_json(switcher.sequence_file, data)
+        monkeypatch.setattr(
+            switcher, "switch_priority_order", lambda info, entries: ["3", "1", "2"]
+        )
+
+        assert [a.number for a in switcher.accounts_snapshot(fetch=set()).accounts] == ["1", "2", "3"]
+        set_setting(switcher.backup_dir, "ui.listOrder", "priority")
+        snap = switcher.accounts_snapshot(fetch=set())
+        assert [a.number for a in snap.accounts] == ["3", "1", "2"]
+        assert snap.active_number == "1"
 
 
 # ---------------------------------------------------------------------------

@@ -63,6 +63,7 @@ from claude_swap.billing import (
     PLAN_REFRESH_S,
     SESSION_BILLING_SCAN_S,
     BillingCache,
+    account_mark,
     billing_text,
     billing_view,
     looks_lapsed,
@@ -2388,10 +2389,20 @@ class ClaudeAccountSwitcher:
                     weekly=weekly.get(n),
                 )
             )
+        from claude_swap.settings import load_ui_settings
+
+        ranked = load_ui_settings(self.backup_dir).list_order == "priority"
+        if ranked:
+            position = {
+                num: i
+                for i, num in enumerate(self.switch_priority_order(accounts_info, entries))
+            }
+            accounts.sort(key=lambda acc: position[acc.number])
         return AccountsSnapshot(
             active_number=active_number,
             accounts=tuple(accounts),
             taken_at=self._usage_store.clock(),
+            ranked=ranked,
         )
 
     def _billing_views(
@@ -2410,16 +2421,16 @@ class ClaudeAccountSwitcher:
                 remembered = self._anchors.rows()
             except Exception:
                 remembered = {}
-            return {
-                num: billing_view(
+            views = {}
+            for num, rec in records.items():
+                row = remembered.get(f"{identities[num][0]}|{identities[num][1]}")
+                views[num] = billing_view(
                     rec,
                     session_state=self._billing.session_state(identities[num]),
-                    period_start=period_start(
-                        remembered.get(f"{identities[num][0]}|{identities[num][1]}")
-                    ),
+                    period_start=period_start(row),
+                    cancelled_at=(row or {}).get("cancelledAt"),
                 )
-                for num, rec in records.items()
-            }
+            return views
         except Exception:
             self._logger.debug("Billing refresh failed", exc_info=True)
             return {}
@@ -2653,7 +2664,8 @@ class ClaudeAccountSwitcher:
         }
 
     def perish_inputs(self, now: float | None = None) -> dict[str, dict]:
-        """Per slot: ``endsAt`` (scheduled subscription end) and ``anchorNext``
+        """Per slot: ``endsAt`` (when the paid period ends: confirmed end,
+        recorded cancel or next renewal, whichever is first) and ``anchorNext``
         (next remembered weekly reset), both epoch seconds or None, and
         ``tier`` (the profile's rate-limit tier, or None).
 
@@ -2662,7 +2674,7 @@ class ClaudeAccountSwitcher:
         """
         from datetime import datetime, timezone
 
-        from claude_swap.billing import confirmed_end_ts
+        from claude_swap.billing import confirmed_end_ts, period_end_ts
         from claude_swap.weekly_anchor import current_anchor, next_occurrence
 
         data = self._get_sequence_data() or {}
@@ -2678,9 +2690,22 @@ class ClaudeAccountSwitcher:
         now_dt = datetime.fromtimestamp(now_ts, timezone.utc)
         out: dict[str, dict] = {}
         for num, identity in identities.items():
-            # Only a confirmed, current cancellation moves consume-first.
+            row = anchors.get(f"{identity[0]}|{identity[1]}")
             ends = confirmed_end_ts(records.get(num), now_ts)
-            anchor = current_anchor(anchors.get(f"{identity[0]}|{identity[1]}"))
+            # The billing period's end counts too, renewing or not (owner
+            # 2026-11-10: melodymix@ renewing in 1.5 days sat 6th behind
+            # accounts resetting in 3+). Accounts are cancelled before they
+            # renew, so weekly quota still unused at the period end is lost.
+            period_end = period_end_ts(
+                billing_view(
+                    records.get(num), now_ts,
+                    period_start=period_start(row), cancelled_at=(row or {}).get("cancelledAt"),
+                ),
+                now_ts,
+            )
+            if period_end is not None and (ends is None or period_end < ends):
+                ends = period_end
+            anchor = current_anchor(row)
             nxt = next_occurrence(anchor, now_dt).timestamp() if anchor else None
             tier = (records.get(num) or {}).get("rateLimitTier")
             if ends is not None or nxt is not None or tier:
@@ -2735,6 +2760,44 @@ class ClaudeAccountSwitcher:
         inputs = (loaded.threshold, parse_model_names(loaded.model))
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
+
+    def switch_priority_order(self, accounts_info: list, entries: dict) -> list[str]:
+        """Slots in auto's preference order as a switch target (``ui.listOrder
+        priority``), from the same settings, usage and billing auto reads."""
+        from claude_swap.autoswitch import priority_order, tier_capacity
+        from claude_swap.settings import parse_priority
+
+        settings = load_settings(self.backup_dir)
+        models = parse_model_names(settings.model)
+        nums = [str(i[0]) for i in accounts_info]
+        usage = {
+            n: (entries[n].last_good if entries[n].sentinel is None else None)
+            for n in nums
+        }
+        switchable = set(self.switchable_account_numbers())
+        unusable = {
+            n for n in nums
+            if n not in switchable
+            or (self.account_kind_for(n) == "api_key" and not settings.include_api_key_accounts)
+        }
+        by_email = {str(i[1]).lower(): str(i[0]) for i in accounts_info}
+        priority = [
+            num for name in parse_priority(settings.priority)
+            if (num := name if name in nums else by_email.get(name.lower())) is not None
+        ]
+        perish = self.perish_inputs()
+        return priority_order(
+            nums,
+            consume_first=settings.strategy == "consume-first",
+            usage=usage,
+            headroom={n: oauth.account_headroom(usage[n], models) for n in nums},
+            perish=perish,
+            caps={n: tier_capacity(v["tier"]) for n, v in perish.items() if v.get("tier")},
+            priority=priority,
+            threshold=settings.threshold,
+            unusable=unusable,
+            now=time.time(),
+        )
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
@@ -7305,7 +7368,19 @@ class ClaudeAccountSwitcher:
             )
 
         seq_data = self._get_sequence_data() or {}
-        print(bolded("Accounts:"))
+        from claude_swap.settings import load_ui_settings
+
+        by_priority = load_ui_settings(self.backup_dir).list_order == "priority"
+        if by_priority:
+            order = self.switch_priority_order(accounts_info, entries)
+            position = {num: i for i, num in enumerate(order)}
+            accounts_info = sorted(accounts_info, key=lambda info: position[str(info[0])])
+            print(bolded("Accounts:") + " " + dimmed(
+                f"(auto's switch priority, {load_settings(self.backup_dir).strategy}: "
+                "first = preferred)"
+            ))
+        else:
+            print(bolded("Accounts:"))
         placement = self._placement_line()
         if placement:
             print(placement)
@@ -7320,7 +7395,11 @@ class ClaudeAccountSwitcher:
             needs_login = self._needs_login_from_data(seq_data, str(num))
             if needs_login:
                 markers += f" {yellowed('(needs login)')}"
-            print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
+            slot = f"{i + 1:>2}. acc #{num}" if by_priority else f"{num}"
+            mark = account_mark(billing.get(str(num)))
+            if mark:
+                label = f"{mark} {label}"
+            print(f"  {slot}: {label} {muted(f'[{tag}]')}{markers}")
             bills = billing_text(billing.get(str(num)))
             week = weekly_text(weekly.get(str(num)))
             for line in _usage_entry_lines(entries[str(num)], bills, week):

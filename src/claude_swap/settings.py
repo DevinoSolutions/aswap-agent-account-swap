@@ -117,12 +117,29 @@ class UiSettings:
 
     theme: str = "auto"
     view: str = "combined"
+    # ``aswap list`` order: "slot" (account number) or "priority" (the order
+    # auto prefers switch targets, most preferred first).
+    list_order: str = "slot"
+
+
+@dataclass(frozen=True)
+class LoginSettings:
+    """``aswap login`` (``login`` section).
+
+    ``push_to`` is a comma-separated list of SSH hosts. After a login mints
+    this machine's Claude Code token, each host gets a token of its own for
+    the same account (``aswap token push``): a refresh token is single-use,
+    so machines sharing one would invalidate each other.
+    """
+
+    push_to: str | None = None
 
 
 _SECTION_DEFAULT_SOURCES = {
     "autoswitch": AutoSwitchSettings,
     "profiles": ProfileSettings,
     "ui": UiSettings,
+    "login": LoginSettings,
 }
 
 # Boolean keys where a JSON *string* must NOT be believed. `bool("false")`
@@ -249,6 +266,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "ui", "view", "view", "choice",
             choices=("combined", "claude", "codex"),
             help="Dashboard view: both providers, or only one",
+        ),
+        SettingSpec(
+            "ui", "listOrder", "list_order", "choice", choices=("slot", "priority"),
+            help="aswap list order: slot number, or auto's switch priority (most preferred first)",
+        ),
+        SettingSpec(
+            "login", "pushTo", "push_to", "string",
+            help="SSH hosts that get their own token at each aswap login (comma-separated)",
         ),
     )
 }
@@ -422,7 +447,31 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
             view, default.view,
         )
         view = default.view
-    return UiSettings(theme=theme, view=view)
+    list_order = section.get("listOrder", default.list_order)
+    if list_order not in SETTING_SPECS["ui.listOrder"].choices:
+        _logger.warning(
+            "settings.json: unsupported ui.listOrder %r; using %r",
+            list_order, default.list_order,
+        )
+        list_order = default.list_order
+    return UiSettings(theme=theme, view=view, list_order=list_order)
+
+
+def load_login_settings(backup_root: Path) -> LoginSettings:
+    """Load the ``login`` section; missing/corrupt file or fields → defaults."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("login")
+    if not isinstance(section, dict):
+        return LoginSettings()
+    value = section.get("pushTo")
+    return LoginSettings(push_to=value if isinstance(value, str) and value.strip() else None)
+
+
+def parse_hosts(value: str | None) -> tuple[str, ...]:
+    """Split ``login.pushTo`` (or ``--to``) into hosts, trimmed and deduped."""
+    if not value:
+        return ()
+    return tuple(dict.fromkeys(h.strip() for h in value.replace(" ", ",").split(",") if h.strip()))
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -729,6 +778,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         "autoswitch": load_settings(backup_root),
         "profiles": load_profile_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "login": load_login_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():

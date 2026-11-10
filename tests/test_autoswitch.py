@@ -7177,9 +7177,10 @@ class TestConsumeFirstEndingFirst:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
-    def test_a_stale_cancellation_no_longer_steers(self, temp_home):
-        # Owner rule 2026-11-01: only a confirmed, current cancellation counts;
-        # the plan may have been resumed since an old reading.
+    def test_a_stale_cancellation_still_ends_the_period(self, temp_home):
+        # Owner rule 2026-11-01 counted only a fresh, confirmed cancel. Since
+        # 2026-11-10 the period end counts either way: cancelled or resumed,
+        # the paid period ends (or renews) at that instant.
         h = self._harness(temp_home)
         self._ends(
             h, 3, "c@example.com", "2024-01-02T00:00:00+00:00",
@@ -7190,7 +7191,7 @@ class TestConsumeFirstEndingFirst:
             "2": _usage7(10, 10, _R_SOON),
             "3": _usage7(10, 10, _R_LATEST),
         })
-        assert h.active_number() != 3
+        assert h.active_number() == 3
 
     def test_without_billing_data_ranking_is_unchanged(self, temp_home):
         h = self._harness(temp_home)

@@ -156,6 +156,7 @@ def billing_view(
     now: float | None = None,
     session_state: str | None = None,
     period_start: tuple[str, str] | None = None,
+    cancelled_at: str | None = None,
 ) -> dict | None:
     """Display/JSON view of a cached record.
 
@@ -169,6 +170,11 @@ def billing_view(
     remembered start of the current period (``weekly_anchor.period_start``:
     a detected resubscribe, or one set with ``aswap billing paid``).
     ``basis`` says which one the estimate used.
+
+    ``cancelled_at`` is a cancel the owner recorded by hand (``aswap billing
+    cancelled``) for accounts aswap cannot read claude.ai billing for. It
+    turns the next renewal into ``endsAt`` and sets ``cancelRecorded``; a
+    purchase after it voids it.
     """
     if not isinstance(record, dict):
         return None
@@ -187,13 +193,23 @@ def billing_view(
         "sessionState": session_state,
     }
     renewing = status is None or status in _RENEWING_STATUSES
+    cancelled = _parse_iso(cancelled_at) if isinstance(cancelled_at, str) else None
     if record.get("source") == "exact":
         period_end = _parse_iso(record.get("currentPeriodEnd") or "")
         if period_end is not None and period_end > now_dt:
             view["source"] = "exact"
             view["nextBillingEstimated"] = False
+            fetched = record.get("fetchedAt")
+            recorded = cancelled is not None and (
+                not isinstance(fetched, (int, float)) or cancelled.timestamp() > fetched
+            )
             if record.get("cancelAtPeriodEnd"):
                 view["endsAt"] = period_end.isoformat()
+            elif recorded and renewing:
+                # Cancelled since the last claude.ai reading: trust the owner
+                # until the next reading says otherwise.
+                view["endsAt"] = period_end.isoformat()
+                view["cancelRecorded"] = cancelled_at
             elif renewing:
                 view["nextBillingAt"] = period_end.isoformat()
             return view
@@ -208,8 +224,19 @@ def billing_view(
         if remembered is not None and (anchor is None or remembered > anchor):
             anchor, basis = remembered, (period_start[1], period_start[0])
     if anchor is None:
+        if cancelled is not None and renewing:
+            view["cancelRecorded"] = cancelled_at
+            return view
         return view if view["source"] == "exact" or status else None
     view["basis"] = {"source": basis[0], "at": basis[1]}
+    if renewing and cancelled is not None and cancelled > anchor:
+        # Recorded cancel in this period (a later purchase voids it): the
+        # plan runs to the first renewal after the cancel, then stops.
+        view["cancelRecorded"] = cancelled_at
+        end = next_renewal(anchor, cancelled)
+        if end > now_dt:
+            view["endsAt"] = end.isoformat()
+        return view
     if renewing:
         view["nextBillingAt"] = next_renewal(anchor, now_dt).isoformat()
     return view
@@ -242,6 +269,79 @@ def ends_at_ts(view: dict | None) -> float | None:
     return parsed.timestamp() if parsed else None
 
 
+def period_end_ts(view: dict | None, now: float) -> float | None:
+    """Epoch the current paid period ends (renewal or scheduled end), or None.
+
+    consume-first treats it as when weekly quota perishes: accounts are
+    cancelled before they renew, so quota unused by then is lost.
+    """
+    value = (view or {}).get("endsAt") or (view or {}).get("nextBillingAt")
+    parsed = _parse_iso(value) if isinstance(value, str) else None
+    if parsed is None or parsed.timestamp() <= now:
+        return None
+    return parsed.timestamp()
+
+
+CANCELLED_MARK = "❌"  # fully ended
+CANCELLING_MARK = "⏳"  # cancelled, paid time still left
+_CANCELLED_STATUSES = frozenset({"canceled", "cancelled"})
+
+
+def is_cancelled(view: dict | None) -> bool:
+    """A cancelled plan: still running to its end, or already lapsed.
+
+    Marked in the list and the dashboard so these accounts stand out (owner
+    ask 2026-11-09): ``CANCELLING_MARK`` while time is left, else
+    ``CANCELLED_MARK`` (see ``account_mark``). Past due, unpaid or free are
+    not cancellations and stay unmarked.
+    """
+    if not view:
+        return False
+    return (
+        bool(view.get("endsAt"))
+        or bool(view.get("cancelRecorded"))
+        or view.get("subscriptionStatus") in _CANCELLED_STATUSES
+    )
+
+
+RENEWS_SOON_MARK = "⏰"
+# How close a renewal has to be to get ``RENEWS_SOON_MARK``: long enough to
+# act on (cancel before it charges), short enough to stay rare.
+RENEWS_SOON_S = 3 * 86400
+
+
+def renews_soon(view: dict | None, now: float | None = None) -> bool:
+    """Still renewing, and the next charge is within ``RENEWS_SOON_S``.
+
+    Owner ask 2026-11-10: flag the accounts about to be charged so they get
+    cancelled in time. Cancelled ones get their own marks instead.
+    """
+    if not view or is_cancelled(view):
+        return False
+    value = view.get("nextBillingAt")
+    nxt = _parse_iso(value) if isinstance(value, str) else None
+    if nxt is None:
+        return False
+    left = nxt.timestamp() - (time.time() if now is None else now)
+    return 0 < left <= RENEWS_SOON_S
+
+
+def account_mark(view: dict | None, now: float | None = None) -> str | None:
+    """The emoji before an account's email, or None.
+
+    ``CANCELLING_MARK`` cancelled with time left, ``CANCELLED_MARK`` ended,
+    ``RENEWS_SOON_MARK`` charging within ``RENEWS_SOON_S`` (owner asks
+    2026-11-09/10).
+    """
+    if view and view.get("endsAt"):
+        return CANCELLING_MARK
+    if is_cancelled(view):
+        return CANCELLED_MARK
+    if renews_soon(view, now):
+        return RENEWS_SOON_MARK
+    return None
+
+
 def _when(iso: str) -> str:
     countdown, _clock = oauth.format_reset(iso)
     local = datetime.fromisoformat(iso).astimezone()
@@ -260,8 +360,11 @@ def billing_text(view: dict | None) -> str | None:
     note = ""
     if view.get("sessionState") == "expired":
         note = "  · session expired: aswap billing login"
+    recorded = " (cancel recorded)" if view.get("cancelRecorded") else " (cancelling)"
     if view.get("endsAt"):
-        return f"ends {_when(view['endsAt'])} (cancelling){note}"
+        return f"ends {_when(view['endsAt'])}{recorded}{note}"
+    if view.get("cancelRecorded"):
+        return f"cancelled (recorded){note}"
     next_at = view.get("nextBillingAt")
     if next_at:
         mark = "~" if view.get("nextBillingEstimated", True) else ""
@@ -607,7 +710,8 @@ def _log_cancel_change(num: str, email: str, before: dict | None, after: dict) -
     if was == now:
         return
     if now:
-        end = after.get("currentPeriodEnd") or "?"
+        parsed = _parse_iso(after.get("currentPeriodEnd") or "")
+        end = f"{parsed.astimezone():%a %b {parsed.astimezone().day} %H:%M}" if parsed else "?"
         _logger.info(
             "📅 Account %s (%s): cancellation confirmed by claude.ai, plan ends %s; "
             "consume-first treats that as its reset",

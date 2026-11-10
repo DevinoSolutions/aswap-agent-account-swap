@@ -15,7 +15,7 @@ from rich.text import Text
 from textual.widgets import ListItem, ListView, Static
 
 from claude_swap import gate, oauth, pace
-from claude_swap.billing import billing_text
+from claude_swap.billing import account_mark, billing_text
 from claude_swap.weekly_anchor import weekly_text
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
@@ -202,12 +202,14 @@ def account_card_text(
     tag: str | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    rank: int | None = None,
 ) -> Text:
     """The full account card: header line + per-window bar rows."""
     now = now if now is not None else time.time()
 
     text = Text()
-    text.append(f"{acc.number:>2}  ", style=f"bold {palette.foreground}")
+    text.append(_number_label(acc, rank), style=f"bold {palette.foreground}")
+    _append_account_mark(text, acc)
     if acc.alias:
         text.append(acc.alias, style=f"bold {palette.accent}")
         text.append(f" ({acc.email})", style=palette.foreground)
@@ -304,8 +306,26 @@ def _append_billing(text: Text, acc: AccountSnapshot, palette: Palette) -> None:
         text.append(bills, style=palette.foreground)
 
 
+def _append_account_mark(text: Text, acc: AccountSnapshot) -> None:
+    """``⏳`` / ``❌`` / ``⏰`` before the email (see ``billing.account_mark``)."""
+    mark = account_mark(acc.billing)
+    if mark:
+        text.append(f"{mark} ")
+
+
+def _number_label(acc: AccountSnapshot, rank: int | None) -> str:
+    """Row prefix: the slot, or ``" 3. acc #17  "`` when rows are ranked."""
+    if rank is None:
+        return f"{acc.number:>2}  "
+    return f"{rank:>2}. acc #{acc.number:<2}  "
+
+
 def mini_account_text(
-    acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
+    acc: AccountSnapshot,
+    now: float,
+    *,
+    palette: Palette = Palette.DARK,
+    rank: int | None = None,
 ) -> Text:
     """One minimized line for an inactive account.
 
@@ -315,7 +335,8 @@ def mini_account_text(
     their label instead.
     """
     text = Text(no_wrap=True, overflow="ellipsis")
-    text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")
+    text.append(_number_label(acc, rank), style=f"bold {palette.muted}")
+    _append_account_mark(text, acc)
     if acc.alias:
         text.append(acc.alias, style=f"bold {palette.accent}")
         text.append(f" ({acc.email})", style=palette.foreground)
@@ -458,7 +479,8 @@ class AccountsPanel(Static):
                 continue
 
             blocks: list[Text] = []
-            for acc in snap.accounts:
+            for i, acc in enumerate(snap.accounts, 1):
+                rank = i if snap.ranked else None
                 if acc.is_active:
                     blocks.append(
                         account_card_text(
@@ -467,10 +489,11 @@ class AccountsPanel(Static):
                             threshold=app.threshold_pct,
                             now=now,
                             palette=palette,
+                            rank=rank,
                         )
                     )
                 elif self._show_minis:
-                    blocks.append(mini_account_text(acc, now, palette=palette))
+                    blocks.append(mini_account_text(acc, now, palette=palette, rank=rank))
             if not blocks:
                 text.append("no active managed login", style=palette.muted)
             previous_multiline = False

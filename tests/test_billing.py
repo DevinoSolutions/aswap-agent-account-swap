@@ -349,6 +349,55 @@ class TestExact:
         assert view["nextBillingAt"] is None and view["endsAt"] is None
         assert billing.billing_text(view) == "subscription canceled"
 
+    def test_cancelled_mark(self):
+        assert billing.is_cancelled(billing.billing_view(self._rec(cancelAtPeriodEnd=True), self.NOW))
+        lapsed = self._rec(subscriptionStatus="canceled", currentPeriodEnd=None)
+        assert billing.is_cancelled(billing.billing_view(lapsed, self.NOW))
+        assert not billing.is_cancelled(billing.billing_view(self._rec(), self.NOW))
+        past_due = self._rec(subscriptionStatus="past_due", currentPeriodEnd=None)
+        assert not billing.is_cancelled(billing.billing_view(past_due, self.NOW))
+        assert not billing.is_cancelled(None)
+
+    def test_marks(self):
+        ending = billing.billing_view(self._rec(cancelAtPeriodEnd=True), self.NOW)
+        assert billing.account_mark(ending, self.NOW) == billing.CANCELLING_MARK
+        lapsed = billing.billing_view(self._rec(subscriptionStatus="canceled", currentPeriodEnd=None), self.NOW)
+        assert billing.account_mark(lapsed, self.NOW) == billing.CANCELLED_MARK
+        renewing = billing.billing_view(self._rec(), self.NOW)
+        end = _dt("2026-10-20T09:00:00").timestamp()
+        assert billing.account_mark(renewing, end - 2 * 86400) == billing.RENEWS_SOON_MARK
+        assert billing.account_mark(renewing, end - 4 * 86400) is None
+        assert billing.account_mark(None) is None
+
+    def test_recorded_cancel_on_exact_record(self):
+        rec = self._rec(fetchedAt=_dt("2026-10-08T00:00:00").timestamp())
+        view = billing.billing_view(rec, self.NOW, cancelled_at="2026-10-09T00:00:00+00:00")
+        assert view["endsAt"] == "2026-10-20T09:00:00+00:00" and view["nextBillingAt"] is None
+        assert billing.billing_text(view).endswith("(cancel recorded)")
+        # A claude.ai reading after the recorded cancel wins.
+        rec["fetchedAt"] = _dt("2026-10-09T01:00:00").timestamp()
+        view = billing.billing_view(rec, self.NOW, cancelled_at="2026-10-09T00:00:00+00:00")
+        assert view["endsAt"] is None and view["nextBillingAt"]
+
+    def test_recorded_cancel_on_estimate(self):
+        rec = {"subscriptionStatus": "active", "subscriptionCreatedAt": "2026-07-12T14:28:34Z"}
+        # Cancelled Oct 9 inside the Sep 12 -> Oct 12 period: ends Oct 12.
+        view = billing.billing_view(rec, self.NOW, cancelled_at="2026-10-09T00:00:00+00:00")
+        assert view["endsAt"] == "2026-10-12T14:28:34+00:00"
+        assert billing.account_mark(view, self.NOW) == billing.CANCELLING_MARK
+        # Past that end: ended.
+        later = _dt("2026-10-13T00:00:00").timestamp()
+        view = billing.billing_view(rec, later, cancelled_at="2026-10-09T00:00:00+00:00")
+        assert view["endsAt"] is None and view["nextBillingAt"] is None
+        assert billing.account_mark(view, later) == billing.CANCELLED_MARK
+        assert billing.billing_text(view) == "cancelled (recorded)"
+        # A purchase after the cancel voids it.
+        view = billing.billing_view(
+            rec, later, period_start=("2026-10-12T20:00:00+00:00", "paid"),
+            cancelled_at="2026-10-09T00:00:00+00:00",
+        )
+        assert view["nextBillingAt"] and not billing.is_cancelled(view)
+
     def test_expired_session_note(self):
         view = billing.billing_view(self._rec(), self.NOW, session_state="expired")
         assert "billing login" in billing.billing_text(view)
@@ -627,7 +676,7 @@ class TestCancelLog:
             bs,
             "fetch_subscription_details",
             lambda key, org: {
-                "periodEnd": "2099-01-01T00:00:00+00:00",
+                "periodEnd": "2099-01-01T12:00:00+00:00",
                 "cancelAtPeriodEnd": cancelling,
                 "status": "active", "interval": "monthly", "keys": [],
             },
@@ -644,5 +693,8 @@ class TestCancelLog:
         self._refresh(tmp_path, monkeypatch, cache, False)
         lines = [r.getMessage() for r in caplog.records if "📅" in r.getMessage()]
         assert len(lines) == 2
-        assert "cancellation confirmed" in lines[0] and "2099-01-01" in lines[0]
+        # Stored in UTC, logged in local time.
+        local = datetime.fromisoformat("2099-01-01T12:00:00+00:00").astimezone()
+        assert "cancellation confirmed" in lines[0]
+        assert f"plan ends {local:%a %b} {local.day} {local:%H:%M};" in lines[0]
         assert "no longer cancelling" in lines[1]
