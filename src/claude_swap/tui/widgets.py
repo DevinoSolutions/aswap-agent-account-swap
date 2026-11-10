@@ -15,7 +15,7 @@ from rich.text import Text
 from textual.widgets import ListItem, ListView, Static
 
 from claude_swap import gate, oauth, pace
-from claude_swap.billing import billing_text
+from claude_swap.billing import CANCELLED_MARK, billing_text, is_cancelled
 from claude_swap.weekly_anchor import weekly_text
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
@@ -209,6 +209,7 @@ def account_card_text(
 
     text = Text()
     text.append(_number_label(acc, rank), style=f"bold {palette.foreground}")
+    _append_cancelled_mark(text, acc)
     if acc.alias:
         text.append(acc.alias, style=f"bold {palette.accent}")
         text.append(f" ({acc.email})", style=palette.foreground)
@@ -305,6 +306,12 @@ def _append_billing(text: Text, acc: AccountSnapshot, palette: Palette) -> None:
         text.append(bills, style=palette.foreground)
 
 
+def _append_cancelled_mark(text: Text, acc: AccountSnapshot) -> None:
+    """``❌`` before the email of an account whose plan is cancelled."""
+    if is_cancelled(acc.billing):
+        text.append(f"{CANCELLED_MARK} ")
+
+
 def _number_label(acc: AccountSnapshot, rank: int | None) -> str:
     """Row prefix: the slot, or ``" 3. acc #17  "`` when rows are ranked."""
     if rank is None:
@@ -328,6 +335,7 @@ def mini_account_text(
     """
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append(_number_label(acc, rank), style=f"bold {palette.muted}")
+    _append_cancelled_mark(text, acc)
     if acc.alias:
         text.append(acc.alias, style=f"bold {palette.accent}")
         text.append(f" ({acc.email})", style=palette.foreground)

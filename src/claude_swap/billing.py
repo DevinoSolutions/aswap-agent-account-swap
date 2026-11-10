@@ -242,6 +242,22 @@ def ends_at_ts(view: dict | None) -> float | None:
     return parsed.timestamp() if parsed else None
 
 
+CANCELLED_MARK = "❌"
+_CANCELLED_STATUSES = frozenset({"canceled", "cancelled"})
+
+
+def is_cancelled(view: dict | None) -> bool:
+    """A cancelled plan: still running to its end, or already lapsed.
+
+    Marked with ``CANCELLED_MARK`` in the list and the dashboard so these
+    accounts stand out (owner ask 2026-11-09). Past due, unpaid or free are
+    not cancellations and stay unmarked.
+    """
+    if not view:
+        return False
+    return bool(view.get("endsAt")) or view.get("subscriptionStatus") in _CANCELLED_STATUSES
+
+
 def _when(iso: str) -> str:
     countdown, _clock = oauth.format_reset(iso)
     local = datetime.fromisoformat(iso).astimezone()

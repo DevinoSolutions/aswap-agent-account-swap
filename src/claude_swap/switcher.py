@@ -62,9 +62,11 @@ from claude_swap.billing import (
     PLAN_RECHECK_MIN_S,
     PLAN_REFRESH_S,
     SESSION_BILLING_SCAN_S,
+    CANCELLED_MARK,
     BillingCache,
     billing_text,
     billing_view,
+    is_cancelled,
     looks_lapsed,
 )
 from claude_swap.billing_session import SessionStore
@@ -7381,6 +7383,8 @@ class ClaudeAccountSwitcher:
             if needs_login:
                 markers += f" {yellowed('(needs login)')}"
             slot = f"{i + 1:>2}. acc #{num}" if by_priority else f"{num}"
+            if is_cancelled(billing.get(str(num))):
+                label = f"{CANCELLED_MARK} {label}"
             print(f"  {slot}: {label} {muted(f'[{tag}]')}{markers}")
             bills = billing_text(billing.get(str(num)))
             week = weekly_text(weekly.get(str(num)))

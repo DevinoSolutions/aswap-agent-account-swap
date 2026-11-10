@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -384,6 +384,32 @@ class TestPlanCommand:
         out = capsys.readouterr().out
         assert "27: banned@example.com  [disabled" in out
         assert "buy now" not in out
+
+
+class TestCancelledMarkInList:
+    def test_list_marks_cancelled_accounts(self, temp_home, capsys):
+        from unittest.mock import patch
+
+        from tests.test_autoswitch import EngineHarness
+
+        h = EngineHarness(temp_home)
+        h.seed(3, "ending@example.com")
+        h.seed(4, "lapsed@example.com")
+        h.seed(5, "paying@example.com")
+        ends = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        views = {
+            "3": {"subscriptionStatus": "active", "endsAt": ends},
+            "4": {"subscriptionStatus": "canceled"},
+            "5": {"subscriptionStatus": "active", "nextBillingAt": ends},
+        }
+        capsys.readouterr()
+        with patch.object(h.switcher, "_billing_views", return_value=views), \
+             patch.object(h.switcher, "usage_entries_by_account", return_value={}):
+            h.switcher.list_accounts()
+        out = capsys.readouterr().out
+        assert "❌ ending@example.com" in out
+        assert "❌ lapsed@example.com" in out
+        assert "❌ paying@example.com" not in out and "paying@example.com" in out
 
 
 class TestRefreshCommand:
