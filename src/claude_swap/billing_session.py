@@ -89,6 +89,23 @@ def _now_iso() -> str:
 
 # --- store -------------------------------------------------------------------
 
+# How long a session marked expired waits before it is tried again. A mark
+# was permanent until ``aswap login``, and working sessions got marked: the
+# Claude Code consent page's reauth step read as a dead login (2026-11-15:
+# melodymix@ and amin@ sat at "session expired" with sessions that worked).
+EXPIRED_RETRY_S = 12 * 3600.0
+
+
+def session_usable(row: dict | None, now: float | None = None) -> bool:
+    """Whether a stored session is worth a request: not marked expired, or
+    marked but due its periodic re-check (rows marked before ``retryAt``
+    existed are due at once)."""
+    if not row or not isinstance(row.get("sessionKey"), str):
+        return False
+    if row.get("status") != "expired":
+        return True
+    return (row.get("retryAt") or 0) <= (time.time() if now is None else now)
+
 
 class SessionStore:
     """``<root>/billing_sessions.json``: identity → claude.ai session."""
@@ -134,7 +151,7 @@ class SessionStore:
             }
             self._save(rows)
 
-    def mark(self, identity: Identity, status: str) -> None:
+    def mark(self, identity: Identity, status: str, now: float | None = None) -> None:
         with self._lock():
             rows = self.rows()
             row = rows.get(_key(identity))
@@ -142,6 +159,11 @@ class SessionStore:
                 return
             if status == "ok":
                 row["lastOkAt"] = _now_iso()
+                row.pop("retryAt", None)
+            elif status == "expired":
+                # Re-armed on every failed check, so a dead session costs
+                # one request per EXPIRED_RETRY_S, not one per refresh.
+                row["retryAt"] = (time.time() if now is None else now) + EXPIRED_RETRY_S
             elif row.get("status") == status:
                 return
             row["status"] = status
@@ -898,8 +920,17 @@ async def _nd_mint_oauth_tokens(
     nd_browser,
     timeout_s: float,
     out,
+    email: str | None = None,
+    root: Path | None = None,
+    on_session=None,
 ) -> dict:
-    """Async implementation of ``mint_oauth_tokens`` using nodriver."""
+    """Async implementation of ``mint_oauth_tokens`` using nodriver.
+
+    ``email`` (and ``root``, for the login inboxes) let it answer claude.ai's
+    reauth step itself; without them that step ends the mint. That fresh
+    sign-in revokes the session the browser had (measured 2026-11-15: the old
+    key turned 403 at once), so its new ``sessionKey`` goes to ``on_session``.
+    """
     import asyncio
     import http.server
     import threading
@@ -955,33 +986,59 @@ async def _nd_mint_oauth_tokens(
     out("Obtaining Claude Code token (approving the consent screen for you)...")
 
     deadline = time.monotonic() + timeout_s
-    on_login = no_plan = 0
-    while time.monotonic() < deadline:
-        if auth_code:
-            break
-        try:
-            await tab.evaluate(_CLICK_AUTHORIZE_JS)
-            on_login = on_login + 1 if await tab.evaluate(_ON_LOGIN_PAGE_JS) else 0
-            no_plan = no_plan + 1 if await tab.evaluate(_NO_PLAN_JS) else 0
-        except Exception:
-            pass  # page mid-navigation; try again next tick
-        if auth_error:
-            srv.server_close()
-            raise OAuthError(f"authorize failed: {auth_error[0]}")
-        if on_login >= _SIGNED_OUT_TICKS:
-            srv.server_close()
-            raise SignedOut("claude.ai asked to sign in again: the saved login has expired")
-        if no_plan >= _NO_PLAN_TICKS:
-            srv.server_close()
-            raise NoPlan("claude.ai says a Pro or Max plan is required to connect Claude Code")
-        await asyncio.sleep(0.5)
-    else:
+    on_login = no_plan = off_flow = 0
+    prefill = None  # the fresh sign-in the reauth step asked for
+    reopened = False
+    try:
+        while time.monotonic() < deadline:
+            if auth_code:
+                break
+            try:
+                await tab.evaluate(_CLICK_AUTHORIZE_JS)
+                on_login = on_login + 1 if await tab.evaluate(_ON_LOGIN_PAGE_JS) else 0
+                no_plan = no_plan + 1 if await tab.evaluate(_NO_PLAN_JS) else 0
+                reauth = await tab.evaluate(_REAUTH_PAGE_JS)
+                if prefill is not None and prefill.done() and not reopened:
+                    # The sign-in link may land on claude.ai's home page
+                    # rather than back on the consent page: go back to it.
+                    in_flow = await tab.evaluate(_IN_SIGN_IN_FLOW_JS)
+                    off_flow = 0 if in_flow else off_flow + 1
+                    if off_flow >= _OFF_FLOW_TICKS:
+                        reopened = True
+                        await tab.get(authorize_url)
+            except Exception:
+                reauth = False  # page mid-navigation; try again next tick
+            if auth_error:
+                raise OAuthError(f"authorize failed: {auth_error[0]}")
+            if reauth and prefill is None:
+                # The session still works; claude.ai only wants a recent
+                # sign-in before connecting Claude Code (seen 2026-11-15).
+                if not email:
+                    raise ReauthRequired(_REAUTH_MESSAGE)
+                out(f"claude.ai wants a fresh sign-in before connecting Claude Code; signing in as {email}...")
+                prefill = _start_prefill(tab, email, out, root)
+                deadline = max(deadline, time.monotonic() + REAUTH_WAIT_S)
+            if prefill is not None:
+                on_login = 0  # waiting on the sign-in, not signed out
+            if on_login >= _SIGNED_OUT_TICKS:
+                raise SignedOut("claude.ai asked to sign in again: the saved login has expired")
+            if no_plan >= _NO_PLAN_TICKS:
+                raise NoPlan("claude.ai says a Pro or Max plan is required to connect Claude Code")
+            await asyncio.sleep(0.5)
+        else:
+            if prefill is not None:
+                raise ReauthRequired(f"{_REAUTH_MESSAGE}, and the sign-in did not finish in time")
+            raise OAuthError(
+                f"timed out after {int(timeout_s)}s waiting for the OAuth callback — "
+                "the consent screen may need manual approval"
+            )
+    finally:
+        _stop_prefill(prefill)
         srv.server_close()
-        raise OAuthError(
-            f"timed out after {int(timeout_s)}s waiting for the OAuth callback — "
-            "the consent screen may need manual approval"
-        )
-    srv.server_close()
+    if prefill is not None and on_session is not None:
+        fresh = _session_cookie(await _nd_cookies(nd_browser))
+        if fresh:
+            on_session(fresh)
 
     code = auth_code[0]
     token_body = json.dumps({
@@ -1282,6 +1339,25 @@ _CLICK_AUTHORIZE_JS = (
 _ON_LOGIN_PAGE_JS = "location.hostname.endsWith('claude.ai') && location.pathname.startsWith('/login')"
 _SIGNED_OUT_TICKS = 6
 
+# A signed-in browser can still be sent from the consent page to
+# /login?reauth=1&from=logout ("Continue with your Claude.ai account to
+# authenticate connections"): claude.ai wants a recent sign-in before it
+# connects Claude Code, while the session itself keeps working (measured
+# 2026-11-15 on cool@ and super@, sessions weeks old). Not a dead login.
+_REAUTH_PAGE_JS = (
+    "location.hostname.endsWith('claude.ai') && location.pathname.startsWith('/login')"
+    " && new URLSearchParams(location.search).get('reauth') === '1'"
+)
+_REAUTH_MESSAGE = "claude.ai wants a fresh sign-in before connecting Claude Code"
+# The email sign-in takes ~75 s (the link page spins ~60 s); room for a slow mail.
+REAUTH_WAIT_S = 240.0
+# Pages the fresh sign-in passes through. Elsewhere for 2 s once it is done
+# (the link landed on the home page), the consent page is opened again.
+_IN_SIGN_IN_FLOW_JS = (
+    "['/login', '/oauth/', '/magic-link', '/verify'].some(p => location.pathname.startsWith(p))"
+)
+_OFF_FLOW_TICKS = 4
+
 # An account without a paid plan gets "Claude Max, Ultra, or Pro is required
 # to connect to Claude Code" instead of the consent page (seen 2026-11-10 on
 # a lapsed account); no callback ever comes, so stop at once.
@@ -1319,6 +1395,14 @@ class NoPlan(OAuthError):
     """The account has no paid plan, so Claude Code cannot be connected."""
 
 
+class ReauthRequired(OAuthError):
+    """claude.ai wants a fresh sign-in before connecting Claude Code.
+
+    Deliberately not ``SignedOut``: the saved session still works, so it
+    must not be marked expired.
+    """
+
+
 def _generate_pkce() -> tuple[str, str]:
     """Return ``(code_verifier, code_challenge)`` for S256 PKCE."""
     import base64
@@ -1338,6 +1422,9 @@ def mint_oauth_tokens(
     out=print,
     clock=time.monotonic,
     sleep=time.sleep,
+    email: str | None = None,
+    root: Path | None = None,
+    on_session=None,
 ) -> dict:
     """Use an authenticated browser to obtain Claude Code OAuth tokens.
 
@@ -1351,7 +1438,9 @@ def mint_oauth_tokens(
     Works with both ``NodriverBrowser`` and ``CdpBrowser``.
     """
     if isinstance(browser, NodriverBrowser):
-        return _nd_run(_nd_mint_oauth_tokens(browser._browser, timeout_s, out))
+        return _nd_run(_nd_mint_oauth_tokens(
+            browser._browser, timeout_s, out, email=email, root=root, on_session=on_session,
+        ))
     import http.server
     import threading
     import urllib.parse

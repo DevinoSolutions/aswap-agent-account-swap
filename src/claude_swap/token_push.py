@@ -49,11 +49,21 @@ def pace_mint(root: Path, *, out=print, rng=random.uniform, now=time.time, sleep
     atomic_write_json(path, {"last": now()})
 
 
-def mint_credentials(browser, root: Path, *, out=print, paced: bool = True) -> str:
-    """Mint a fresh token from a signed-in browser; returns Claude Code's credential JSON."""
+def mint_credentials(
+    browser, root: Path, *, out=print, paced: bool = True, email: str | None = None,
+    on_session=None,
+) -> str:
+    """Mint a fresh token from a signed-in browser; returns Claude Code's credential JSON.
+
+    ``email`` lets the mint answer claude.ai's reauth step with a fresh
+    sign-in; ``on_session`` then gets the new claude.ai session key (the
+    sign-in revokes the old one).
+    """
     if paced:
         pace_mint(root, out=out)
-    token_data = bs.mint_oauth_tokens(browser, out=out)
+    token_data = bs.mint_oauth_tokens(
+        browser, out=out, email=email, root=root, on_session=on_session,
+    )
     try:
         profile = oauth.request_profile_data(token_data["access_token"])
     except Exception:  # noqa: BLE001 - plan fields stay unset; the token still works
@@ -127,19 +137,34 @@ def receive(sw, stream=None) -> str:
     return f"Account-{num} ({email}): stored {' and '.join(stored)}"
 
 
-def push_to_hosts(open_browser, root: Path, email: str, session_key: str | None, hosts, *, out=print) -> int:
+def push_to_hosts(
+    open_browser, root: Path, email: str, session_key: str | None, hosts, *, out=print,
+    on_session=None,
+) -> int:
     """Mint one token per host and send each; returns how many landed.
 
     ``open_browser()`` returns a signed-in browser. Chrome runs only for the
     mint itself: it is opened after the pacing wait and closed right after.
+    A reauth sign-in replaces the session: ``on_session`` gets the new key
+    (the caller saves it and its ``open_browser`` must use it from then on),
+    and later hosts are sent the new one.
     """
+
+    def fresh(key: str) -> None:
+        nonlocal session_key
+        session_key = key
+        if on_session is not None:
+            on_session(key)
+
     landed = 0
     for host in hosts:
         try:
             pace_mint(root, out=out)
             browser = open_browser()
             try:
-                credentials = mint_credentials(browser, root, out=out, paced=False)
+                credentials = mint_credentials(
+                    browser, root, out=out, paced=False, email=email, on_session=fresh,
+                )
             finally:
                 browser.close()
             report = send(host, email, credentials, session_key)
@@ -190,7 +215,7 @@ def _saved_login(sw, identity) -> str | None:
     """The saved claude.ai session when it still works (or cannot be checked)."""
     row = sw._sessions.get(identity) or {}
     key = row.get("sessionKey")
-    if not key or row.get("status") == "expired":
+    if not bs.session_usable(row):
         return None
     try:
         bs.fetch_organizations(key)
@@ -199,6 +224,8 @@ def _saved_login(sw, identity) -> str | None:
         return None
     except bs.BillingSessionError:
         pass  # unreachable or rate-limited: the consent page will tell
+    else:
+        sw._sessions.mark(identity, "ok")
     return key
 
 
@@ -217,13 +244,18 @@ def _push_account(sw, identity, hosts, args) -> int:
     def opener():
         return bs.open_signed_in(sw.backup_dir, email, key, chrome=args.chrome)
 
+    def fresh(new_key: str) -> None:
+        nonlocal key
+        key = new_key
+        sw._sessions.put(identity, new_key)
+
     try:
-        return push_to_hosts(opener, sw.backup_dir, email, key, hosts)
+        return push_to_hosts(opener, sw.backup_dir, email, key, hosts, on_session=fresh)
     except bs.SignedOut:
         # The check passed but claude.ai still wants a sign-in.
         sw._sessions.mark(identity, "expired")
         key = _sign_in(sw, identity, args)
-        return push_to_hosts(opener, sw.backup_dir, email, key, hosts)
+        return push_to_hosts(opener, sw.backup_dir, email, key, hosts, on_session=fresh)
 
 
 def token_command(argv: list[str]) -> None:

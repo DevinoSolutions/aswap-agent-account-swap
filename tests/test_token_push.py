@@ -142,7 +142,7 @@ class TestPushToHosts:
         monkeypatch.setattr(tp, "pace_mint", lambda root, out=print: events.append("pace"))
         n = iter(range(1, 10))
 
-        def mint(browser, root, out=print, paced=True):
+        def mint(browser, root, out=print, paced=True, **_kw):
             assert not paced and not browser.closed
             events.append("mint")
             return f"blob-{next(n)}"
@@ -186,7 +186,7 @@ class TestPushToHosts:
         events = []
         opener = self._wire(monkeypatch, events)
 
-        def mint(browser, root, out=print, paced=True):
+        def mint(browser, root, out=print, paced=True, **_kw):
             raise tp.bs.SignedOut("asked to sign in")
 
         monkeypatch.setattr(tp, "mint_credentials", mint)
@@ -221,7 +221,7 @@ class TestPushCommand:
             log["signed_in"].append((identity, timeout_s))
             return "sk-fresh"
 
-        def push_to_hosts(open_browser, root, email, key, hosts, out=print):
+        def push_to_hosts(open_browser, root, email, key, hosts, out=print, on_session=None):
             open_browser().close()
             if signed_out_once and not log["signed_in"]:
                 raise tp.bs.SignedOut("asked to sign in")
@@ -303,6 +303,110 @@ class TestSignedOutDetection:
         with pytest.raises(tp.bs.OAuthError, match="timed out") as e:
             self._mint(on_login_page=False, timeout_s=4.0)
         assert not isinstance(e.value, tp.bs.SignedOut)
+
+
+class TestReauth:
+    """claude.ai's /login?reauth=1 step before the consent page (2026-11-15)."""
+
+    @staticmethod
+    def _run(coro):
+        import asyncio
+
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def test_reauth_without_an_email_is_not_a_dead_login(self):
+        # A dead login gets the session marked expired; this session works.
+        class Tab:
+            async def evaluate(self, js):
+                return js in (tp.bs._ON_LOGIN_PAGE_JS, tp.bs._REAUTH_PAGE_JS)
+
+        class Browser:
+            async def get(self, url, new_tab=False):
+                return Tab()
+
+        with pytest.raises(tp.bs.ReauthRequired) as e:
+            self._run(tp.bs._nd_mint_oauth_tokens(Browser(), timeout_s=10.0, out=lambda *_: None))
+        assert not isinstance(e.value, tp.bs.SignedOut)
+
+    def test_reauth_signs_in_by_email_and_hands_back_the_new_session(self, monkeypatch):
+        import asyncio
+        import http.client
+        import urllib.parse
+
+        state = {"page": "reauth", "callback": None}
+        started = []
+
+        def fake_prefill(tab, email, out, root=None):
+            started.append(email)
+            state["page"] = "consent"  # the link landed back on the consent page
+            done = asyncio.get_event_loop().create_future()
+            done.set_result(True)
+            return done
+
+        monkeypatch.setattr(tp.bs, "_start_prefill", fake_prefill)
+
+        def approve():  # what clicking Authorize does: claude.ai calls back
+            u = urllib.parse.urlsplit(state["callback"])
+            conn = http.client.HTTPConnection("127.0.0.1", u.port, timeout=5)
+            conn.request("GET", u.path + "?code=the-code")
+            conn.getresponse().read()
+            conn.close()
+
+        class Tab:
+            async def evaluate(self, js):
+                page = state["page"]
+                if js == tp.bs._CLICK_AUTHORIZE_JS:
+                    if page != "consent":
+                        return False
+                    state["page"] = "done"
+                    await asyncio.to_thread(approve)
+                    return True
+                if js == tp.bs._IN_SIGN_IN_FLOW_JS:
+                    return True
+                return page == "reauth" and js in (tp.bs._ON_LOGIN_PAGE_JS, tp.bs._REAUTH_PAGE_JS)
+
+        class Cookie:
+            name, value, domain, path = "sessionKey", "sk-new", ".claude.ai", "/"
+
+        class Cookies:
+            async def get_all(self):
+                return [Cookie()]
+
+        class Browser:
+            cookies = Cookies()
+
+            async def get(self, url, new_tab=False):
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+                state["callback"] = query["redirect_uri"][0]
+                return Tab()
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"access_token": "at", "refresh_token": "rt", "expires_in": 3600}).encode()
+
+        exchanged = []
+        monkeypatch.setattr(
+            tp.bs.urllib.request, "urlopen",
+            lambda req, timeout=15: exchanged.append(json.loads(req.data)) or Response(),
+        )
+        fresh = []
+        token = self._run(tp.bs._nd_mint_oauth_tokens(
+            Browser(), timeout_s=10.0, out=lambda *_: None,
+            email="a@example.com", on_session=fresh.append,
+        ))
+        assert started == ["a@example.com"]
+        assert token["access_token"] == "at" and exchanged[0]["code"] == "the-code"
+        assert fresh == ["sk-new"]  # the sign-in revoked the old session
 
 
 class TestNoPlanDetection:
@@ -405,7 +509,7 @@ class TestLoginPushes:
         monkeypatch.setattr(billing_cli.bs, "open_signed_in", open_signed_in)
         monkeypatch.setattr(tp, "pace_mint", lambda root, out=print: None)
         mints = iter([_blob("at-laptop", "rt-laptop"), _blob("at-h1", "rt-h1")])
-        monkeypatch.setattr(tp, "mint_credentials", lambda b, root, out=print, paced=True: next(mints))
+        monkeypatch.setattr(tp, "mint_credentials", lambda b, root, out=print, paced=True, **_kw: next(mints))
         sent = []
         monkeypatch.setattr(tp, "send", lambda host, email, creds, key: sent.append((host, creds, key)) or "ok")
         monkeypatch.setattr(sw._billing, "refresh", lambda *a, **kw: None)

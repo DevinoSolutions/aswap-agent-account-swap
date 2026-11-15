@@ -344,8 +344,16 @@ class TestPlanCommand:
         h.switcher._anchors.observe(
             ("cozy@example.com", ""), reset.isoformat(), slot=15, tier="default_claude_max_5x"
         )
-        # Renews one hour after a weekly reset: five quotas next month.
-        renews = reset + timedelta(days=7, hours=1)
+        # Renews one hour after a weekly reset: five quotas next month. Lapsing
+        # wins only over a 31-day period (over 30 days the unpaid gap costs
+        # more per day than the sixth quota brings), so pick the first weekly
+        # renewal that starts one: this failed for renewals in November.
+        from claude_swap.weekly_anchor import add_months
+
+        renews = next(
+            r for k in range(1, 7)
+            if (add_months(r := reset + timedelta(days=7 * k, hours=1), 1) - r).days == 31
+        )
         views = {"15": {"subscriptionStatus": "active", "rateLimitTier": "default_claude_max_5x",
                         "nextBillingAt": renews.isoformat()}}
         usage = {"15": UsageEntry(last_good={

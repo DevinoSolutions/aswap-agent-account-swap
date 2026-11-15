@@ -489,11 +489,9 @@ class BillingCache:
             ):
                 continue
             session = self.sessions.get((email, org_uuid or "")) if self.sessions else None
-            session_key = (
-                session["sessionKey"]
-                if session and session.get("status") != "expired"
-                else None
-            )
+            from claude_swap.billing_session import session_usable
+
+            session_key = session["sessionKey"] if session_usable(session, now) else None
             token = _usable_access_token(creds)
             if token or session_key:
                 due[key] = (email, org_uuid or "", token, session_key)
@@ -564,7 +562,7 @@ class BillingCache:
             rows[num] = row
             if self.sessions is not None and result["session"] in ("ok", "expired"):
                 try:
-                    self.sessions.mark(identity, result["session"])
+                    self.sessions.mark(identity, result["session"], now=now)
                 except Exception:
                     _logger.debug("session mark failed", exc_info=True)
             if self.anchors is not None and ok:

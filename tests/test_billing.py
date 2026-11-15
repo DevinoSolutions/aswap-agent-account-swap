@@ -422,7 +422,7 @@ class FakeSessions:
     def get(self, identity):
         return self.rows_.get(identity)
 
-    def mark(self, identity, status):
+    def mark(self, identity, status, now=None):
         self.marks.append((identity, status))
 
 
@@ -459,6 +459,29 @@ class TestExactRefresh:
         assert sessions.marks == [(("a@example.com", "org-1"), "expired")]
         row = cache.records({"3": ("a@example.com", "org-1")})["3"]
         assert row["nextCheckAt"] - cache.clock() <= billing.FAILURE_RETRY_S + 1
+
+    def test_a_stale_expired_mark_is_checked_again(self, tmp_path, monkeypatch):
+        # 2026-11-15: sessions that worked sat at "expired" for days, because
+        # a mark was never re-tried. One marked before retries existed is due.
+        from claude_swap import billing_session as bs
+
+        monkeypatch.setattr(
+            bs, "fetch_subscription_details",
+            lambda key, org: {"periodEnd": None, "cancelAtPeriodEnd": None, "status": "none", "interval": None, "keys": []},
+        )
+        sessions = FakeSessions({("a@example.com", "org-1"): {"sessionKey": "sk", "status": "expired"}})
+        billing.BillingCache(tmp_path, sessions=sessions).refresh(self.INFO, force=True)
+        assert sessions.marks == [(("a@example.com", "org-1"), "ok")]
+
+    def test_an_expired_mark_waits_for_its_retry(self, tmp_path, monkeypatch):
+        from claude_swap import billing_session as bs
+
+        calls = []
+        monkeypatch.setattr(bs, "fetch_subscription_details", lambda key, org: calls.append(key))
+        row = {"sessionKey": "sk", "status": "expired", "retryAt": time.time() + 3600}
+        sessions = FakeSessions({("a@example.com", "org-1"): row})
+        billing.BillingCache(tmp_path, sessions=sessions).refresh(self.INFO, force=True)
+        assert calls == [] and sessions.marks == []
 
 
 def _profile(tier, plan="claude_max", status="active", created="2026-07-15T06:18:03Z"):
