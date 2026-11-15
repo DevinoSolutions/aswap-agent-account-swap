@@ -30,6 +30,26 @@ class TestStore:
         assert store.get(ID)["status"] == "expired"
         store.mark(("nobody@x", ""), "expired")  # unknown identity: no-op
 
+    def test_an_expired_mark_is_retried_after_a_while(self, tmp_path):
+        store = bs.SessionStore(tmp_path)
+        store.put(ID, "sk")
+        store.mark(ID, "expired", now=1000.0)
+        row = store.get(ID)
+        assert row["retryAt"] == 1000.0 + bs.EXPIRED_RETRY_S
+        assert not bs.session_usable(row, 1000.0 + bs.EXPIRED_RETRY_S - 1)
+        assert bs.session_usable(row, 1000.0 + bs.EXPIRED_RETRY_S)
+        # Failing again pushes the next try out; working again clears it.
+        store.mark(ID, "expired", now=5000.0)
+        assert store.get(ID)["retryAt"] == 5000.0 + bs.EXPIRED_RETRY_S
+        store.mark(ID, "ok")
+        assert "retryAt" not in store.get(ID) and bs.session_usable(store.get(ID), 0.0)
+
+    def test_a_mark_from_before_retries_existed_is_due_at_once(self):
+        assert bs.session_usable({"sessionKey": "sk", "status": "expired"}, 0.0)
+        assert bs.session_usable({"sessionKey": "sk", "status": "ok"}, 0.0)
+        assert not bs.session_usable({"status": "ok"}, 0.0)
+        assert not bs.session_usable(None, 0.0)
+
     def test_merge_newer_capture_wins(self, tmp_path):
         a = bs.SessionStore(tmp_path / "a")
         a.put(ID, "old")

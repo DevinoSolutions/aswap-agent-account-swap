@@ -93,8 +93,17 @@ def _login(sw, args) -> None:
     # --- mint an OAuth token and store credentials ---
     if mint and browser is not None:
         minted = False
+
+        def fresh(new_key: str) -> None:
+            # A reauth sign-in revoked the session just saved; keep the new one.
+            nonlocal key
+            key = new_key
+            sw._sessions.put(identity, new_key)
+
         try:
-            credentials = tp.mint_credentials(browser, sw.backup_dir)
+            credentials = tp.mint_credentials(
+                browser, sw.backup_dir, email=email, on_session=fresh,
+            )
             # Chrome is only needed again for another mint; closed, it frees
             # its memory through the pacing wait before each host's token.
             browser.close()
@@ -130,7 +139,7 @@ def _login(sw, args) -> None:
             try:
                 tp.push_to_hosts(
                     lambda: bs.open_signed_in(sw.backup_dir, email, key, chrome=args.chrome),
-                    sw.backup_dir, email, key, hosts,
+                    sw.backup_dir, email, key, hosts, on_session=fresh,
                 )
             except bs.SignedOut as e:
                 error(f"No tokens pushed ({e}); run 'aswap token push {email}'")

@@ -68,7 +68,7 @@ from claude_swap.billing import (
     billing_view,
     looks_lapsed,
 )
-from claude_swap.billing_session import SessionStore
+from claude_swap.billing_session import SessionStore, session_usable
 from claude_swap.weekly_anchor import (
     WeeklyAnchorStore,
     off_schedule,
@@ -2539,8 +2539,7 @@ class ClaudeAccountSwitcher:
         try:
             info = [
                 row for row in self._build_accounts_info()
-                if (session := self._sessions.get((row[1], row[3] or "")))
-                and session.get("status") != "expired"
+                if session_usable(self._sessions.get((row[1], row[3] or "")), now)
             ]
             if info:
                 self._billing.refresh(info)
