@@ -642,7 +642,7 @@ Examples:
         for num, email, _org_name, _org, *_ in switcher._build_accounts_info():
             row = rows.get(str(num)) or {}
             if cvp_mod.row_is_cvp(row):
-                state = accent(f"{cvp_mod.CVP_MARK} CVP")
+                state = accent(cvp_mod.CVP_LABEL)
                 if str(num) in reserved:
                     state += muted(" (in reserve)")
                 elif settings.cvp_policy != "normal":

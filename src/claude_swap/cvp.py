@@ -41,6 +41,9 @@ _logger = logging.getLogger("claude-swap")
 
 FILE_NAME = "cvp_accounts.json"
 CVP_MARK = "🛡️"
+# Shown beside the account (never before the email, where the billing marks
+# ❌ ⏳ ⏰ sit), owner ask 2026-11-15.
+CVP_LABEL = f"{CVP_MARK} [Mythos Unlocked]"
 # A detected answer is re-checked this often; a failed probe sooner.
 RECHECK_S = 6 * 3600.0
 ERROR_RECHECK_S = 3600.0
