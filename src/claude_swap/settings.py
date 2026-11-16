@@ -88,6 +88,15 @@ class AutoSwitchSettings:
     # Start `aswap auto` when the user logs in (a per-user login entry, see
     # login_start.py). Off by default: it adds an entry outside aswap's data.
     start_on_login: bool = False
+    # CVP accounts (cvp.py: a Mythos model offered = Cyber Verification
+    # Program) are scarce. "lastResort": auto uses one only when no other
+    # account can take the work, and leaves it as soon as one can. "never":
+    # auto never picks one. "normal": no special treatment.
+    cvp_policy: str = "lastResort"
+    # A reserved CVP account counts as a normal one while its weekly quota
+    # is about to be lost (weekly reset or plan end this many hours away).
+    # 0 = off.
+    cvp_release_hours: float = 12.0
 
     @property
     def hold_minutes(self) -> float:
@@ -253,6 +262,15 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "startOnLogin", "start_on_login", "bool",
             help="Start aswap auto when you log in (adds a per-user login entry)",
+        ),
+        SettingSpec(
+            "autoswitch", "cvpPolicy", "cvp_policy", "choice",
+            choices=("lastResort", "never", "normal"),
+            help="CVP accounts: lastResort (only when nothing else can work), never, or normal",
+        ),
+        SettingSpec(
+            "autoswitch", "cvpReleaseHours", "cvp_release_hours", "float", 0.0, 168.0,
+            help="Use a CVP account normally when its weekly quota is lost within this many hours (0 = off)",
         ),
         SettingSpec(
             "profiles", "persistent", "persistent", "bool",

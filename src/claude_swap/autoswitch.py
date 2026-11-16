@@ -71,6 +71,7 @@ from claude_swap.settings import (
     parse_priority,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap import cvp as cvp_mod
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 from claude_swap.warmup import (
     DEFAULT_INTERVAL_SECONDS as WARMUP_INTERVAL_SECONDS,
@@ -275,9 +276,14 @@ RUNWAY_MARGIN_S = 5 * 60.0
 #               proactive move too: the active is over the threshold there)
 #   failover    the active account's usage has been unreadable for a while
 #
+#   cvp-exit    leaving a reserved CVP account (cvp.py) for one with room; a
+#               hand switch onto a CVP account is respected like any other
+#
 # Measured 2026-10-27: a hand switch to account 3 at 11:06 was undone at
 # 11:10 by consume-first (3 at 73% -> 13 at 85%).
-OPTIONAL_TRIGGERS = frozenset({"consume-first"})
+OPTIONAL_TRIGGERS = frozenset({"consume-first", "cvp-exit"})
+# Must-move triggers that may fall back onto a reserved CVP account.
+CVP_FALLBACK_TRIGGERS = frozenset({"at-limit", "failover"})
 # A held-off optional move is logged at most this often (the hold itself is
 # logged once, when it starts); the NoSwitchEvent still goes out every tick.
 HOLD_NOTE_INTERVAL_S = scaled(15 * 60.0)
@@ -672,7 +678,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "priority"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "priority" | "cvp-exit"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -708,6 +714,7 @@ _NO_SWITCH_EMOJI = {
     "last-point": "⏱️",
     "no-candidates": "🛑",
     "no-viable-target": "🛑",
+    "cvp-reserved": "🛡️",
 }
 
 
@@ -1749,7 +1756,20 @@ class AutoSwitchEngine:
         self._riding = riding
         # The priority list (autoswitch.priority) over every other rule: the
         # first account on it with room is where auto wants to be.
-        priority = self._priority_accounts(quarantined)
+        # CVP accounts (cvp.py) held in reserve this tick: out of the
+        # priority list and the normal candidates; see the fallback below.
+        reserved = self._cvp_reserved(usage, settings, self._collected_at)
+        priority = [n for n in self._priority_accounts(quarantined) if n not in reserved]
+        # On a reserved account below the threshold: leave it as soon as
+        # another account can take the work.
+        cvp_exit = current in reserved and any(
+            self._priority_usable(n, headroom, settings)
+            for n in self.switcher.switchable_account_numbers()
+            if n != current
+            and n not in quarantined
+            and n not in reserved
+            and self.switcher.account_kind_for(n) != "api_key"
+        )
         priority_target = next(
             (
                 n for n in priority
@@ -1802,7 +1822,9 @@ class AutoSwitchEngine:
                 )
             )
             if utilization < settings.threshold and not self._limit_guard:
-                if current in priority:
+                if cvp_exit:
+                    trigger = "cvp-exit"
+                elif current in priority:
                     # A priority account is used up before anything else,
                     # whatever resets sooner: only its limit moves it.
                     self._emit(
@@ -1815,7 +1837,7 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
-                if priority_target is not None:
+                elif priority_target is not None:
                     trigger = "priority"
                 elif settings.strategy != "consume-first":
                     self._emit(
@@ -1892,7 +1914,7 @@ class AutoSwitchEngine:
             trigger = "failover"
 
         if (
-            trigger in ("proactive", "consume-first")
+            trigger in ("proactive", "consume-first", "cvp-exit")
             and not self._limit_guard  # waiting out a cooldown means hitting the limit
             and self._in_cooldown(state)
         ):
@@ -1908,6 +1930,20 @@ class AutoSwitchEngine:
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
+        # Reserved CVP accounts wait out of the ranking. Under lastResort they
+        # are the fallback when the active account must be left and nothing
+        # else can take it; under never they are gone.
+        cvp_reserve = (
+            [n for n in oauth_candidates if n in reserved]
+            if settings.cvp_policy == "lastResort"
+            else []
+        )
+        oauth_candidates = [n for n in oauth_candidates if n not in reserved]
+        if trigger == "cvp-exit":
+            # Leaving for somewhere that can take the work, not another edge.
+            oauth_candidates = [
+                n for n in oauth_candidates if self._priority_usable(n, headroom, settings)
+            ]
         # The no-return bar itself lives in `_rank` below: it is a statement
         # about the CHOICE, so it belongs where the choice is made rather than
         # in this census of what exists. See `_no_return_account` for the
@@ -1947,7 +1983,10 @@ class AutoSwitchEngine:
                 n for n in oauth_candidates
                 if (headroom.get(n) or 0.0) > gate.OPEN_HEADROOM
             ]
-            if not oauth_candidates and not metered_candidates:
+            cvp_reserve = [
+                n for n in cvp_reserve if (headroom.get(n) or 0.0) > gate.OPEN_HEADROOM
+            ]
+            if not oauth_candidates and not metered_candidates and not cvp_reserve:
                 self._emit(
                     NoSwitchEvent(
                         reason="last-point",
@@ -1955,7 +1994,7 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.NO_ACTION
-        if not oauth_candidates and not metered_candidates:
+        if not oauth_candidates and not metered_candidates and not cvp_reserve:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -2115,6 +2154,51 @@ class AutoSwitchEngine:
                 settings=settings,
                 now=decided_now,
             )
+
+        if (
+            not ordered
+            and cvp_reserve
+            and (trigger in CVP_FALLBACK_TRIGGERS or self._limit_guard)
+        ):
+            # Last resort (autoswitch.cvpPolicy lastResort): the active account
+            # must be left and no other account can take the work.
+            ordered, cvp_known, _ = _rank(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=cvp_reserve,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+            )
+            any_known = any_known or cvp_known
+            if ordered:
+                _logger.info(
+                    "🛡️ No other account can take the work; falling back on CVP account %s",
+                    ordered[0],
+                )
+
+        if (
+            not ordered
+            and cvp_reserve
+            and trigger != "consume-first"
+            and any((headroom.get(n) or 0.0) > 0 for n in cvp_reserve)
+        ):
+            # Only CVP accounts have room, and leaving is not a must yet:
+            # stay, at the normal cadence (never the all-exhausted sleep, so
+            # the at-limit escape is not missed).
+            self._emit(
+                NoSwitchEvent(
+                    reason="cvp-reserved",
+                    detail=(
+                        f"only CVP account(s) {', '.join(cvp_reserve)} have room; "
+                        f"kept for when account {current} is spent"
+                    ),
+                )
+            )
+            return TickOutcome.NO_ACTION
 
         if not ordered and metered_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
@@ -2880,6 +2964,35 @@ class AutoSwitchEngine:
             measured = fetched
         at = self._collected_at if measured is None else min(measured, self._collected_at)
         return at, current, pct, self._cap(current)
+
+    def _cvp_reserved(
+        self, usage: dict[str, dict | str | None], settings: AutoSwitchSettings, now: float
+    ) -> set[str]:
+        """CVP accounts (cvp.py) auto holds back this tick.
+
+        None under ``cvpPolicy normal``. Under ``lastResort`` an account whose
+        weekly quota is lost within ``cvpReleaseHours`` (weekly reset or plan
+        end) is used like any other; under ``never`` nothing is released.
+        """
+        if settings.cvp_policy == "normal":
+            return set()
+        getter = getattr(self.switcher, "cvp_accounts", None)
+        if getter is None:
+            return set()
+        try:
+            cvp_nums = set(getter())
+        except Exception:  # noqa: BLE001 - a bad file must not stop the engine
+            _logger.debug("could not read CVP labels", exc_info=True)
+            return set()
+        if not cvp_nums or settings.cvp_policy != "lastResort" or settings.cvp_release_hours <= 0:
+            return cvp_nums
+        perish = self._perish_inputs(now)
+        return {
+            n for n in cvp_nums
+            if not cvp_mod.released(
+                _perishable_ts(perish, n, usage.get(n), now), now, settings.cvp_release_hours
+            )
+        }
 
     def _priority_accounts(self, quarantined: set[str]) -> list[str]:
         """``autoswitch.priority`` as switchable account numbers, in order.
@@ -3753,7 +3866,7 @@ class AutoSwitchEngine:
         with self._state_lock():
             state = self._read_state()
             if (
-                trigger in ("proactive", "consume-first")
+                trigger in ("proactive", "consume-first", "cvp-exit")
                 and not self._limit_guard
                 and self._in_cooldown(state)
             ):

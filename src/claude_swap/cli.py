@@ -576,6 +576,94 @@ Examples:
         sys.exit(1)
 
 
+def _cvp_command(argv: list[str]) -> None:
+    """Handle `aswap cvp [refresh [NUM|EMAIL ...]] | set NUM|EMAIL on|off|auto`.
+
+    Cyber Verification Program accounts (cvp.py): an account offered a Mythos
+    model is labelled CVP, and ``autoswitch.cvpPolicy`` keeps those in
+    reserve. ``aswap auto`` re-checks each account every few hours by itself.
+    """
+    from claude_swap import cvp as cvp_mod
+    from claude_swap.settings import load_settings
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} cvp",
+        description=(
+            "Cyber Verification Program (CVP) accounts. An account whose Claude "
+            "Code token is offered a Mythos model is labelled CVP. Auto keeps "
+            "them in reserve (autoswitch.cvpPolicy: lastResort, never or "
+            "normal) and uses one normally when its weekly quota would be lost "
+            "within autoswitch.cvpReleaseHours."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  aswap cvp                       show each account's label
+  aswap cvp refresh               check every account now
+  aswap cvp refresh 3             check account 3 now
+  aswap cvp set 3 on              label account 3 CVP by hand
+  aswap cvp set 3 auto            back to detection
+  aswap config set autoswitch.cvpPolicy never
+        """,
+    )
+    parser.add_argument("action", nargs="?", choices=("show", "refresh", "set"), default="show")
+    parser.add_argument("rest", nargs="*", metavar="ARG")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    root = paths.get_backup_root()
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        if args.action == "set":
+            if len(args.rest) != 2 or args.rest[1] not in ("on", "off", "auto"):
+                parser.error("usage: aswap cvp set NUM|EMAIL on|off|auto")
+            num, email, org = switcher.resolve_account(args.rest[0])
+            value = {"on": True, "off": False, "auto": None}[args.rest[1]]
+            switcher._cvp.set_label(email, org, value)
+            what = {"on": "labelled CVP", "off": "labelled not CVP", "auto": "back to detection"}
+            print(f"{accent('Account ' + str(num))} {what[args.rest[1]]}")
+            return
+        if args.action == "refresh":
+            nums = None
+            if args.rest:
+                nums = [switcher.resolve_account(i)[0] for i in args.rest]
+            probed = switcher.refresh_cvp([str(n) for n in nums] if nums else None, force=True)
+            if not probed:
+                print(dimmed("No OAuth accounts to check"))
+                return
+        settings = load_settings(root)
+        rows = switcher.cvp_rows()
+        reserved = switcher.cvp_reserved_slots()
+        print(bolded("CVP accounts:") + " " + dimmed(
+            f"(autoswitch.cvpPolicy {settings.cvp_policy}, "
+            f"cvpReleaseHours {settings.cvp_release_hours:g})"
+        ))
+        for num, email, _org_name, _org, *_ in switcher._build_accounts_info():
+            row = rows.get(str(num)) or {}
+            if cvp_mod.row_is_cvp(row):
+                state = accent(f"{cvp_mod.CVP_MARK} CVP")
+                if str(num) in reserved:
+                    state += muted(" (in reserve)")
+                elif settings.cvp_policy != "normal":
+                    state += muted(" (released: quota about to be lost)")
+            else:
+                state = muted("not CVP")
+            notes = []
+            if isinstance(row.get("label"), bool):
+                notes.append("set by hand")
+            elif row.get("models"):
+                notes.append(", ".join(row["models"]))
+            if row.get("error"):
+                notes.append(f"last check failed: {row['error']}")
+            elif "checkedAt" not in row:
+                notes.append("not checked yet")
+            print(f"  {num}: {email}  {state}" + (f"  {dimmed('(' + '; '.join(notes) + ')')}" if notes else ""))
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+
+
 def _renumber_command(argv: list[str]) -> None:
     """Handle `aswap renumber [--by-email] [--dry-run] [--yes] [--json]`.
 
@@ -2079,6 +2167,9 @@ def main() -> None:
     if argv and argv[0] == "priority":
         _priority_command(argv[1:])
         return
+    if argv and argv[0] == "cvp":
+        _cvp_command(argv[1:])
+        return
 
     # Bare `aswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -2119,6 +2210,7 @@ Commands:
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s renumber [--by-email]      renumber every account to 1..N
   %(prog)s priority [<num|email>...]  accounts auto uses up first, in order
+  %(prog)s cvp [refresh|set ...]      CVP (Mythos) accounts, kept in reserve
   %(prog)s codex <command>            manage Codex CLI accounts
   %(prog)s backup [take|list|check|restore|export]  snapshots of state.db; crash restore
   %(prog)s login [num|email]          sign in: session + CC token in one step

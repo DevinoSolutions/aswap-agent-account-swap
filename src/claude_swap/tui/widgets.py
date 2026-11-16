@@ -16,6 +16,7 @@ from textual.widgets import ListItem, ListView, Static
 
 from claude_swap import gate, oauth, pace
 from claude_swap.billing import account_mark, billing_text
+from claude_swap.cvp import CVP_MARK
 from claude_swap.weekly_anchor import weekly_text
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
@@ -311,6 +312,8 @@ def _append_account_mark(text: Text, acc: AccountSnapshot) -> None:
     mark = account_mark(acc.billing)
     if mark:
         text.append(f"{mark} ")
+    if acc.cvp:
+        text.append(f"{CVP_MARK} ")
 
 
 def _number_label(acc: AccountSnapshot, rank: int | None) -> str:
