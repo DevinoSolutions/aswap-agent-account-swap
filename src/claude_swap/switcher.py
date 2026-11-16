@@ -7513,7 +7513,7 @@ class ClaudeAccountSwitcher:
             if needs_login:
                 markers += f" {yellowed('(needs login)')}"
             if str(num) in cvp_nums:
-                markers += f" {accent(cvp_mod.CVP_MARK + ' CVP')}"
+                markers += f" {accent(cvp_mod.CVP_LABEL)}"
             slot = f"{i + 1:>2}. acc #{num}" if by_priority else f"{num}"
             mark = account_mark(billing.get(str(num)))
             if mark:

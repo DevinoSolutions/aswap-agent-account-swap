@@ -252,3 +252,23 @@ class TestSettings:
         assert s.cvp_policy == "lastResort" and s.cvp_release_hours == 12.0
         assert SETTING_SPECS["autoswitch.cvpPolicy"].choices == cvp.POLICIES
         assert SETTING_SPECS["autoswitch.cvpReleaseHours"].kind == "float"
+
+
+class TestLabel:
+    def test_label_sits_beside_the_account_not_before_the_email(self):
+        import dataclasses
+
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+        from tests.test_tui import make_account
+
+        acc = dataclasses.replace(
+            make_account(3, email="c@example.com"),
+            cvp=True,
+            billing={"endsAt": "2099-01-01T00:00:00Z"},  # ⏳ before the email
+        )
+        for text in (account_card_text(acc, 120).plain, mini_account_text(acc, 0).plain):
+            first_line = text.splitlines()[0]
+            assert cvp.CVP_LABEL in first_line
+            assert first_line.index("c@example.com") < first_line.index(cvp.CVP_LABEL)
+            assert first_line.index("[personal]") < first_line.index(cvp.CVP_LABEL)
+        assert cvp.CVP_LABEL == "🛡️ [Mythos Unlocked]"
