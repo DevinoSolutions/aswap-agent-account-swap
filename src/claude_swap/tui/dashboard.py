@@ -17,7 +17,6 @@ No global command palette: actions live where their context is.
 
 from __future__ import annotations
 
-from bisect import bisect_left
 from functools import partial
 from typing import TYPE_CHECKING, Callable
 
@@ -26,7 +25,15 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
+from claude_swap.exceptions import ConfigError
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.settings import (
+    SETTING_SPECS,
+    effective_settings,
+    format_setting_value,
+    set_setting,
+    unset_setting,
+)
 from claude_swap.tui.data import PROVIDERS, PROVIDER_LABELS, iter_accounts
 from claude_swap.tui.widgets import (
     AccountItem,
@@ -45,6 +52,45 @@ DEFAULT_THRESHOLD_PCT = 90.0
 MenuEntries = list[tuple[str, str]]  # (label, action_id)
 
 _BACK = ("← back", "back")
+
+# The four settings the TUI applies live keep their own rows and handlers;
+# every other key gets a generic row (``setting:<dotted key>``).
+_LIVE_SETTINGS = {
+    "theme": "ui.theme",
+    "view": "ui.view",
+    "threshold": "autoswitch.threshold",
+    "strategy": "autoswitch.strategy",
+}
+# Short row labels; each key's full help shows under the menu.
+_SETTING_LABELS = {
+    "autoswitch.enabled": "Auto-switch enabled",
+    "autoswitch.intervalSeconds": "Poll interval (seconds)",
+    "autoswitch.cooldownSeconds": "Switch cooldown (seconds)",
+    "autoswitch.hysteresisPct": "Switch margin (pct)",
+    "autoswitch.includeApiKeyAccounts": "Use API-key accounts",
+    "autoswitch.unhealthyTicks": "Failed polls before unhealthy",
+    "autoswitch.model": "Model weekly limits",
+    "autoswitch.warmupFiveHour": "Warm up five-hour windows",
+    "autoswitch.manualHold": "Hold hand-picked account",
+    "autoswitch.manualHoldMinutes": "Manual hold (minutes)",
+    "autoswitch.priority": "Priority accounts",
+    "autoswitch.autoAddAccounts": "Auto-add new logins",
+    "autoswitch.startOnLogin": "Start auto on login",
+    "autoswitch.cvpPolicy": "CVP (Mythos) accounts",
+    "autoswitch.cvpReleaseHours": "CVP release window (hours)",
+    "profiles.persistent": "Persistent session profiles",
+    "ui.listOrder": "aswap list order",
+    "login.pushTo": "Push login tokens to hosts",
+}
+
+
+def _setting_text(value) -> str:
+    """A settings value as a menu row shows it."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    if value is None or value == "":
+        return "(none)"
+    return format_setting_value(value)
 
 
 class DashboardScreen(Screen):
@@ -74,6 +120,7 @@ class DashboardScreen(Screen):
         )
         yield Static("", id="menu-title")
         yield CyclingListView(id="menu")
+        yield Static("", id="menu-help")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -166,8 +213,124 @@ class DashboardScreen(Screen):
             (f"Dashboard view: {view_labels[self.app._view]}", "setting:view"),
             (f"Auto-switch threshold: {threshold_label}%", "setting:threshold"),
             (f"Auto-switch strategy: {self.app._strategy_name}", "setting:strategy"),
+            *(
+                (
+                    f"{_SETTING_LABELS.get(spec.dotted, spec.dotted)}: "
+                    f"{_setting_text(value)}",
+                    f"setting:{spec.dotted}",
+                )
+                for spec, value, _is_set in effective_settings(self._settings_root())
+                if spec.dotted not in _LIVE_SETTINGS.values()
+            ),
             _BACK,
         ]
+
+    def _settings_root(self):
+        return self.app.switcher_for("claude").backup_dir
+
+    def _setting_value(self, dotted: str):
+        return next(
+            v for s, v, _ in effective_settings(self._settings_root()) if s.dotted == dotted
+        )
+
+    def _setting_help(self, action_id: str) -> str:
+        """The full help line for a settings row, or "" for any other row."""
+        if not action_id.startswith("setting:"):
+            return ""
+        key = action_id.split(":", 1)[1]
+        spec = SETTING_SPECS.get(_LIVE_SETTINGS.get(key, key))
+        if spec is None:
+            return ""
+        return (
+            f"{spec.help} (default {_setting_text(spec.default)}; "
+            f"aswap config set {spec.dotted})"
+        )
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        item = event.item
+        help_text = self._setting_help(item.action_id) if isinstance(item, MenuItem) else ""
+        self.query_one("#menu-help", Static).update(help_text)
+
+    async def _refresh_settings_menu(self) -> None:
+        """Re-render the settings menu in place, keeping the cursor row."""
+        if not self._menu_stack or self._menu_stack[-1][0] != "settings":
+            return
+        menu = self.query_one("#menu", ListView)
+        index = menu.index
+        self._menu_stack[-1] = ("settings", self._settings_entries())
+        await self._render_menu()
+        menu.index = index
+
+    def _store_setting(self, dotted: str, raw: str) -> bool:
+        """Persist one key ("" = back to default); False on failure."""
+        root = self._settings_root()
+        try:
+            if raw == "":
+                unset_setting(root, dotted)
+            else:
+                set_setting(root, dotted, raw)
+        except (ConfigError, OSError) as exc:
+            self.app.notify(f"Could not save {dotted}: {exc}", severity="error")
+            return False
+        if dotted == "autoswitch.startOnLogin":
+            # Same side effect as `aswap config set autoswitch.startOnLogin`.
+            from claude_swap import login_start
+            from claude_swap.settings import load_settings
+
+            result = login_start.sync(load_settings(root).start_on_login, root)
+            if result and result.startswith("failed"):
+                self.app.notify(f"Start on login: {result}", severity="warning")
+            elif result:
+                self.app.notify(f"Start on login: login entry {result}")
+        return True
+
+    async def _edit_setting(self, dotted: str) -> None:
+        """bool: toggle. choice: next choice. Anything else: edit in a modal."""
+        from claude_swap.tui.modals import SettingEditModal
+
+        spec = SETTING_SPECS[dotted]
+        value = self._setting_value(dotted)
+        label = _SETTING_LABELS.get(dotted, dotted)
+        if spec.kind == "bool":
+            if self._store_setting(dotted, "false" if value else "true"):
+                self.app.notify(f"{label}: {_setting_text(not value)}")
+            await self._refresh_settings_menu()
+        elif spec.kind == "choice":
+            choices = spec.choices
+            nxt = (
+                choices[(choices.index(value) + 1) % len(choices)]
+                if value in choices
+                else choices[0]
+            )
+            if self._store_setting(dotted, nxt):
+                self.app.notify(f"{label}: {nxt}")
+            await self._refresh_settings_menu()
+        else:
+            if dotted == "autoswitch.threshold":
+                label = "Auto-switch threshold (pct)"
+            current = "" if value in (None, "") else format_setting_value(value)
+            self.app.push_screen(
+                SettingEditModal(spec, label, current),
+                partial(self._on_setting_edited, dotted, label),
+            )
+
+    async def _on_setting_edited(self, dotted: str, label: str, raw: str | None) -> None:
+        if raw is None:
+            return
+        if dotted == "autoswitch.threshold":
+            if raw == "":
+                if not self._store_setting(dotted, ""):
+                    return
+                from claude_swap.settings import load_settings
+
+                self.app.threshold_pct = load_settings(self._settings_root()).threshold
+                self.app._refresh_accounts_panels()
+            else:
+                self.app.apply_threshold(float(raw))
+        elif not self._store_setting(dotted, raw):
+            return
+        self.app.notify(f"{label}: {_setting_text(self._setting_value(dotted))}")
+        await self._refresh_settings_menu()
 
     async def _push_menu(self, title: str, entries: MenuEntries) -> None:
         self._menu_stack.append((title, entries))
@@ -231,6 +394,8 @@ class DashboardScreen(Screen):
             app.confirm_remove(provider, number, email)
         elif action_id == "settings-menu":
             await self._push_menu("settings", self._settings_entries())
+        elif action_id.startswith("setting:") and "." in action_id:
+            await self._edit_setting(action_id.split(":", 1)[1])
         elif action_id.startswith("setting:"):
             key = action_id.split(":", 1)[1]
             if key == "theme":
@@ -243,18 +408,9 @@ class DashboardScreen(Screen):
                 value = order[(order.index(app._view) + 1) % len(order)]
                 app.apply_view(value)
             elif key == "threshold":
-                # ponytail: 95% is this compact TUI ladder's ceiling; use
-                # `aswap config set autoswitch.threshold` for exact values.
-                ladder = (75.0, 80.0, 85.0, 90.0, 95.0)
-                current = (
-                    app.threshold_pct
-                    if app.threshold_pct is not None
-                    else DEFAULT_THRESHOLD_PCT
-                )
-                index = bisect_left(ladder, current)
-                if index < len(ladder) and ladder[index] == current:
-                    index += 1
-                app.apply_threshold(ladder[index % len(ladder)])
+                # An exact value: the old 75-95 ladder could not reach 99.9.
+                await self._edit_setting("autoswitch.threshold")
+                return
             elif key == "strategy":
                 order = ("best", "consume-first")
                 value = order[(order.index(app._strategy_name) + 1) % len(order)]
@@ -267,12 +423,8 @@ class DashboardScreen(Screen):
                 # depends on AutoScreen staying top for its engine's whole
                 # lifetime; if the screen model changes, guards belong here.
                 app.apply_strategy(value)
-            menu = self.query_one("#menu", ListView)
-            index = menu.index
-            self._menu_stack[-1] = ("settings", self._settings_entries())
-            await self._render_menu()
             # Unlike a new menu, cycling refreshes this menu in place: keep its row.
-            menu.index = index
+            await self._refresh_settings_menu()
         elif action_id == "disable-menu":
             await self._push_menu("disable / enable", self._disable_entries())
         elif action_id.startswith("disable:"):

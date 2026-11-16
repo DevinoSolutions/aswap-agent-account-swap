@@ -318,6 +318,37 @@ async def wait_event(event: threading.Event, timeout: float = 1.0) -> None:
     assert await asyncio.to_thread(event.wait, timeout)
 
 
+def _menu_ids(app) -> list[str]:
+    from textual.widgets import ListView
+
+    from claude_swap.tui.widgets import MenuItem
+
+    menu = app.screen.query_one("#menu", ListView)
+    return [item.action_id for item in menu.query(MenuItem)]
+
+
+def _menu_labels(app) -> list[str]:
+    from textual.widgets import ListView, Static
+
+    from claude_swap.tui.widgets import MenuItem
+
+    menu = app.screen.query_one("#menu", ListView)
+    return [item.query_one(Static).render().plain for item in menu.query(MenuItem)]
+
+
+async def _type_value(pilot, text: str) -> None:
+    """Replace the edit modal's value and press Enter."""
+    from textual.widgets import Input
+
+    field = pilot.app.screen.query_one("#value", Input)
+    field.value = text
+    field.focus()
+    await pilot.pause()
+    await pilot.press("enter")
+    await pilot.pause()
+    await pilot.pause()
+
+
 async def menu_select(pilot, action_id: str) -> None:
     """Drive the dashboard menu: highlight the entry by id, press Enter."""
     from textual.widgets import ListView
@@ -2744,7 +2775,7 @@ class TestBareInvocation:
 
 @pytest.mark.asyncio
 class TestSettingsMenu:
-    async def test_threshold_cycles_up_from_an_off_ladder_value(self, tmp_path):
+    async def test_threshold_takes_an_exact_value(self, tmp_path):
         (tmp_path / "settings.json").write_text(
             json.dumps({"autoswitch": {"threshold": 87.5}})
         )
@@ -2752,16 +2783,122 @@ class TestSettingsMenu:
         app = make_app(fake)
         async with app.run_test() as pilot:
             await settle(pilot)
+            from claude_swap.tui.modals import SettingEditModal
+
+            await menu_select(pilot, "settings-menu")
+            assert "Auto-switch threshold: 87.5%" in _menu_labels(app)
+            await menu_select(pilot, "setting:threshold")
+            assert isinstance(app.screen, SettingEditModal)
+            await _type_value(pilot, "99.9")
+            assert app.threshold_pct == 99.9
+            assert json.loads((tmp_path / "settings.json").read_text())["autoswitch"]["threshold"] == 99.9
+            assert "Auto-switch threshold: 99.9%" in _menu_labels(app)
+
+    async def test_every_setting_has_a_row(self, tmp_path):
+        from claude_swap.settings import SETTING_SPECS
+        from claude_swap.tui.dashboard import _LIVE_SETTINGS
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 60)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "settings-menu")
+            ids = _menu_ids(app)
+            covered = {_LIVE_SETTINGS.get(i[8:], i[8:]) for i in ids if i.startswith("setting:")}
+            assert covered == set(SETTING_SPECS)
+            assert ids[-1] == "back"
+            assert "CVP (Mythos) accounts: lastResort" in _menu_labels(app)
+
+    async def test_a_switch_toggles_in_place(self, tmp_path):
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 60)) as pilot:
+            await settle(pilot)
+            from textual.widgets import ListView
+
+            await menu_select(pilot, "settings-menu")
+            await menu_select(pilot, "setting:autoswitch.manualHold")
+            raw = json.loads((tmp_path / "settings.json").read_text())
+            assert raw["autoswitch"]["manualHold"] is False
+            assert "Hold hand-picked account: off" in _menu_labels(app)
+            menu = app.screen.query_one("#menu", ListView)
+            assert _menu_ids(app)[menu.index] == "setting:autoswitch.manualHold"
+
+    async def test_a_choice_cycles(self, tmp_path):
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 60)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "settings-menu")
+            await menu_select(pilot, "setting:autoswitch.cvpPolicy")
+            assert json.loads((tmp_path / "settings.json").read_text())["autoswitch"]["cvpPolicy"] == "never"
+            await menu_select(pilot, "setting:autoswitch.cvpPolicy")
+            assert "CVP (Mythos) accounts: normal" in _menu_labels(app)
+
+    async def test_a_number_is_checked_saved_and_reset(self, tmp_path):
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 60)) as pilot:
+            await settle(pilot)
+            from textual.widgets import Static
+
+            from claude_swap.tui.modals import SettingEditModal
+
+            await menu_select(pilot, "settings-menu")
+            await menu_select(pilot, "setting:autoswitch.cvpReleaseHours")
+            modal = app.screen
+            assert isinstance(modal, SettingEditModal)
+            await _type_value(pilot, "500")  # above the 168 h ceiling
+            assert app.screen is modal
+            assert "between 0 and 168" in str(modal.query_one("#form-error", Static).render())
+            await _type_value(pilot, "6")
+            assert not isinstance(app.screen, SettingEditModal)
+            assert json.loads((tmp_path / "settings.json").read_text())["autoswitch"]["cvpReleaseHours"] == 6
+            assert "CVP release window (hours): 6" in _menu_labels(app)
+
+            await menu_select(pilot, "setting:autoswitch.cvpReleaseHours")
+            await _type_value(pilot, "")  # empty = back to the default
+            assert "autoswitch" not in json.loads((tmp_path / "settings.json").read_text())
+            assert "CVP release window (hours): 12" in _menu_labels(app)
+
+    async def test_text_settings_and_cancel(self, tmp_path):
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 60)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "settings-menu")
+            assert "Push login tokens to hosts: (none)" in _menu_labels(app)
+            await menu_select(pilot, "setting:login.pushTo")
+            await _type_value(pilot, "amin-desktop")
+            assert json.loads((tmp_path / "settings.json").read_text())["login"]["pushTo"] == "amin-desktop"
+            await menu_select(pilot, "setting:login.pushTo")
+            await pilot.press("escape")
+            await pilot.pause()
+            assert "Push login tokens to hosts: amin-desktop" in _menu_labels(app)
+
+    async def test_start_on_login_syncs_the_login_entry(self, tmp_path):
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 60)) as pilot:
+            await settle(pilot)
+            with patch("claude_swap.login_start.sync", return_value="installed") as sync:
+                await menu_select(pilot, "settings-menu")
+                await menu_select(pilot, "setting:autoswitch.startOnLogin")
+            sync.assert_called_once_with(True, tmp_path)
+
+    async def test_help_line_follows_the_cursor(self, tmp_path):
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 60)) as pilot:
+            await settle(pilot)
             from textual.widgets import ListView, Static
-            from claude_swap.tui.widgets import MenuItem
 
             await menu_select(pilot, "settings-menu")
             menu = app.screen.query_one("#menu", ListView)
-            labels = [item.query_one(Static).render().plain for item in menu.query(MenuItem)]
-            assert "Auto-switch threshold: 87.5%" in labels
-            await menu_select(pilot, "setting:threshold")
-            assert app.threshold_pct == 90.0
-            assert json.loads((tmp_path / "settings.json").read_text())["autoswitch"]["threshold"] == 90.0
+            menu.index = _menu_ids(app).index("setting:autoswitch.cvpReleaseHours")
+            await pilot.pause()
+            help_text = str(app.screen.query_one("#menu-help", Static).render())
+            assert "weekly quota" in help_text and "default 12" in help_text
 
     async def test_threshold_change_repaints_the_bar_tick_immediately(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)

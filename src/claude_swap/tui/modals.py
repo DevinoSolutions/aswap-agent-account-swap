@@ -157,3 +157,83 @@ class OutputModal(ModalScreen[None]):
 
     def action_dismiss_modal(self) -> None:
         self.dismiss(None)
+
+
+class SettingEditModal(ModalScreen["str | None"]):
+    """Edit one number or text setting.
+
+    Dismisses with the raw value to store, ``""`` to go back to the default
+    (an empty field or the Default button), or None on cancel. The value is
+    checked with ``aswap config set``'s own parser, so the bounds cannot
+    drift from the CLI's.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("left", "app.focus_previous", show=False),
+        Binding("right", "app.focus_next", show=False),
+    ]
+
+    def __init__(self, spec, label: str, current: str) -> None:
+        super().__init__()
+        self._spec = spec
+        self._label = label
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        from claude_swap.settings import format_setting_value
+
+        spec = self._spec
+        notes = [f"default {format_setting_value(spec.default)}"]
+        if spec.kind in ("float", "int"):
+            notes.insert(
+                0,
+                f"{format_setting_value(spec.lo)} to {format_setting_value(spec.hi)}",
+            )
+        with Vertical(classes="modal-box"):
+            yield Label(self._label, classes="modal-title")
+            yield Static(
+                f"{spec.help}\n({'; '.join(notes)})", classes="modal-body", markup=False
+            )
+            yield Input(
+                value=self._current,
+                placeholder="empty = default",
+                id="value",
+                type={"int": "integer", "float": "number"}.get(spec.kind, "text"),
+            )
+            yield Static("", id="form-error", classes="form-error")
+            with Horizontal(classes="modal-buttons"):
+                yield Button("Save", id="save")
+                yield Button("Default", id="default")
+                yield Button("Cancel", id="cancel")
+            yield Static(
+                "enter save  ·  empty = default  ·  esc cancel",
+                classes="modal-hint",
+            )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+        elif event.button.id == "default":
+            self.dismiss("")
+        else:
+            self._submit()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        from claude_swap.exceptions import ConfigError
+        from claude_swap.settings import parse_setting_value
+
+        raw = self.query_one("#value", Input).value.strip()
+        if raw:
+            try:
+                parse_setting_value(self._spec, raw)
+            except ConfigError as exc:
+                self.query_one("#form-error", Static).update(str(exc))
+                return
+        self.dismiss(raw)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
