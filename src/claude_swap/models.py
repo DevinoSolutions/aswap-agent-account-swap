@@ -143,6 +143,7 @@ class AccountSnapshot:
     needs_login: bool = False  # profile holds a wiped credential; out of rotation
     billing: dict | None = None  # billing.billing_view: estimated next renewal
     weekly: dict | None = None  # weekly_anchor.weekly_view: remembered weekly reset
+    cvp: bool = False  # Cyber Verification Program account (cvp.py), kept in reserve
 
     @property
     def display_tag(self) -> str:

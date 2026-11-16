@@ -334,6 +334,7 @@ def account_row(
     usage_deferred_reason: str | None = None,
     billing: dict | None = None,
     weekly: dict | None = None,
+    cvp: bool = False,
 ) -> dict:
     """A full account row for ``--list``.
 
@@ -385,6 +386,9 @@ def account_row(
     # Additive, same rule: present only while the slot waits for a re-login.
     if needs_login:
         row["needsLogin"] = True
+    # Additive, same rule: a Cyber Verification Program account (cvp.py).
+    if cvp:
+        row["cvp"] = True
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

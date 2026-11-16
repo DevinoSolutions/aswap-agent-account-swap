@@ -69,11 +69,12 @@ def _reasons(h: EngineHarness) -> list[str]:
 
 
 class TestClassification:
-    def test_only_consume_first_is_optional(self):
+    def test_only_consume_first_and_cvp_exit_are_optional(self):
         """Every other trigger protects the session: at-limit (account at its
         limit), proactive (over the threshold, or the limit guard projecting
-        100% within minutes) and failover (usage unreadable)."""
-        assert OPTIONAL_TRIGGERS == frozenset({"consume-first"})
+        100% within minutes) and failover (usage unreadable). Leaving a CVP
+        account (cvp-exit) is a preference, so a hand switch onto one holds."""
+        assert OPTIONAL_TRIGGERS == frozenset({"consume-first", "cvp-exit"})
 
 
 class TestManualHold:

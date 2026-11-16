@@ -69,6 +69,7 @@ from claude_swap.billing import (
     looks_lapsed,
 )
 from claude_swap.billing_session import SessionStore, session_usable
+from claude_swap import cvp as cvp_mod
 from claude_swap.weekly_anchor import (
     WeeklyAnchorStore,
     off_schedule,
@@ -465,6 +466,7 @@ class ClaudeAccountSwitcher:
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._anchors = WeeklyAnchorStore(self.backup_dir)
         self._sessions = SessionStore(self.backup_dir)
+        self._cvp = cvp_mod.CvpStore(self.backup_dir)
         self._usage_store = UsageStore(
             self.backup_dir / "cache", on_measure=self._observe_usage,
             on_forbidden=self._observe_forbidden,
@@ -2365,6 +2367,7 @@ class ClaudeAccountSwitcher:
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
         billing = self._billing_views(accounts_info)
         weekly = self._weekly_views(accounts_info)
+        cvp_nums = self.cvp_accounts()
         seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
@@ -2387,6 +2390,7 @@ class ClaudeAccountSwitcher:
                     needs_login=self._needs_login_from_data(seq_data, n),
                     billing=billing.get(n),
                     weekly=weekly.get(n),
+                    cvp=n in cvp_nums,
                 )
             )
         from claude_swap.settings import load_ui_settings
@@ -2525,6 +2529,19 @@ class ClaudeAccountSwitcher:
         """
         self._recheck_lapsed(None, PLAN_REFRESH_S, stagger=True, lapsed_only=False)
         self._refresh_session_billing()
+        self._refresh_cvp_due()
+
+    def _refresh_cvp_due(self) -> None:
+        """Probe slots whose CVP detection is due (cvp.py), a few per tick;
+        best-effort."""
+        try:
+            for num, email, row in self.refresh_cvp(limit=cvp_mod.PROBES_PER_TICK):
+                if row.get("error") is None:
+                    self._logger.debug(
+                        "CVP check: account %s %s", num, "CVP" if row.get("detected") else "not CVP"
+                    )
+        except Exception:
+            self._logger.debug("CVP check failed", exc_info=True)
 
     def _refresh_session_billing(self) -> None:
         """Re-read the exact billing of slots with a claude.ai session when due
@@ -2778,7 +2795,7 @@ class ClaudeAccountSwitcher:
             n for n in nums
             if n not in switchable
             or (self.account_kind_for(n) == "api_key" and not settings.include_api_key_accounts)
-        }
+        } | self.cvp_reserved_slots(usage, settings)
         by_email = {str(i[1]).lower(): str(i[0]) for i in accounts_info}
         priority = [
             num for name in parse_priority(settings.priority)
@@ -2934,6 +2951,88 @@ class ClaudeAccountSwitcher:
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
         return self._account_kind(account_num)
+
+    def _slot_identities(self) -> dict[str, tuple[str, str]]:
+        data = self._get_sequence_data() or {}
+        return {
+            str(num): (acc.get("email", ""), acc.get("organizationUuid", "") or "")
+            for num, acc in (data.get("accounts") or {}).items()
+            if isinstance(acc, dict) and acc.get("email")
+        }
+
+    def cvp_rows(self) -> dict[str, dict]:
+        """Slot -> stored CVP row (detection and hand label), {} for none."""
+        rows = self._cvp.rows()
+        return {
+            num: rows.get(cvp_mod._key(email, org)) or {}
+            for num, (email, org) in self._slot_identities().items()
+        }
+
+    def cvp_accounts(self) -> set[str]:
+        """Slots labelled CVP (see cvp.py). A pure file read."""
+        return {num for num, row in self.cvp_rows().items() if cvp_mod.row_is_cvp(row)}
+
+    def cvp_reserved_slots(
+        self, usage: dict | None = None, settings=None, now: float | None = None
+    ) -> set[str]:
+        """CVP slots held back from automatic picks under ``autoswitch.cvpPolicy``
+        (the same rule as the auto engine's ``_cvp_reserved``)."""
+        from claude_swap.autoswitch import _perishable_ts
+
+        settings = settings or load_settings(self.backup_dir)
+        if settings.cvp_policy == "normal":
+            return set()
+        nums = self.cvp_accounts()
+        if not nums or settings.cvp_policy != "lastResort" or settings.cvp_release_hours <= 0:
+            return nums
+        now = time.time() if now is None else now
+        perish = self.perish_inputs(now)
+        usage = usage or {}
+        return {
+            n for n in nums
+            if not cvp_mod.released(
+                _perishable_ts(perish, n, usage.get(n), now), now, settings.cvp_release_hours
+            )
+        }
+
+    def refresh_cvp(
+        self,
+        nums: list[str] | None = None,
+        *,
+        force: bool = False,
+        limit: int | None = None,
+        now: float | None = None,
+    ) -> list[tuple[str, str, dict]]:
+        """Probe OAuth slots for a Mythos model (see cvp.py) and store it.
+
+        Only probes that are due unless ``force``; at most ``limit``. Uses
+        the stored access token as is and never refreshes it. Returns
+        ``(slot, email, row)`` for each slot probed.
+        """
+        now = time.time() if now is None else now
+        rows = self.cvp_rows()
+        out: list[tuple[str, str, dict]] = []
+        for num, (email, org) in self._slot_identities().items():
+            if nums is not None and num not in nums:
+                continue
+            if limit is not None and len(out) >= limit:
+                break
+            if self._account_kind(num) == "api_key":
+                continue
+            if not force and not cvp_mod.probe_due(rows.get(num), now):
+                continue
+            try:
+                creds = self._read_account_credentials(num, email)
+            except Exception:  # noqa: BLE001 - unreadable store = no token
+                creds = ""
+            token = (oauth.extract_oauth_data(creds) or {}).get("accessToken") if creds else None
+            if token:
+                models, error = cvp_mod.probe(token)
+            else:
+                models, error = None, "no-access-token"
+            self._cvp.record(email, org, models, error, now=now)
+            out.append((num, email, self._cvp.get(email, org)))
+        return out
 
     def account_email(self, account_num: str) -> str:
         """Stored email for a slot; empty string when unknown."""
@@ -6914,11 +7013,20 @@ class ClaudeAccountSwitcher:
             and not self._disabled_from_data(data, str(n))
             and not self._needs_login_from_data(data, str(n))
         ]
-        if not others:
+        if usage is None and others:
+            usage = self._usage_by_account()
+        # Reserved CVP accounts (autoswitch.cvpPolicy) only when the current
+        # account is spent and nothing else has room; never under "never".
+        reserved = self.cvp_reserved_slots(usage) if others else set()
+        reserve = (
+            [n for n in others if n in reserved]
+            if load_settings(self.backup_dir).cvp_policy == "lastResort"
+            else []
+        )
+        others = [n for n in others if n not in reserved]
+        if not others and not reserve:
             return None, "none"
 
-        if usage is None:
-            usage = self._usage_by_account()
         current_headroom = oauth.account_headroom(usage.get(str(current_num)), models)
         if current_headroom is None:
             # Can't measure where the user is → can't prove any target is
@@ -6929,6 +7037,13 @@ class ClaudeAccountSwitcher:
             (oauth.account_headroom(usage.get(num), models), num) for num in others
         ]
         known = [(h, num) for h, num in scored if h is not None]
+        if current_headroom <= 0 and reserve and not any(h > 0 for h, _ in known):
+            spare = [
+                (h, num) for num in reserve
+                if (h := oauth.account_headroom(usage.get(num), models)) is not None and h > 0
+            ]
+            if spare:
+                return max(spare, key=lambda t: t[0])[1], ""
         if not known:
             return None, "no-comparison"
 
@@ -7097,6 +7212,7 @@ class ClaudeAccountSwitcher:
         """
         billing = billing or {}
         weekly = weekly or {}
+        cvp_nums = self.cvp_accounts()
         active_num: int | None = None
         accounts = []
         seq_data = self._get_sequence_data() or {}
@@ -7129,6 +7245,7 @@ class ClaudeAccountSwitcher:
                     ),
                     billing=billing.get(str(num)),
                     weekly=weekly.get(str(num)),
+                    cvp=str(num) in cvp_nums,
                     profile=(
                         profile_fields(
                             hydrated=snapshot["hydrated"],
@@ -7367,6 +7484,7 @@ class ClaudeAccountSwitcher:
             )
 
         seq_data = self._get_sequence_data() or {}
+        cvp_nums = self.cvp_accounts()
         from claude_swap.settings import load_ui_settings
 
         by_priority = load_ui_settings(self.backup_dir).list_order == "priority"
@@ -7394,6 +7512,8 @@ class ClaudeAccountSwitcher:
             needs_login = self._needs_login_from_data(seq_data, str(num))
             if needs_login:
                 markers += f" {yellowed('(needs login)')}"
+            if str(num) in cvp_nums:
+                markers += f" {accent(cvp_mod.CVP_MARK + ' CVP')}"
             slot = f"{i + 1:>2}. acc #{num}" if by_priority else f"{num}"
             mark = account_mark(billing.get(str(num)))
             if mark:
@@ -7983,8 +8103,18 @@ class ClaudeAccountSwitcher:
 
         next_account: str | None = None
         skipped_exhausted: list[str] = []
+        reserved = self.cvp_reserved_slots(usage)
+        skipped_cvp: list[str] = []
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
+            if candidate in reserved:
+                skipped_cvp.append(candidate)
+                note = f"Skipped Account-{candidate} (CVP, kept in reserve)"
+                if json_output:
+                    warnings.append(note)
+                else:
+                    print(f"{accent('Skipping')} Account-{candidate} (CVP, kept in reserve)")
+                continue
             if self._disabled_from_data(data, candidate):
                 if json_output:
                     warnings.append(f"Skipped Account-{candidate} (disabled)")
@@ -8036,6 +8166,26 @@ class ClaudeAccountSwitcher:
             next_account = candidate
             break
 
+        if (
+            next_account is None
+            and skipped_cvp
+            and load_settings(self.backup_dir).cvp_policy == "lastResort"
+        ):
+            # Nothing else to go to: the reserve is for exactly this.
+            for candidate in skipped_cvp:
+                if (
+                    self._disabled_from_data(data, candidate)
+                    or self._needs_login_from_data(data, candidate)
+                    or not self._account_is_switchable(candidate)
+                ):
+                    continue
+                if strategy == "next-available":
+                    h = oauth.account_headroom(usage.get(candidate), models)
+                    if h is not None and h <= 0:
+                        continue
+                next_account = candidate
+                break
+
         # Every rotation target is at its limit. Switching onto an exhausted
         # account would not help, so stay on the current one instead.
         if next_account is None and skipped_exhausted:
@@ -8055,6 +8205,19 @@ class ClaudeAccountSwitcher:
                 f"All other accounts are at their {limits_label} — staying on "
                 f"Account-{current_num}."
             )
+            return None
+
+        if next_account is None and skipped_cvp:
+            message = (
+                "Only CVP accounts are left, and autoswitch.cvpPolicy keeps them "
+                "out of rotation. Switch to one by name: aswap switch <num|email>"
+            )
+            if json_output:
+                return self._switch_noop(
+                    strategy=strategy_label, reason="cvp-reserved",
+                    to_ref=current_ref, warnings=warnings, message=message,
+                )
+            print(dimmed(message))
             return None
 
         if next_account is None:
