@@ -251,7 +251,7 @@ That automatic pass is **always on** — it is not gated behind `profiles.persis
 
 ### Interactive dashboard (TUI)
 
-Run `aswap` on its own (or `aswap tui`) for the full-screen dashboard: Claude Code and Codex appear together in labelled sections, with live usage, provider-correct switching, and auto-switching, all keyboard-driven. Arrow-key and Vim-style menu navigation wraps at both ends. The menu's **Settings…** screen cycles the theme, dashboard view, auto-switch threshold, and strategy; its dashboard view can show both providers or only Claude Code / Codex without stopping background updates for the hidden provider. `aswap watch` opens straight into the live monitor using the selected dashboard view. Works on macOS, Linux, and Windows.
+Run `aswap` on its own (or `aswap tui`) for the full-screen dashboard: Claude Code and Codex appear together in labelled sections, with live usage, provider-correct switching, and auto-switching, all keyboard-driven. Arrow-key and Vim-style menu navigation wraps at both ends. The menu's **Settings…** screen lists every `aswap config` setting: Enter flips an on/off setting, steps through a choice (theme, dashboard view, strategy, CVP policy and so on), or opens a field for a number or text (the threshold takes an exact value), and the highlighted setting's help shows under the menu. Its dashboard view can show both providers or only Claude Code / Codex without stopping background updates for the hidden provider. `aswap watch` opens straight into the live monitor using the selected dashboard view. Works on macOS, Linux, and Windows.
 
 <img src="assets/tui-watch.png" width="760" alt="aswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
