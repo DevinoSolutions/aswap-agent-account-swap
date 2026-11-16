@@ -389,6 +389,58 @@ class TestPrefillEmail:
         assert bs._start_prefill(FakeTab(), "7", print) is None
 
 
+class CheckingTab(FakeTab):
+    """A login page whose browser check fails ``failures`` times."""
+
+    def __init__(self, failures):
+        super().__init__()
+        self._failures = failures
+
+    async def evaluate(self, expression, return_by_value=False):
+        assert expression == bs._AFTER_CONTINUE_JS
+        clicks = sum(1 for step in self.log if step == ("click", "continue"))
+        return "error" if clicks <= self._failures else "moved"
+
+    async def reload(self):
+        self.log.append(("reload",))
+
+
+class TestBrowserCheckRetry:
+    """Owner ask 2026-11-16: "Couldn't verify your browser. Try again." is
+    retried by itself, up to 5 times."""
+
+    def _run(self, tab):
+        import asyncio
+
+        messages: list[str] = []
+        ok = asyncio.run(bs._nd_prefill_email(
+            tab, "a@example.com", messages.append, wait_s=0, check_wait_s=0))
+        return ok, messages
+
+    def test_a_failed_check_reloads_and_presses_continue_again(self):
+        tab = CheckingTab(failures=2)
+        ok, messages = self._run(tab)
+        assert ok
+        assert tab.log.count(("click", "continue")) == 3
+        assert tab.log.count(("reload",)) == 2
+        assert sum("trying again" in m for m in messages) == 2
+        assert not any("still couldn't" in m for m in messages)
+
+    def test_gives_up_after_five_retries(self):
+        tab = CheckingTab(failures=99)
+        ok, messages = self._run(tab)
+        assert ok  # the person can still press Continue themselves
+        assert tab.log.count(("click", "continue")) == bs.BROWSER_CHECK_RETRIES + 1 == 6
+        assert tab.log.count(("reload",)) == 5
+        assert any("after 5 retries" in m for m in messages)
+
+    def test_no_retry_when_the_check_passes(self):
+        tab = CheckingTab(failures=0)
+        ok, messages = self._run(tab)
+        assert ok and ("reload",) not in tab.log
+        assert tab.log.count(("click", "continue")) == 1
+
+
 class TestOAuthMint:
     def test_authorize_url_is_the_subscription_login(self):
         from urllib.parse import parse_qs

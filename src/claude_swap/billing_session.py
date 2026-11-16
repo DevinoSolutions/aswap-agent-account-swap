@@ -681,9 +681,86 @@ def open_signed_in(root: Path, email: str, session_key: str, *, chrome: str | No
 
 _EMAIL_INPUT = "input#email, input[type=email]"
 _CONTINUE_BUTTON = "button[data-testid=continue], button[type=submit]"
+# claude.ai sometimes answers Continue with "Couldn't verify your browser.
+# Try again." (its bot check failed). Owner ask 2026-11-16: try again by
+# itself, up to this many times, before leaving it to the person.
+BROWSER_CHECK_RETRIES = 5
+# After Continue: "error" (the browser check failed), "moved" (the email form
+# is gone: the code / link step), or "" (no answer yet).
+_AFTER_CONTINUE_JS = (
+    "(() => {"
+    " const text = document.body ? document.body.innerText : '';"
+    " if (/couldn.t verify your browser/i.test(text)) return 'error';"
+    " return document.querySelector('input#email, input[type=email]') ? '' : 'moved';"
+    "})()"
+)
+_CHECK_WAIT_S = 8.0  # how long to watch for the error after each Continue
+_CHECK_POLL_S = 0.5
 
 
-async def _nd_prefill_email(tab, email: str, out, wait_s: float = 60.0, inbox_root: Path | None = None) -> bool:
+async def _nd_after_continue(tab, wait_s: float = _CHECK_WAIT_S) -> str:
+    """Watch the page after Continue; "error" only if the browser check failed."""
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + wait_s
+    while True:
+        try:
+            state = await tab.evaluate(_AFTER_CONTINUE_JS, return_by_value=True)
+        except Exception:
+            return ""  # the page is navigating, or cannot be read: not the error
+        if state in ("error", "moved"):
+            return state
+        if loop.time() >= deadline:
+            return ""
+        await asyncio.sleep(_CHECK_POLL_S)
+
+
+async def _nd_submit_email(tab, field, email: str, out, wait_s: float = _CHECK_WAIT_S) -> bool:
+    """Type ``email``, press Continue, and retry a failed browser check.
+
+    A retry reloads the login page, so claude.ai runs its check again from
+    scratch, then types the email and presses Continue again. False if the
+    check still fails after ``BROWSER_CHECK_RETRIES`` retries.
+    """
+    import asyncio
+
+    from nodriver import cdp
+
+    for attempt in range(BROWSER_CHECK_RETRIES + 1):
+        if attempt:
+            out(
+                "claude.ai couldn't verify the browser; trying again "
+                f"({attempt}/{BROWSER_CHECK_RETRIES})..."
+            )
+            await asyncio.sleep(min(2.0 * attempt, 8.0) if wait_s else 0)
+            await tab.reload()
+            field = await tab.select(_EMAIL_INPUT, timeout=30)
+            try:
+                await field.clear_input()
+            except Exception:
+                pass
+        await field.focus()
+        await tab.send(cdp.input_.insert_text(email))
+        button = await tab.select(_CONTINUE_BUTTON, timeout=5)
+        await button.click()
+        if await _nd_after_continue(tab, wait_s) != "error":
+            return True
+    out(
+        f"claude.ai still couldn't verify the browser after {BROWSER_CHECK_RETRIES} "
+        "retries — press Continue in the browser yourself."
+    )
+    return False
+
+
+async def _nd_prefill_email(
+    tab,
+    email: str,
+    out,
+    wait_s: float = 60.0,
+    inbox_root: Path | None = None,
+    check_wait_s: float = _CHECK_WAIT_S,
+) -> bool:
     """Type ``email`` into claude.ai's login form and press Continue.
 
     Best effort: a profile that is already signed in never shows the form,
@@ -691,12 +768,12 @@ async def _nd_prefill_email(tab, email: str, out, wait_s: float = 60.0, inbox_ro
     the text goes in through CDP ``Input.insertText`` (keystrokes are lost).
 
     With login mailboxes connected (``aswap inbox add``), the magic link
-    claude.ai mails is read from them and opened in this tab.
+    claude.ai mails is read from them and opened in this tab. A failed
+    browser check ("Couldn't verify your browser") is retried up to
+    ``BROWSER_CHECK_RETRIES`` times.
     """
     import asyncio
     import threading
-
-    from nodriver import cdp
 
     try:
         field = await tab.select(_EMAIL_INPUT, timeout=wait_s)
@@ -708,10 +785,8 @@ async def _nd_prefill_email(tab, email: str, out, wait_s: float = 60.0, inbox_ro
     stop = threading.Event()
     try:
         try:
-            await field.focus()
-            await tab.send(cdp.input_.insert_text(email))
-            button = await tab.select(_CONTINUE_BUTTON, timeout=5)
-            await button.click()
+            # Retries spent: the person presses Continue; still watch the inbox.
+            await _nd_submit_email(tab, field, email, out, wait_s=check_wait_s)
         except Exception:
             return False
         if not sources:
