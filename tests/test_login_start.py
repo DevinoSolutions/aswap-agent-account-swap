@@ -26,8 +26,49 @@ EXE = str(Path("/opt/bin/aswap").resolve())
 @pytest.fixture
 def exe(monkeypatch):
     monkeypatch.setattr(login_start, "aswap_executable", lambda: EXE)
-    monkeypatch.setattr(login_start.shutil, "which", lambda name: None)
+    monkeypatch.setattr(login_start, "windows_terminal", lambda: None)
     return EXE
+
+
+class TestWindowsTerminal:
+    """Measured 2026-11-18: the Run value named a WindowsTerminal_1.24 folder
+    a Store update had deleted, so auto never started after a reboot."""
+
+    def test_the_app_alias_wins_over_the_versioned_folder(self, tmp_path, monkeypatch):
+        alias = tmp_path / "Microsoft" / "WindowsApps" / "wt.exe"
+        alias.parent.mkdir(parents=True)
+        alias.write_bytes(b"")
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        monkeypatch.setattr(
+            login_start.shutil, "which",
+            lambda name: r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.24.1_x64__8w\wt.EXE",
+        )
+        assert login_start.windows_terminal() == str(alias)
+
+    def test_never_a_versioned_folder(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))  # no alias there
+        monkeypatch.setattr(
+            login_start.shutil, "which",
+            lambda name: r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.24.1_x64__8w\wt.EXE",
+        )
+        assert login_start.windows_terminal() is None
+
+    def test_any_other_wt_on_path_is_kept(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        monkeypatch.setattr(login_start.shutil, "which", lambda name: r"C:\tools\wt.exe")
+        assert login_start.windows_terminal() == r"C:\tools\wt.exe"
+
+    def test_a_stale_terminal_path_is_rewritten(self, tmp_path, monkeypatch, block_real_login_entry):
+        monkeypatch.setattr(login_start, "aswap_executable", lambda: EXE)
+        alias = tmp_path / "Microsoft" / "WindowsApps" / "wt.exe"
+        alias.parent.mkdir(parents=True)
+        alias.write_bytes(b"")
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        block_real_login_entry.values[login_start.ENTRY_NAME] = login_start.windows_command(
+            EXE, r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.24.1_x64__8w\wt.EXE"
+        )
+        assert login_start.sync(True, tmp_path, platform="win32") == "updated"
+        assert block_real_login_entry.values[login_start.ENTRY_NAME].startswith(f'"{alias}" ')
 
 
 class TestWindows:

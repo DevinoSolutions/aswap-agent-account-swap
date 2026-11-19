@@ -7738,17 +7738,10 @@ class ClaudeAccountSwitcher:
         """A warning when the last ``aswap auto`` loop has stopped checking
         (stuck, or killed without a clean stop), while auto is enabled."""
         # Imported here: autoswitch imports this module.
-        from claude_swap.autoswitch import clock_label, heartbeat_stalled_since
+        from claude_swap.autoswitch import auto_stalled_note
 
-        now = time.time()
-        since = heartbeat_stalled_since(self.backup_dir, now)
-        if since is None or not load_settings(self.backup_dir).enabled:
-            return None
-        minutes = max(1, int((now - since) // 60))
-        return yellowed(
-            f"auto: no check since {clock_label(since)} ({minutes} min) — "
-            "stuck or stopped; restart `aswap auto`"
-        )
+        note = auto_stalled_note(self.backup_dir, time.time())
+        return yellowed(note) if note else None
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""

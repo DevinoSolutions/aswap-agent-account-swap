@@ -880,6 +880,41 @@ class TestDashboard:
             assert "━" not in mini_part
             assert "acc #" not in panel
 
+    async def test_warns_when_auto_stopped_checking(self, tmp_path):
+        """2026-11-18: a reboot killed `aswap auto`, and the laptop sat 17 h on
+        one account while this dashboard showed the ranked order."""
+        import time as _time
+
+        from claude_swap.autoswitch import write_heartbeat
+        from claude_swap.tui.widgets import AccountsPanel
+
+        now = _time.time()
+        write_heartbeat(tmp_path, now - 17 * 3600, now - 17 * 3600 + 60)
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            panel = app.screen.query_one(AccountsPanel).render().plain
+            assert "⚠ auto: no check since" in panel and "(17 h)" in panel
+            assert "nothing is switching" in panel
+
+            write_heartbeat(tmp_path, _time.time(), _time.time() + 60)  # auto back
+            app._auto_checked_at = 0.0
+            app._update_refresh_status()
+            await pilot.pause()
+            assert "no check since" not in app.screen.query_one(AccountsPanel).render().plain
+
+    async def test_quiet_while_auto_checks(self, tmp_path):
+        import time as _time
+
+        from claude_swap.autoswitch import write_heartbeat
+        from claude_swap.tui.widgets import AccountsPanel
+
+        write_heartbeat(tmp_path, _time.time(), _time.time() + 60)
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            assert "no check since" not in app.screen.query_one(AccountsPanel).render().plain
+
     async def test_ranked_snapshot_numbers_rows_and_labels_slots(self, tmp_path):
         fake = FakeSwitcher(
             [
