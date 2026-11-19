@@ -27,7 +27,7 @@ from claude_swap.locking import FileLock
 from claude_swap.models import AccountSnapshot
 from claude_swap.poll_policy import parse_reset_ts
 from claude_swap.session import SessionManager
-from claude_swap.settings import atomic_write_json
+from claude_swap.settings import atomic_write_json, load_settings
 from claude_swap.usage_store import STALE_OK_S
 
 if TYPE_CHECKING:
@@ -43,6 +43,46 @@ PENDING_GUARD_SECONDS = FIVE_HOUR_SECONDS
 STATE_SCHEMA_VERSION = 2
 LEGACY_STATE_SCHEMA_VERSION = 1
 WARMUP_PROMPT = "Reply only: OK"
+# An account auto has stopped landing on for the week (weekly at or over the
+# auto-switch threshold) gets nothing from a five-hour window before its
+# weekly reset. Its warm is timed instead so the window ends this long AFTER
+# that reset: the reset frees the weekly quota, this window's budget is spent
+# in that hour, and a second fresh window opens right after. Warmed any
+# earlier, the window lapses unused before the reset. Owner ask 2026-11-19:
+# super@ was warmed at 10:34 for nothing (weekly back at 19:00).
+WEEKLY_RESET_BUFFER_S = 3600.0
+DEFAULT_HOLD_PCT = 90.0  # AutoSwitchSettings.threshold's default
+
+# Weekly points auto keeps back on a five-hour account for its timed warm
+# (WEEKLY_RESET_BUFFER_S): at 100% claude.ai refuses the Haiku request, so
+# the window meant to span the reset never opens. Usage reads in whole
+# points, so 1 means auto leaves the account when its weekly reads 99.
+# Owner ask 2026-11-19: "go all the way until ~99.5%".
+WARM_RESERVE_PCT = 1.0
+
+
+def warm_reserve_headroom(usage: object, now: float) -> float | None:
+    """The decision-headroom ceiling while a timed warm still needs its sliver.
+
+    ``99 - weekly%`` for an account with a five-hour window and a weekly
+    reset ahead, until a five-hour window spanning that reset is open. None
+    when nothing is reserved (no five-hour window, no reset ahead, or the
+    spanning window is already open).
+    """
+    if not isinstance(usage, dict) or oauth.has_no_five_hour(usage):
+        return None
+    weekly = usage.get("seven_day")
+    if not isinstance(weekly, dict) or not isinstance(weekly.get("pct"), (int, float)):
+        return None
+    reset = parse_reset_ts(weekly.get("resets_at"))
+    if reset is None or reset <= now:
+        return None
+    five_hour = usage.get("five_hour")
+    if isinstance(five_hour, dict):
+        five_reset = parse_reset_ts(five_hour.get("resets_at"))
+        if five_reset is not None and five_reset >= reset:
+            return None
+    return (100.0 - WARM_RESERVE_PCT) - float(weekly["pct"])
 
 
 @dataclass(frozen=True)
@@ -91,6 +131,7 @@ class WarmupEngine:
         self.state_path = switcher.backup_dir / "warmup_state.json"
         self.lock_path = switcher.backup_dir / ".warmup.lock"
         self._stopped = threading.Event()
+        self._hold_pct = DEFAULT_HOLD_PCT
 
     def stop(self) -> None:
         """Request a foreground loop shutdown."""
@@ -117,6 +158,10 @@ class WarmupEngine:
 
     def _tick_locked(self) -> WarmupSummary:
         now = self.clock()
+        try:
+            self._hold_pct = load_settings(self.switcher.backup_dir).threshold
+        except Exception:
+            self._hold_pct = DEFAULT_HOLD_PCT
         state = self._load_state()
         snapshot = self.switcher.accounts_snapshot(fetch=None)
         freshen = {
@@ -139,7 +184,12 @@ class WarmupEngine:
             reason = self._skip_reason(account, state, account_now)
             if reason is not None:
                 skipped += 1
-                self._emit(account, reason, self._reason_detail(reason))
+                detail = (
+                    self._timed_detail(account, account_now)
+                    if reason == "timed-for-weekly-reset"
+                    else self._reason_detail(reason)
+                )
+                self._emit(account, reason, detail)
                 continue
 
             if self.dry_run:
@@ -231,6 +281,8 @@ class WarmupEngine:
             return True
         if self._stale_weekly_is_exhausted(usage, now) or oauth.has_no_five_hour(usage):
             return False
+        if self._weekly_hold_until(usage, now) is not None:
+            return False  # weekly use only climbs before its reset: no probe
 
         weekly = usage.get("seven_day")
         if isinstance(weekly, dict) and isinstance(weekly.get("pct"), (int, float)):
@@ -248,7 +300,61 @@ class WarmupEngine:
         # its five-hour window is still live.
         return reset is None or reset <= now
 
+    def _weekly_hold_until(self, usage: object, now: float) -> float | None:
+        """When to warm an account that is done for the week, if not yet.
+
+        Weekly at or over the auto-switch threshold with a known reset: the
+        warm waits until the window it opens would end
+        ``WEEKLY_RESET_BUFFER_S`` after that reset. None once that moment has
+        come, or for any account auto still uses this week.
+        """
+        weekly = usage.get("seven_day") if isinstance(usage, dict) else None
+        if not isinstance(weekly, dict):
+            return None
+        pct = weekly.get("pct")
+        if not isinstance(pct, (int, float)) or float(pct) < self._hold_pct:
+            return None
+        reset = parse_reset_ts(weekly.get("resets_at"))
+        if reset is None:
+            return None
+        start = reset + WEEKLY_RESET_BUFFER_S - FIVE_HOUR_SECONDS
+        return start if start > now else None
+
+    def _timed_detail(self, account: AccountSnapshot, now: float) -> str:
+        from datetime import datetime
+
+        entry = account.usage
+        usage = entry.decision_value()
+        if not isinstance(usage, dict):
+            usage = entry.last_good
+        start = self._weekly_hold_until(usage, now) or now
+        weekly = usage.get("seven_day") if isinstance(usage, dict) else {}
+        reset = parse_reset_ts(weekly.get("resets_at")) or now
+
+        def clock(ts: float) -> str:
+            return datetime.fromtimestamp(ts).strftime("%H:%M")
+
+        return (
+            f"weekly is back at {clock(reset)}; warming at {clock(start)} so this "
+            f"window ends at {clock(start + FIVE_HOUR_SECONDS)} and a second one "
+            "follows"
+        )
+
     def _skip_reason(self, account: AccountSnapshot, state: dict, now: float) -> str | None:
+        reason = self._base_skip_reason(account, state, now)
+        if reason is not None:
+            return reason
+        entry = account.usage
+        usage = entry.decision_value()
+        if not isinstance(usage, dict):
+            usage = entry.last_good
+        if self._weekly_hold_until(usage, now) is not None:
+            return "timed-for-weekly-reset"
+        return None
+
+    def _base_skip_reason(
+        self, account: AccountSnapshot, state: dict, now: float
+    ) -> str | None:
         if account.disabled:
             return "disabled"
         if account.kind != "oauth":

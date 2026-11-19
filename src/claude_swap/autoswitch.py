@@ -78,6 +78,7 @@ from claude_swap.warmup import (
     DEFAULT_INTERVAL_SECONDS as WARMUP_INTERVAL_SECONDS,
     WarmupEngine,
     WarmupEvent,
+    warm_reserve_headroom,
 )
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -3442,6 +3443,14 @@ class AutoSwitchEngine:
             if verdict is not None:
                 headroom[num] = h
                 self._gate_verdicts[num] = verdict
+        if self.settings.warmup_five_hour:
+            # After the gates: an open gate must not ride into the sliver the
+            # timed warm needs (warmup.WARM_RESERVE_PCT).
+            for num, value in usage.items():
+                ceiling = warm_reserve_headroom(value, now)
+                h = headroom.get(num)
+                if ceiling is not None and h is not None and ceiling < h:
+                    headroom[num] = ceiling
         return headroom
 
     def _gate_pass(
