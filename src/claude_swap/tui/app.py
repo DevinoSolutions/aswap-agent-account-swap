@@ -62,6 +62,11 @@ class AswapApp(App):
         dict, always_update=True
     )
     refresh_status: reactive[str] = reactive("")
+    # "auto: no check since ..." while `aswap auto` has stopped checking, else
+    # "". The ranked list alone looks like auto is at work (2026-11-18: a
+    # reboot left the laptop 17 h on one account under this dashboard).
+    auto_stalled: reactive[str] = reactive("")
+    AUTO_CHECK_S = 5.0
     # Deliberately global: both provider switchers acquire the same lock file.
     # Separate busy flags could start two same-process actions whose distinct
     # file descriptors contend, recreating the lock-timeout/deadlock class the
@@ -103,6 +108,7 @@ class AswapApp(App):
         self._applied_generation = {provider: 0 for provider in PROVIDERS}
         self._last_refresh_error = {provider: "" for provider in PROVIDERS}
         self._last_auto_provider = "claude"
+        self._auto_checked_at = 0.0
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
         try:
@@ -279,6 +285,19 @@ class AswapApp(App):
                 if elapsed >= self.POLL_INTERVAL_S:
                     parts.append(f"{label} refreshing {format_duration(elapsed)}")
         self.refresh_status = " · ".join(parts)
+        self._update_auto_stalled(now)
+
+    def _update_auto_stalled(self, now: float) -> None:
+        if now - self._auto_checked_at < self.AUTO_CHECK_S:
+            return
+        self._auto_checked_at = now
+        from claude_swap.autoswitch import auto_stalled_note  # imports switcher
+
+        try:
+            note = auto_stalled_note(self.switcher_for("claude").backup_dir, now)
+        except Exception:
+            note = None  # unreadable settings: not this line's problem
+        self.auto_stalled = note or ""
 
     def request_refresh(self, provider: str | None = None, *, full: bool = False) -> None:
         if full:

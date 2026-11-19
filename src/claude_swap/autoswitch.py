@@ -67,6 +67,7 @@ from claude_swap.settings import (
     AutoSwitchSettings,
     atomic_write_json,
     format_setting_value,
+    load_settings,
     parse_model_names,
     parse_priority,
 )
@@ -364,6 +365,25 @@ def heartbeat_stalled_since(backup_dir: Path, now: float) -> float | None:
     except (OSError, ValueError, TypeError, KeyError):
         return None
     return at if now > next_by + HEARTBEAT_GRACE_S else None
+
+
+def auto_stalled_note(backup_dir: Path, now: float) -> str | None:
+    """Plain-text warning that ``aswap auto`` stopped checking while enabled.
+
+    Shown by ``aswap list`` and the dashboard: the ranked list alone looks
+    like auto is at work. Measured 2026-11-18: after a reboot auto never came
+    back and the laptop sat 17 hours on one account while the dashboard
+    showed the order.
+    """
+    since = heartbeat_stalled_since(backup_dir, now)
+    if since is None or not load_settings(backup_dir).enabled:
+        return None
+    minutes = max(1, int((now - since) // 60))
+    span = f"{minutes} min" if minutes < 120 else f"{minutes // 60} h"
+    return (
+        f"auto: no check since {clock_label(since)} ({span}) — "
+        "stuck or stopped, nothing is switching; restart `aswap auto`"
+    )
 
 
 def clock_label(ts: float) -> str:

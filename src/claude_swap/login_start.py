@@ -80,6 +80,26 @@ def aswap_executable() -> str | None:
     return None
 
 
+def windows_terminal() -> str | None:
+    """Windows Terminal by its app execution alias, which survives updates.
+
+    Inside a Windows Terminal tab, ``shutil.which("wt")`` answers with the
+    package folder itself (``...\\WindowsApps\\Microsoft.WindowsTerminal_1.24...``),
+    and the next Store update deletes that folder. Measured 2026-11-18: the
+    login entry still named a removed 1.24 folder, so after a reboot auto
+    never started and the laptop sat 17 hours on one account.
+    """
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        alias = Path(local) / "Microsoft" / "WindowsApps" / "wt.exe"
+        if alias.exists():
+            return str(alias)
+    found = shutil.which("wt")
+    if found and "windowsterminal_" in found.lower():
+        return None  # a versioned folder: a plain console outlives it
+    return found
+
+
 def windows_command(exe: str, wt: str | None) -> str:
     if wt:
         return f'"{wt}" -w new nt --title "{ENTRY_NAME}" "{exe}" auto {LOGIN_FLAG}'
@@ -150,7 +170,7 @@ def sync(enabled: bool, backup_dir: Path, *, platform: str | None = None) -> str
     home = Path.home()
     try:
         if platform == "win32":
-            want = windows_command(exe, shutil.which("wt")) if exe else None
+            want = windows_command(exe, windows_terminal()) if exe else None
             have = _run_key.get(ENTRY_NAME)
             if want is None:
                 if have is None:

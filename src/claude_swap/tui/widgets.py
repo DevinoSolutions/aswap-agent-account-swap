@@ -447,6 +447,7 @@ class AccountsPanel(Static):
     def on_mount(self) -> None:
         self.watch(self.app, "snapshots", lambda _snap: self.refresh(layout=True))
         self.watch(self.app, "theme", lambda _t: self.refresh(layout=True))
+        self.watch(self.app, "auto_stalled", lambda _s: self.refresh(layout=True))
 
     def render(self) -> Text:
         app: "AswapApp" = self.app  # type: ignore[assignment]
@@ -465,6 +466,9 @@ class AccountsPanel(Static):
         now = time.time()
         width = (self.size.width or 80) - 2
         text = Text()
+        if app.auto_stalled and "claude" in providers:
+            text.append(f"⚠ {app.auto_stalled}", style=f"bold {palette.sev_warn}")
+            text.append("\n\n")
         rendered_sections = 0
         for provider in providers:
             snap = app.snapshots[provider]
