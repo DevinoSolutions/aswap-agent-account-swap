@@ -169,6 +169,16 @@ aswap warmup                    # keep checking in the foreground
 aswap warmup --interval 900     # check every 15 minutes
 ```
 
+**Timed around the weekly reset.** An account done for the week (weekly at or
+over `autoswitch.threshold`) is not warmed at random: the warm waits until the
+window it opens would end one hour after the weekly reset. The reset frees the
+weekly quota, the window's budget is spent in that hour, and a second fresh
+window opens right after, so two five-hour budgets fit where one would. With
+warm-up on, `aswap auto` also leaves such an account when its weekly reads 99%,
+keeping the last point for that Haiku request (claude.ai refuses it at 100%).
+Neither applies to plans without a five-hour window, or once a window spanning
+the reset is already open.
+
 This feature consumes real five-hour and weekly quota and is opt-in. It skips
 disabled, API-key, non-switchable, and accounts with known exhausted weekly quota.
 If usage remains missing, stale, errored, or hollow after a fresh probe, it

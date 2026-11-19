@@ -7240,3 +7240,61 @@ class TestNeedsLoginSlots:
         assert outcome is TickOutcome.SWITCHED
         sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert sw.to_ref["number"] == 3
+
+
+class TestWarmReserve:
+    """Owner ask 2026-11-19: on an account with a five-hour window, auto stops
+    at a weekly reading of 99 so the timed warm (a Haiku request, refused at
+    100%) can still open the window that spans the weekly reset."""
+
+    class _NoWarmer:
+        def __init__(self, *a, **k):
+            pass
+
+        def tick(self):
+            from claude_swap.warmup import WarmupSummary
+
+            return WarmupSummary()
+
+        def stop(self):
+            pass
+
+    def _harness(self, temp_home: Path, warmup: bool) -> EngineHarness:
+        h = EngineHarness(
+            temp_home, strategy="consume-first", threshold=99.9, warmup_five_hour=warmup
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _tick(self, h: EngineHarness, active: dict) -> TickOutcome:
+        return h.tick_with_usage({"1": active, "2": _usage7(10, 10, _R_LATER)})
+
+    def test_leaves_at_99_to_keep_the_warm_point(self, temp_home):
+        with patch("claude_swap.autoswitch.WarmupEngine", self._NoWarmer):
+            h = self._harness(temp_home, warmup=True)
+            assert self._tick(h, _usage7(20, 99, _R_SOON)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_without_warmup_it_rides_to_the_threshold(self, temp_home):
+        h = self._harness(temp_home, warmup=False)
+        assert self._tick(h, _usage7(20, 99, _R_SOON)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_no_reserve_once_the_spanning_window_is_open(self, temp_home):
+        active = _usage7(20, 99, _R_SOON)
+        active["five_hour"]["resets_at"] = "2024-01-05T03:00:00Z"  # after the weekly reset
+        with patch("claude_swap.autoswitch.WarmupEngine", self._NoWarmer):
+            h = self._harness(temp_home, warmup=True)
+            assert self._tick(h, active) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_no_reserve_on_a_weekly_only_plan(self, temp_home):
+        from claude_swap import oauth
+
+        active = {"seven_day": {"pct": 99, "resets_at": _R_SOON}, oauth.NO_FIVE_HOUR: True}
+        with patch("claude_swap.autoswitch.WarmupEngine", self._NoWarmer):
+            h = self._harness(temp_home, warmup=True)
+            assert self._tick(h, active) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1

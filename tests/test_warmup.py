@@ -1054,3 +1054,68 @@ def test_loop_exit_code_recovers_after_a_successful_tick(tmp_path):
     engine._stopped.wait.side_effect = [False, True]
 
     assert engine.run_loop() == 0
+
+
+class TestTimedForWeeklyReset:
+    """Owner ask 2026-11-19: an account done for the week is warmed so its
+    five-hour window ends an hour after the weekly reset, and a second fresh
+    window opens right after (super@: warmed at 10:34 for nothing, weekly
+    back at 19:00, plan ending 23:33)."""
+
+    @staticmethod
+    def _done_for_week(reset_in_s: float, pct: float = 99.0, **kw):
+        return _account(
+            "2",
+            {"five_hour": {"pct": 0.0}, "seven_day": {"pct": pct, "resets_at": _iso(reset_in_s)}},
+            **kw,
+        )
+
+    def test_waits_until_the_window_would_end_an_hour_after_the_reset(self, tmp_path):
+        clock = _MutableClock()
+        engine, _switcher, sessions, events = _engine(
+            tmp_path, [self._done_for_week(8 * 3600)], clock=clock
+        )
+        engine.tick()
+        assert sessions.calls == []
+        assert events[-1].kind == "timed-for-weekly-reset"
+        assert "a second one follows" in events[-1].detail
+
+        clock.advance(4 * 3600 - 1)  # one second before reset + 1 h - 5 h
+        engine.tick()
+        assert sessions.calls == []
+
+        clock.advance(1)
+        engine.tick()
+        assert [call[0] for call in sessions.calls] == ["2"]
+
+    def test_inside_the_last_four_hours_it_warms_at_once(self, tmp_path):
+        engine, _switcher, sessions, _events = _engine(
+            tmp_path, [self._done_for_week(int(2.5 * 3600))]
+        )
+        engine.tick()
+        assert [call[0] for call in sessions.calls] == ["2"]
+
+    def test_an_account_still_in_use_this_week_is_warmed_as_before(self, tmp_path):
+        engine, _switcher, sessions, _events = _engine(
+            tmp_path, [self._done_for_week(8 * 3600, pct=50.0)]
+        )
+        engine.tick()
+        assert [call[0] for call in sessions.calls] == ["2"]
+
+    def test_the_hold_follows_the_auto_switch_threshold(self, tmp_path):
+        from claude_swap.settings import set_setting
+
+        set_setting(tmp_path, "autoswitch.threshold", "99.5")
+        engine, _switcher, sessions, _events = _engine(
+            tmp_path, [self._done_for_week(8 * 3600, pct=99.0)]
+        )
+        engine.tick()
+        assert [call[0] for call in sessions.calls] == ["2"]  # below 99.5: in use
+
+    def test_a_held_stale_account_is_not_probed(self, tmp_path):
+        engine, switcher, sessions, _events = _engine(
+            tmp_path, [self._done_for_week(8 * 3600, age_s=3600)]
+        )
+        engine.tick()
+        assert switcher.snapshot_calls == 1  # no forced fresh probe
+        assert sessions.calls == []
