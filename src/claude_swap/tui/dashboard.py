@@ -70,6 +70,7 @@ _SETTING_LABELS = {
     "autoswitch.includeApiKeyAccounts": "Use API-key accounts",
     "autoswitch.unhealthyTicks": "Failed polls before unhealthy",
     "autoswitch.model": "Model weekly limits",
+    "autoswitch.modelsFromChats": "Follow models chats use",
     "autoswitch.warmupFiveHour": "Warm up five-hour windows",
     "autoswitch.manualHold": "Hold hand-picked account",
     "autoswitch.manualHoldMinutes": "Manual hold (minutes)",

@@ -12,6 +12,7 @@ than one poll interval.
 File contract (written by the statusline command, e.g. ``~/.claude/statusline.mjs``)::
 
     {"at": <epoch ms written>, "session": "<id>",
+     "model": {"id": "claude-fable-5-2", "display_name": "Fable 5.2"},
      "rate_limits": {"five_hour": {"used_percentage": 37, "resets_at": 1791...},
                      "seven_day": {"used_percentage": 12, "resets_at": 1792...}}}
 
@@ -56,6 +57,11 @@ MATCH_TOL_S = 300.0
 # with second precision by one source and rounded by the other).
 SAME_WINDOW_TOL_S = 120.0
 _WEEK_S = 7 * 86400.0
+# A chat whose statusline wrote within this long counts as using its model:
+# long enough to span a slow tool call between responses, short enough that
+# auto drops a finished chat's model and goes back to draining the weekly
+# quota within minutes (owner ask 2026-11-21, see ``active_models``).
+MODEL_ACTIVE_S = 10 * 60.0
 _WINDOWS = ("five_hour", "seven_day")
 
 
@@ -130,6 +136,64 @@ def read_readings(root: Path, now: float | None = None, fresh_s: float = FRESH_S
                 reading[key] = window
         if "five_hour" in reading or "seven_day" in reading:
             out.append(reading)
+    return out
+
+
+def model_family(model: object) -> str | None:
+    """The model's family as per-model usage windows name it.
+
+    ``{"display_name": "Fable 5.2"}`` -> ``"Fable"`` (the words before the
+    version); a bare id ``"claude-fable-5-2"`` -> ``"Fable"``.
+    """
+    if not isinstance(model, dict):
+        return None
+    display = model.get("display_name")
+    if isinstance(display, str):
+        words = []
+        for word in display.split():
+            if word[:1].isdigit() or word.startswith("("):
+                break
+            words.append(word)
+        if words:
+            return " ".join(words)
+    ident = model.get("id")
+    if isinstance(ident, str):
+        for part in ident.split("-"):
+            if part.isalpha() and part.lower() != "claude":
+                return part.capitalize()
+    return None
+
+
+def active_models(
+    root: Path, now: float | None = None, within_s: float = MODEL_ACTIVE_S
+) -> set[str]:
+    """Model families of the chats that responded within ``within_s``.
+
+    Every chat on this machine runs on the active account, so these are the
+    models whose per-model weekly limits bind the active account right now.
+    Never raises; a file without a model (an older statusline) adds nothing.
+    """
+    now = time.time() if now is None else now
+    out: set[str] = set()
+    try:
+        paths = list(live_dir(root).glob("*.json"))
+    except OSError:
+        return out
+    for path in paths:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        stamp = raw.get("at")
+        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+            continue
+        if now - stamp / 1000.0 > within_s:
+            continue
+        family = model_family(raw.get("model"))
+        if family:
+            out.add(family)
     return out
 
 

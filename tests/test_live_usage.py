@@ -244,3 +244,104 @@ class TestLiveCheckLog:
             harness.engine.tick()
         msgs = [r.getMessage() for r in caplog.records if "live-check" in r.getMessage()]
         assert msgs and "not attributed" in msgs[0]
+
+
+
+# --- models chats are using (owner ask 2026-11-21) ---------------------------
+
+
+def _chat(root: Path, session: str, at_s: float, model: dict | None) -> None:
+    d = lu.live_dir(root)
+    d.mkdir(parents=True, exist_ok=True)
+    body = {"at": at_s * 1000.0, "session": session}
+    if model is not None:
+        body["model"] = model
+    (d / f"{session}.json").write_text(json.dumps(body), encoding="utf-8")
+
+
+class TestModelFamily:
+    @pytest.mark.parametrize("model, family", [
+        ({"id": "claude-fable-5-2", "display_name": "Fable 5.2"}, "Fable"),
+        ({"display_name": "Opus 4.6 (1M context)"}, "Opus"),
+        ({"id": "claude-sonnet-5-5"}, "Sonnet"),
+        ({"display_name": ""}, None),
+        (None, None),
+    ])
+    def test_family(self, model, family):
+        assert lu.model_family(model) == family
+
+
+class TestActiveModels:
+    def test_recent_chats_only(self, tmp_path):
+        now = 1_800_000_000.0
+        _chat(tmp_path, "a", now - 30, {"display_name": "Fable 5.2"})
+        _chat(tmp_path, "b", now - lu.MODEL_ACTIVE_S - 1, {"display_name": "Opus 4.6"})
+        _chat(tmp_path, "c", now - 5, None)  # an older statusline: no model
+        assert lu.active_models(tmp_path, now) == {"Fable"}
+
+
+def _fable(pct: float, seven: float, reset7: str) -> dict:
+    return {
+        "five_hour": {"pct": 10.0},
+        "seven_day": {"pct": seven, "resets_at": reset7},
+        "scoped": [{"name": "Fable", "pct": pct, "resets_at": reset7}],
+    }
+
+
+class TestFableFollowsChats:
+    """A nearly spent Fable limit moves the work only while a chat runs Fable;
+    with none, auto keeps draining the weekly quota (and goes back to it)."""
+
+    SOON, LATER = "2024-01-05T00:00:00Z", "2024-01-08T00:00:00Z"
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_switches_while_a_chat_uses_fable(self, temp_home):
+        h = self._harness(temp_home)
+        _chat(h.switcher.backup_dir, "s1", h.clock.now - 20, {"display_name": "Fable 5.2"})
+        outcome = h.tick_with_usage({
+            "1": _fable(100.0, 40.0, self.SOON),
+            "2": _fable(10.0, 10.0, self.LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_stays_when_no_chat_uses_fable(self, temp_home):
+        h = self._harness(temp_home)
+        _chat(h.switcher.backup_dir, "s1", h.clock.now - 20, {"display_name": "Opus 4.6"})
+        outcome = h.tick_with_usage({
+            "1": _fable(100.0, 40.0, self.SOON),
+            "2": _fable(10.0, 10.0, self.LATER),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_goes_back_to_drain_once_fable_chats_stop(self, temp_home):
+        h = self._harness(temp_home)
+        root = h.switcher.backup_dir
+        usage = {"1": _fable(100.0, 40.0, self.SOON), "2": _fable(10.0, 10.0, self.LATER)}
+        _chat(root, "s1", h.clock.now - 20, {"display_name": "Fable 5.2"})
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        h.clock.advance(lu.MODEL_ACTIVE_S + 3600)  # the Fable chat went quiet
+        h.events.clear()
+        h.tick_with_usage(usage)
+        assert h.active_number() == 1  # account 1's weekly perishes sooner
+
+    def test_setting_off_ignores_chats(self, temp_home):
+        h = EngineHarness(temp_home, strategy="consume-first", models_from_chats=False)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        _chat(h.switcher.backup_dir, "s1", h.clock.now - 20, {"display_name": "Fable 5.2"})
+        outcome = h.tick_with_usage({
+            "1": _fable(100.0, 40.0, self.SOON),
+            "2": _fable(10.0, 10.0, self.LATER),
+        })
+        assert outcome is TickOutcome.NO_ACTION

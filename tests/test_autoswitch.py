@@ -6168,12 +6168,12 @@ class TestHorizonAxisDoesNotFlap:
         reset_at = self._iso_at(ranking_now + 100.0)   # future at ranking_now
         stale_reread = ranking_now + 200.0             # past reset_at
 
-        # Enough values for the OLD code's clock() call order (pre-tick
-        # check, ranking now, left_snapshot re-read, freshen expiry check,
-        # _perform's lastSwitchAt) with a couple of spares so neither code
-        # path can exhaust the sequence.
+        # Enough values for the OLD code's clock() call order (tick-start
+        # chat-model read, pre-tick check, ranking now, left_snapshot
+        # re-read, freshen expiry check, _perform's lastSwitchAt) with a
+        # couple of spares so neither code path can exhaust the sequence.
         clock_values = iter([
-            ranking_now, ranking_now, stale_reread,
+            ranking_now, ranking_now, ranking_now, stale_reread,
             stale_reread, stale_reread, stale_reread,
         ])
         with patch.object(h.engine, "clock", side_effect=lambda: next(clock_values)):
