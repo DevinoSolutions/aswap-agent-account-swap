@@ -11,17 +11,27 @@ work:
 - a heads-up ``HEADS_UP_S`` before the weekly reset, and
 - a "ready" alert at the reset, while the quota is there to use.
 
+Delivery goes through Notifly (https://notifly.io): aswap triggers one
+workflow, and the workflow's email step delivers through whatever email
+integration the Notifly environment has (Sendly, connected from Notifly's
+Integrations page). aswap composes the subject and body itself and passes
+them as ``payload.subject`` / ``payload.body``, so the workflow's email step
+only needs ``{{payload.subject}}`` and ``{{payload.body}}``.
+
 Configuration is environment-only, so no address or key is ever stored in
-source or settings (all three are required; nothing is sent otherwise):
+source or settings (nothing is sent unless both of the first two are set):
 
 - ``ASWAP_NOTIFY_EMAILS``: comma-separated recipients.
-- ``ASWAP_NOTIFY_FROM``: the sender, on a domain verified in Sendly.
-- ``ASWAP_NOTIFY_SENDLY_KEY``: a Sendly API key with ``emails:send``.
+- ``ASWAP_NOTIFY_NOTIFLY_KEY``: the Notifly environment's secret API key.
+- ``ASWAP_NOTIFY_WORKFLOW``: the workflow to trigger (default
+  ``aswap-tight-window``).
+- ``ASWAP_NOTIFY_API_URL``: the Notifly API (default
+  ``https://api.notifly.io``).
 
-Every machine running ``aswap auto`` may send the same alert: each send
-carries an ``Idempotency-Key`` derived from the account, the reset and the
-alert kind, and the body only states absolute times, so Sendly delivers one
-email however many machines ask (its key lives 24 hours).
+Every machine running ``aswap auto`` may send the same alert: each trigger
+carries a ``transactionId`` derived from the account, the reset and the
+alert kind, and the body only states absolute times, so Notifly delivers
+one email however many machines ask.
 """
 
 from __future__ import annotations
@@ -34,7 +44,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Callable, Mapping
@@ -50,7 +60,8 @@ HEADS_UP_S = 8 * 3600.0
 # How often the engine looks; alerts are about hours, not seconds.
 CHECK_INTERVAL_S = 300.0
 STATE_FILENAME = "notify_state.json"
-SENDLY_URL = "https://api.sendly.now/api/emails"
+DEFAULT_WORKFLOW = "aswap-tight-window"
+DEFAULT_API_URL = "https://api.notifly.io"
 SEND_TIMEOUT_S = 20.0
 SPARKLE = "✨"
 
@@ -69,8 +80,9 @@ class TightWindow:
 @dataclass(frozen=True)
 class Config:
     recipients: tuple[str, ...]
-    sender: str
     api_key: str
+    workflow: str = DEFAULT_WORKFLOW
+    api_url: str = DEFAULT_API_URL
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Config | None":
@@ -78,17 +90,18 @@ class Config:
         recipients = tuple(
             r.strip() for r in env.get("ASWAP_NOTIFY_EMAILS", "").split(",") if r.strip()
         )
-        sender = env.get("ASWAP_NOTIFY_FROM", "").strip()
-        key = env.get("ASWAP_NOTIFY_SENDLY_KEY", "").strip()
         if not recipients:
             return None
-        if not sender or not key:
+        key = env.get("ASWAP_NOTIFY_NOTIFLY_KEY", "").strip()
+        if not key:
             _logger.warning(
-                "⚠️ ASWAP_NOTIFY_EMAILS is set but ASWAP_NOTIFY_FROM or "
-                "ASWAP_NOTIFY_SENDLY_KEY is missing; tight-window alerts are off"
+                "⚠️ ASWAP_NOTIFY_EMAILS is set but ASWAP_NOTIFY_NOTIFLY_KEY is "
+                "missing; tight-window alerts are off"
             )
             return None
-        return cls(recipients, sender, key)
+        workflow = env.get("ASWAP_NOTIFY_WORKFLOW", "").strip() or DEFAULT_WORKFLOW
+        api_url = (env.get("ASWAP_NOTIFY_API_URL", "").strip() or DEFAULT_API_URL).rstrip("/")
+        return cls(recipients, key, workflow, api_url)
 
 
 def tight_windows(
@@ -117,6 +130,10 @@ def tight_windows(
 
 def _clock(ts: float) -> str:
     return datetime.fromtimestamp(ts).astimezone().strftime("%a %b %d %H:%M %Z").strip()
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _span(seconds: float) -> str:
@@ -152,36 +169,61 @@ def message(window: TightWindow, kind: str) -> tuple[str, str]:
     return subject, body
 
 
+def payload(window: TightWindow, kind: str) -> dict:
+    """The workflow payload: the composed message plus the raw facts, for a
+    workflow that prefers to template its own text."""
+    subject, body = message(window, kind)
+    return {
+        "subject": subject,
+        "body": body,
+        "kind": kind,
+        "account": window.email,
+        "resetAt": _iso(window.reset_at),
+        "endsAt": _iso(window.ends_at),
+        "span": _span(window.length_s),
+    }
+
+
 def idempotency_key(window: TightWindow, kind: str) -> str:
     raw = f"aswap|{window.email.lower()}|{int(window.reset_at)}|{kind}"
     return hashlib.sha256(raw.encode()).hexdigest()[:40]
 
 
-def send_sendly(
-    config: Config, subject: str, body: str, key: str, *, opener=urllib.request.urlopen
+def subscriber_id(email: str) -> str:
+    """A Notifly subscriber of aswap's own per recipient, so an alert never
+    rewrites the profile an app keeps for the same person."""
+    return "aswap-" + hashlib.sha256(email.strip().lower().encode()).hexdigest()[:16]
+
+
+def send_notifly(
+    config: Config, data: dict, key: str, *, opener=urllib.request.urlopen
 ) -> None:
-    """One email to every recipient. Raises on failure (caller retries)."""
-    payload = json.dumps({
-        "to": list(config.recipients),
-        "from": config.sender,
-        "name": "aswap",
-        "subject": subject,
-        "body": body,
+    """Trigger the workflow once for every recipient. Raises on failure
+    (caller retries); a duplicate ``transactionId`` counts as sent."""
+    body = json.dumps({
+        "name": config.workflow,
+        "to": [{"subscriberId": subscriber_id(r), "email": r} for r in config.recipients],
+        "payload": data,
+        "transactionId": key,
     }).encode()
     request = urllib.request.Request(
-        SENDLY_URL,
-        data=payload,
+        f"{config.api_url}/v1/events/trigger",
+        data=body,
         method="POST",
         headers={
-            "Authorization": f"Bearer {config.api_key}",
+            "Authorization": f"ApiKey {config.api_key}",
             "Content-Type": "application/json",
-            "Idempotency-Key": key,
         },
     )
-    with opener(request, timeout=SEND_TIMEOUT_S) as response:
-        status = getattr(response, "status", 200)
-        if status >= 300:
-            raise OSError(f"Sendly answered {status}")
+    try:
+        with opener(request, timeout=SEND_TIMEOUT_S) as response:
+            status = getattr(response, "status", 200)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:  # another machine already triggered this alert
+            return
+        raise OSError(f"Notifly answered {exc.code}") from None
+    if status >= 300:
+        raise OSError(f"Notifly answered {status}")
 
 
 class Notifier:
@@ -194,7 +236,7 @@ class Notifier:
         *,
         inputs: Callable[[float], Mapping[str, dict]],
         emails: Callable[[], Mapping[str, str]],
-        send: Callable[[Config, str, str, str], None] = send_sendly,
+        send: Callable[[Config, dict, str], None] = send_notifly,
         clock: Callable[[], float] = time.time,
     ):
         self.state_path = Path(backup_dir) / STATE_FILENAME
@@ -244,9 +286,8 @@ class Notifier:
                 key = idempotency_key(window, kind)
                 if key in state:
                     continue
-                subject, body = message(window, kind)
                 try:
-                    self._send(self.config, subject, body, key)
+                    self._send(self.config, payload(window, kind), key)
                 except (OSError, urllib.error.URLError) as exc:
                     _logger.warning("⚠️ tight-window alert for %s not sent: %s", window.email, exc)
                     continue

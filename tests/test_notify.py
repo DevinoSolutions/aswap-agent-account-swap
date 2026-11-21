@@ -13,7 +13,7 @@ from claude_swap.notify import HEADS_UP_S, WEEK_S, Config, Notifier, TightWindow
 
 RESET = 1_800_000_000.0  # the weekly reset
 ENDS = RESET + 79 * 60  # bills 1h19m later (owner example: 22:00 / 23:19)
-CONFIG = Config(("a@example.com", "b@example.com"), "aswap@example.com", "pk_test")
+CONFIG = Config(("a@example.com", "b@example.com"), "nk_test")
 
 
 class TestTightWindows:
@@ -63,30 +63,41 @@ class TestConfig:
     def test_off_without_recipients(self):
         assert Config.from_env({}) is None
 
-    def test_off_and_warns_without_sender_or_key(self, caplog):
+    def test_off_and_warns_without_a_key(self, caplog):
         assert Config.from_env({"ASWAP_NOTIFY_EMAILS": "a@example.com"}) is None
-        assert "ASWAP_NOTIFY_SENDLY_KEY" in caplog.text
+        assert "ASWAP_NOTIFY_NOTIFLY_KEY" in caplog.text
 
-    def test_reads_all_three(self):
+    def test_reads_recipients_and_key_with_defaults(self):
         cfg = Config.from_env({
             "ASWAP_NOTIFY_EMAILS": " a@example.com, b@example.com ,",
-            "ASWAP_NOTIFY_FROM": "aswap@example.com",
-            "ASWAP_NOTIFY_SENDLY_KEY": "pk_x",
+            "ASWAP_NOTIFY_NOTIFLY_KEY": "nk_x",
         })
-        assert cfg == Config(("a@example.com", "b@example.com"), "aswap@example.com", "pk_x")
+        assert cfg == Config(("a@example.com", "b@example.com"), "nk_x")
+        assert cfg.workflow == "aswap-tight-window"
+        assert cfg.api_url == "https://api.notifly.io"
+
+    def test_workflow_and_api_url_can_be_overridden(self):
+        cfg = Config.from_env({
+            "ASWAP_NOTIFY_EMAILS": "a@example.com",
+            "ASWAP_NOTIFY_NOTIFLY_KEY": "nk_x",
+            "ASWAP_NOTIFY_WORKFLOW": "my-flow",
+            "ASWAP_NOTIFY_API_URL": "https://notifly.internal/",
+        })
+        assert (cfg.workflow, cfg.api_url) == ("my-flow", "https://notifly.internal")
 
 
-def test_send_sendly_posts_once_to_every_recipient():
+class _Response:
+    status = 201
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_send_notifly_triggers_the_workflow_once_for_every_recipient():
     seen = {}
-
-    class _Response:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
 
     def opener(request, timeout):
         seen["url"] = request.full_url
@@ -94,12 +105,36 @@ def test_send_sendly_posts_once_to_every_recipient():
         seen["body"] = json.loads(request.data)
         return _Response()
 
-    notify.send_sendly(CONFIG, "S", "<p>B</p>", "key-1", opener=opener)
-    assert seen["url"] == "https://api.sendly.now/api/emails"
-    assert seen["headers"]["Authorization"] == "Bearer pk_test"
-    assert seen["headers"]["Idempotency-key"] == "key-1"
-    assert seen["body"]["to"] == ["a@example.com", "b@example.com"]
-    assert seen["body"]["from"] == "aswap@example.com"
+    data = notify.payload(TightWindow("cozy@example.com", RESET, ENDS), "ready")
+    notify.send_notifly(CONFIG, data, "key-1", opener=opener)
+    assert seen["url"] == "https://api.notifly.io/v1/events/trigger"
+    assert seen["headers"]["Authorization"] == "ApiKey nk_test"
+    body = seen["body"]
+    assert body["name"] == "aswap-tight-window"
+    assert body["transactionId"] == "key-1"
+    assert [t["email"] for t in body["to"]] == ["a@example.com", "b@example.com"]
+    assert all(t["subscriberId"].startswith("aswap-") for t in body["to"])
+    assert body["payload"]["subject"].startswith("✨ cozy@example.com is ready")
+    assert body["payload"]["kind"] == "ready" and body["payload"]["span"] == "1h 19m"
+
+
+def test_a_duplicate_transaction_counts_as_sent_and_other_errors_raise():
+    import urllib.error
+
+    def refuse(code):
+        def opener(request, timeout):
+            raise urllib.error.HTTPError(request.full_url, code, "x", {}, None)
+        return opener
+
+    data = notify.payload(TightWindow("cozy@example.com", RESET, ENDS), "ready")
+    notify.send_notifly(CONFIG, data, "k", opener=refuse(409))
+    with pytest.raises(OSError, match="401"):
+        notify.send_notifly(CONFIG, data, "k", opener=refuse(401))
+
+
+def test_subscriber_ids_are_stable_and_case_blind():
+    assert notify.subscriber_id("A@Example.com ") == notify.subscriber_id("a@example.com")
+    assert notify.subscriber_id("a@example.com") != notify.subscriber_id("b@example.com")
 
 
 class _Clock:
@@ -111,10 +146,10 @@ class _Clock:
 
 
 def _notifier(tmp_path, clock, sends, fail=False):
-    def send(config, subject, body, key):
+    def send(config, data, key):
         if fail:
             raise OSError("network down")
-        sends.append((subject, key))
+        sends.append((data["subject"], key))
 
     def inputs(now):
         nxt = RESET if now < RESET else RESET + WEEK_S
@@ -176,12 +211,11 @@ class TestNotifier:
 def test_engine_enables_alerts_from_the_environment(temp_home, monkeypatch, dry_run, env_on, expected):
     from tests.test_autoswitch import EngineHarness
 
-    for key in ("ASWAP_NOTIFY_EMAILS", "ASWAP_NOTIFY_FROM", "ASWAP_NOTIFY_SENDLY_KEY"):
+    for key in ("ASWAP_NOTIFY_EMAILS", "ASWAP_NOTIFY_NOTIFLY_KEY"):
         monkeypatch.delenv(key, raising=False)
     if env_on:
         monkeypatch.setenv("ASWAP_NOTIFY_EMAILS", "a@example.com")
-        monkeypatch.setenv("ASWAP_NOTIFY_FROM", "aswap@example.com")
-        monkeypatch.setenv("ASWAP_NOTIFY_SENDLY_KEY", "pk_x")
+        monkeypatch.setenv("ASWAP_NOTIFY_NOTIFLY_KEY", "nk_x")
     h = EngineHarness(temp_home)
     engine = h._make_engine(dry_run=dry_run)
     assert (engine._notifier is not None) is expected
