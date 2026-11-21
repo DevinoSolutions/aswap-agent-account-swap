@@ -155,6 +155,20 @@ Defaults like the threshold and cooldown are configurable with `aswap config set
 
 </details>
 
+### Tight-window email alerts (opt-in)
+
+When an account's weekly limit resets only shortly before its paid period ends (12 hours or less, e.g. weekly back at 22:00, billing at 23:19), a whole week of quota exists for that stretch alone, and whatever is left at the period end is lost. `aswap auto` already drains such an account first; these alerts give people time to line up work. It emails a ✨ heads-up 8 hours before the reset, then a ✨ "ready" alert at the reset.
+
+Configuration is environment-only, so no address or key lands in source or settings. All three variables must be set:
+
+```bash
+ASWAP_NOTIFY_EMAILS="you@example.com,teammate@example.com"   # recipients
+ASWAP_NOTIFY_FROM="aswap@example.com"                         # a sender on a domain verified in Sendly
+ASWAP_NOTIFY_SENDLY_KEY="pk_..."                              # Sendly API key with emails:send
+```
+
+Every machine running `aswap auto` can carry the same variables. Each alert is sent with a fixed `Idempotency-Key`, so Sendly delivers it once however many machines send it.
+
 ### Keep five-hour windows warm (opt-in)
 
 `aswap warmup` keeps stored OAuth accounts ready by checking usage every ten

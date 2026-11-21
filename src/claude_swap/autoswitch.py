@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap.endpoints import scaled  # test-only clock scale (1.0 outside tests)
-from claude_swap import edge, gate, live_usage, oauth, poll_policy, snapshots, statedb
+from claude_swap import edge, gate, live_usage, notify, oauth, poll_policy, snapshots, statedb
 from claude_swap.exceptions import ClaudeSwitchError, RosterChangedError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -1277,6 +1277,23 @@ class AutoSwitchEngine:
         self._next_warmup_at: float | None = None
         if settings.warmup_five_hour:
             self._enable_warmup()
+        # Tight-window email alerts (notify.py): on only when the
+        # ASWAP_NOTIFY_* environment is set; never in a dry run.
+        config = None if dry_run else notify.Config.from_env()
+        self._notifier = (
+            notify.Notifier(
+                switcher.backup_dir,
+                config,
+                inputs=self._perish_inputs,
+                emails=lambda: {
+                    n: switcher.account_email(n)
+                    for n in switcher.switchable_account_numbers()
+                },
+                clock=clock,
+            )
+            if config is not None
+            else None
+        )
 
     def _enable_warmup(self) -> None:
         self._warmup = WarmupEngine(
@@ -1637,6 +1654,8 @@ class AutoSwitchEngine:
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
             outcome = TickOutcome.ERROR
+        if self._notifier is not None and not self._stop.is_set():
+            self._notifier.maybe_run()
         if self._run_warmup_if_due():
             return TickOutcome.ERROR
         return outcome
