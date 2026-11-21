@@ -12,7 +12,7 @@ from claude_swap import notify
 from claude_swap.notify import HEADS_UP_S, WEEK_S, Config, Notifier, TightWindow
 
 RESET = 1_800_000_000.0  # the weekly reset
-ENDS = RESET + 79 * 60  # bills 1h19m later (cozy_comfort@, Nov 25 22:00 / 23:19)
+ENDS = RESET + 79 * 60  # bills 1h19m later (owner example: 22:00 / 23:19)
 CONFIG = Config(("a@example.com", "b@example.com"), "aswap@example.com", "pk_test")
 
 
