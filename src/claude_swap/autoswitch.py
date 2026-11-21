@@ -1186,7 +1186,9 @@ class AutoSwitchEngine:
         # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
         # pass everywhere usage windows are read — decisions, cadence, and
         # reset scheduling must all see the same axes.
-        self._models = parse_model_names(settings.model)
+        self._configured_models = parse_model_names(settings.model)
+        self._models = self._configured_models
+        self._chat_models: tuple[str, ...] = ()
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
@@ -1246,7 +1248,7 @@ class AutoSwitchEngine:
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
-        self._model_check_done = not self._models
+        self._model_check_done = not self._configured_models
         # Manual hold. ``_last_seen`` is the active account of the previous
         # tick — the fallback for spotting a hand switch before the state file
         # records one, and a dry run's own view; ``_stored_seen`` is the
@@ -1650,6 +1652,7 @@ class AutoSwitchEngine:
         self._edge_forced = False
         self.manual_hold = None
         self._follow_roster()
+        self._follow_chat_models()
         self._reload_settings()
         settings = self.settings
         self._caps = {
@@ -4000,7 +4003,7 @@ class AutoSwitchEngine:
         polling legitimately leaves gaps before that — and never worth a
         forced refresh of its own.
         """
-        wanted = {m.lower(): m for m in self._models if m.lower() != "all"}
+        wanted = {m.lower(): m for m in self._configured_models if m.lower() != "all"}
         if not wanted:
             self._model_check_done = True  # bare "all" needs no name match
             return
@@ -4136,13 +4139,64 @@ class AutoSwitchEngine:
         """
         apply_settings_reload(self, self._live.poll(self.settings))
 
+    def _chat_extra(self) -> tuple[str, ...]:
+        configured = {m.lower() for m in self._configured_models}
+        if "all" in configured:
+            return ()
+        return tuple(m for m in self._chat_models if m.lower() not in configured)
+
+    def _follow_chat_models(self) -> None:
+        """Fold the models chats are using right now into ``_models``.
+
+        Owner ask 2026-11-21: a nearly spent Fable limit should move the work
+        only while some chat is running Fable; with none, the account-wide
+        windows decide, and auto goes back to draining the weekly quota. Each
+        tick re-reads the chats (live_usage.active_models), so a chat starting
+        on Fable counts from its first response, and one that stopped stops
+        counting ``MODEL_ACTIVE_S`` later.
+        """
+        chats: tuple[str, ...] = ()
+        if self.settings.models_from_chats:
+            try:
+                chats = tuple(sorted(
+                    live_usage.active_models(self.switcher.backup_dir, self.clock())
+                ))
+            except Exception:
+                _logger.debug("chat models unavailable", exc_info=True)
+                chats = self._chat_models
+        if chats == self._chat_models:
+            return
+        before = set(self._chat_extra())
+        self._chat_models = chats
+        after = set(self._chat_extra())
+        if before != after:
+            started, stopped = sorted(after - before), sorted(before - after)
+            if started:
+                _logger.info(
+                    "🧠 Chats are using %s: its weekly limit now counts",
+                    ", ".join(started),
+                )
+            if stopped:
+                _logger.info(
+                    "🧠 No chat has used %s for %d min: back to the account-wide limits",
+                    ", ".join(stopped), int(live_usage.MODEL_ACTIVE_S // 60),
+                )
+        models = (*self._configured_models, *self._chat_extra())
+        if models != self._models:
+            self._models = models
+            # Binding percentages change axis with the models: earlier
+            # samples would read as a jump or a drop.
+            self._burn = BurnTracker()
+            self.switcher.set_poll_policy_inputs(self.settings.threshold, self._models)
+
     def _settings_applied(
         self, old: AutoSwitchSettings, new: AutoSwitchSettings
     ) -> None:
         """Carry a reloaded value into the state derived from it."""
         if new.model != old.model:
-            self._models = parse_model_names(new.model)
-            self._model_check_done = not self._models
+            self._configured_models = parse_model_names(new.model)
+            self._models = (*self._configured_models, *self._chat_extra())
+            self._model_check_done = not self._configured_models
             self._burn = BurnTracker()
         if new.threshold != old.threshold or new.model != old.model:
             self.switcher.set_poll_policy_inputs(new.threshold, self._models)

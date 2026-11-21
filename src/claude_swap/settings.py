@@ -64,6 +64,11 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Also fold in the per-model weekly limit of every model a chat on this
+    # machine ran within the last few minutes (live_usage.active_models): a
+    # nearly spent Fable limit moves the work only while a chat uses Fable,
+    # and auto returns to draining the weekly quota once none does.
+    models_from_chats: bool = True
     # Opt-in: let `aswap auto` also keep OAuth accounts' five-hour windows
     # started. The warmer keeps its own five-hour duplicate-spend guard.
     warmup_five_hour: bool = False
@@ -237,6 +242,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "modelsFromChats", "models_from_chats", "bool",
+            help="Also switch on the weekly limit of any model a chat used in the last 10 minutes",
         ),
         SettingSpec(
             "autoswitch", "warmupFiveHour", "warmup_five_hour", "bool",
