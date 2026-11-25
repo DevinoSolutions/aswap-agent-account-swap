@@ -509,7 +509,12 @@ def billing_command(argv: list[str]) -> None:
                    help="existing slot/email, or a new email; omit to sign in as anyone")
     p.add_argument("--chrome", metavar="PATH")
     # 600 s: a claude.ai sign-in code stays valid for ten minutes.
-    p.add_argument("--timeout", type=float, default=600.0)
+    p.add_argument("--timeout", type=float, default=None,
+                   help="seconds to wait for the sign-in (default 600; 300 with --auto)")
+    p.add_argument("--auto", action="store_true",
+                   help="hands-free re-login of an existing account: the sign-in link is read "
+                        "from the login mailboxes (aswap inbox), only the slot is updated, and "
+                        "the first wall (no mail, captcha, phone check) ends it")
     p.add_argument("--no-token", action="store_true",
                    help="skip minting a Claude Code OAuth token (session only)")
     p.add_argument("--push-to", metavar="HOST[,HOST]",
@@ -552,7 +557,16 @@ def billing_command(argv: list[str]) -> None:
         parser.error("a subcommand is required: login, status, refresh, tier, plan, paid, cancelled, forget, forget-anchor")
     try:
         sw = _switcher(args.debug)
-        if args.action == "login":
+        if args.action == "login" and args.auto:
+            from claude_swap import relogin
+
+            relogin.login_auto(
+                sw, args.account, chrome=args.chrome,
+                timeout_s=args.timeout or relogin.AUTO_TIMEOUT_S,
+            )
+        elif args.action == "login":
+            if args.timeout is None:
+                args.timeout = 600.0
             _login(sw, args)
         elif args.action == "status":
             _status(sw, args)

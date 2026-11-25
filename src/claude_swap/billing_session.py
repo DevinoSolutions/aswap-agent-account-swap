@@ -79,6 +79,30 @@ class CaptureError(BillingSessionError):
     """The browser capture could not run or finish."""
 
 
+# Hands-free (``--auto``) sign-ins stop at the first wall instead of waiting
+# for a person. ``kind`` names the wall; ``WALL_STOPS_RUN`` are the ones that
+# say something about this machine or IP rather than the one account (a bot
+# check, a captcha), so a loop over many accounts stops there instead of
+# walking every account into the same wall.
+WALL_NO_INBOX = "no-inbox"
+WALL_NO_FORM = "no-login-form"
+WALL_NO_EMAIL = "no-email"
+WALL_BROWSER_CHECK = "browser-check"
+WALL_CAPTCHA = "captcha"
+WALL_PHONE = "phone"
+WALL_LINK_REJECTED = "link-rejected"
+WALL_TIMEOUT = "timeout"
+WALL_STOPS_RUN = frozenset({WALL_BROWSER_CHECK, WALL_CAPTCHA})
+
+
+class LoginWall(CaptureError):
+    """A hands-free sign-in hit something only a person can get past."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
 def _key(identity: Identity) -> str:
     return f"{identity[0]}|{identity[1] or ''}"
 
@@ -716,22 +740,25 @@ async def _nd_after_continue(tab, wait_s: float = _CHECK_WAIT_S) -> str:
         await asyncio.sleep(_CHECK_POLL_S)
 
 
-async def _nd_submit_email(tab, field, email: str, out, wait_s: float = _CHECK_WAIT_S) -> bool:
+async def _nd_submit_email(
+    tab, field, email: str, out, wait_s: float = _CHECK_WAIT_S,
+    retries: int = BROWSER_CHECK_RETRIES,
+) -> bool:
     """Type ``email``, press Continue, and retry a failed browser check.
 
     A retry reloads the login page, so claude.ai runs its check again from
     scratch, then types the email and presses Continue again. False if the
-    check still fails after ``BROWSER_CHECK_RETRIES`` retries.
+    check still fails after ``retries`` retries.
     """
     import asyncio
 
     from nodriver import cdp
 
-    for attempt in range(BROWSER_CHECK_RETRIES + 1):
+    for attempt in range(retries + 1):
         if attempt:
             out(
                 "claude.ai couldn't verify the browser; trying again "
-                f"({attempt}/{BROWSER_CHECK_RETRIES})..."
+                f"({attempt}/{retries})..."
             )
             await asyncio.sleep(min(2.0 * attempt, 8.0) if wait_s else 0)
             await tab.reload()
@@ -747,10 +774,16 @@ async def _nd_submit_email(tab, field, email: str, out, wait_s: float = _CHECK_W
         if await _nd_after_continue(tab, wait_s) != "error":
             return True
     out(
-        f"claude.ai still couldn't verify the browser after {BROWSER_CHECK_RETRIES} "
+        f"claude.ai still couldn't verify the browser after {retries} "
         "retries — press Continue in the browser yourself."
     )
     return False
+
+
+# Hands-free mode: a bot check this many retries deep is a wall, not bad luck.
+AUTO_BROWSER_CHECK_RETRIES = 2
+# How long the hands-free mode waits for the sign-in mail.
+AUTO_LINK_WAIT_S = 180.0
 
 
 async def _nd_prefill_email(
@@ -760,6 +793,7 @@ async def _nd_prefill_email(
     wait_s: float = 60.0,
     inbox_root: Path | None = None,
     check_wait_s: float = _CHECK_WAIT_S,
+    strict: bool = False,
 ) -> bool:
     """Type ``email`` into claude.ai's login form and press Continue.
 
@@ -771,6 +805,12 @@ async def _nd_prefill_email(
     claude.ai mails is read from them and opened in this tab. A failed
     browser check ("Couldn't verify your browser") is retried up to
     ``BROWSER_CHECK_RETRIES`` times.
+
+    ``strict`` (hands-free ``--auto``) never leaves anything to a person: no
+    reachable mailbox, a bot check that keeps failing, or no link in time
+    raises ``LoginWall`` instead, and Continue is pressed for one email only
+    (a failed bot check sends none), so a wall never turns into a stream of
+    sign-in mails.
     """
     import asyncio
     import threading
@@ -778,25 +818,55 @@ async def _nd_prefill_email(
     try:
         field = await tab.select(_EMAIL_INPUT, timeout=wait_s)
     except Exception:
+        if strict:
+            try:
+                where = await tab.evaluate("location.pathname + ' (' + document.title + ')'")
+            except Exception:
+                where = "unknown page"
+            raise LoginWall(
+                WALL_NO_FORM, f"claude.ai did not show its email sign-in form (on {where})",
+            ) from None
         return False
     sources, snapshots = await asyncio.to_thread(_snapshot_inboxes, inbox_root, out)
+    if strict and not sources:
+        raise LoginWall(
+            WALL_NO_INBOX,
+            "no login mailbox could be read (aswap inbox add / aswap inbox test)",
+        )
     # Set when this task ends (a manual sign-in cancels it), so the polling
     # thread stops instead of holding the process open until its timeout.
     stop = threading.Event()
     try:
         try:
             # Retries spent: the person presses Continue; still watch the inbox.
-            await _nd_submit_email(tab, field, email, out, wait_s=check_wait_s)
-        except Exception:
+            sent = await _nd_submit_email(
+                tab, field, email, out, wait_s=check_wait_s,
+                retries=AUTO_BROWSER_CHECK_RETRIES if strict else BROWSER_CHECK_RETRIES,
+            )
+        except Exception as e:
+            if strict:
+                raise LoginWall(WALL_NO_FORM, f"could not submit the email: {type(e).__name__}") from None
             return False
+        if strict and not sent:
+            raise LoginWall(
+                WALL_BROWSER_CHECK,
+                "claude.ai couldn't verify the browser (bot check) — sign in by hand once",
+            )
         if not sources:
             out(f"Entered {email} and pressed Continue — finish with the code or link claude.ai sends.")
             return True
         watched = ", ".join(s.address for s in sources)
         out(f"Entered {email} and pressed Continue — watching {watched} for the sign-in link...")
-        link = await asyncio.to_thread(_await_link, sources, email, snapshots, stop, out)
+        link = await asyncio.to_thread(
+            _await_link, sources, email, snapshots, stop, out,
+            AUTO_LINK_WAIT_S if strict else None,
+        )
         sources = []  # _await_link closed them
+    except LoginWall:
+        raise
     except Exception as e:  # inbox trouble never blocks a manual sign-in
+        if strict:
+            raise LoginWall(WALL_NO_EMAIL, f"login inbox failed: {e}") from None
         out(f"Login inbox: {e} — finish with the code or link claude.ai sends.")
         return True
     finally:
@@ -804,6 +874,12 @@ async def _nd_prefill_email(
         for source in sources:
             source.close()
     if not link:
+        if strict:
+            raise LoginWall(
+                WALL_NO_EMAIL,
+                f"no sign-in email for {email} reached {watched} within "
+                f"{int(AUTO_LINK_WAIT_S)}s — is its mail forwarded there?",
+            )
         out("No sign-in link reached the login inbox — finish with the code or link claude.ai sends.")
         return True
     out("Sign-in link arrived; opening it.")
@@ -828,25 +904,99 @@ def _snapshot_inboxes(root: Path | None, out) -> tuple[list, list]:
     return sources, snapshots
 
 
-def _await_link(sources: list, email: str, snapshots: list, stop, out) -> str | None:
+def _await_link(
+    sources: list, email: str, snapshots: list, stop, out, timeout_s: float | None = None,
+) -> str | None:
     """Wait on its own thread for the link, then close the mailboxes there."""
     from claude_swap import inbox
 
+    extra = {} if timeout_s is None else {"timeout_s": timeout_s}
     try:
         return inbox.wait_for_link(
-            sources, email, snapshots, stop=stop.is_set, sleep=stop.wait, out=out,
+            sources, email, snapshots, stop=stop.is_set, sleep=stop.wait, out=out, **extra,
         )
     finally:
         for source in sources:
             source.close()
 
 
-def _start_prefill(tab, email: str | None, out, root: Path | None = None):
+def _start_prefill(tab, email: str | None, out, root: Path | None = None, *, strict: bool = False):
     import asyncio
 
     if not email or "@" not in email:
+        if strict:
+            raise LoginWall(WALL_NO_FORM, "a hands-free sign-in needs the account's email")
         return None
-    return asyncio.ensure_future(_nd_prefill_email(tab, email, out, inbox_root=root))
+    return asyncio.ensure_future(
+        _nd_prefill_email(tab, email, out, inbox_root=root, strict=strict)
+    )
+
+
+def _prefill_wall(task) -> "LoginWall | None":
+    """The wall a finished strict prefill task raised, if any."""
+    if task is None or not task.done() or task.cancelled():
+        return None
+    exc = task.exception()
+    return exc if isinstance(exc, LoginWall) else None
+
+
+# Walls a hands-free sign-in can see on the page itself. Phone verification
+# and a visible human check end the attempt (no SMS, no captcha services);
+# an expired or already-used link means the mail was stale.
+_WALL_JS = (
+    "(() => { const p = location.pathname;"
+    # Only sign-in pages: a signed-in page lists chat titles that could say anything.
+    " if (!['/login', '/magic-link', '/verify', '/phone', '/onboarding', '/cdn-cgi/']"
+    "      .some(x => p.startsWith(x)) && !/verif|phone|challenge/i.test(p)) return '';"
+    # A captcha's own words live in a cross-origin frame: look for its frame on
+    # screen instead (hCaptcha's invisible check escalates to a visible
+    # challenge frame, seen 2026-11-26 on /magic-link; reCAPTCHA's likewise).
+    # Not Turnstile's frame: its widget can sit on a page it already passed;
+    # Cloudflare's full-page check says "Verify you are human" in the page.
+    " const shown = f => { const r = f.getBoundingClientRect();"
+    "   if (r.width < 100 || r.height < 100) return false;"
+    "   for (let e = f; e; e = e.parentElement) { const s = getComputedStyle(e);"
+    "     if (s.visibility === 'hidden' || s.display === 'none' || s.opacity === '0') return false; }"
+    "   return true; };"
+    " const frames = [...document.querySelectorAll('iframe')].filter(f =>"
+    "   /hcaptcha\\.com.*frame=challenge|recaptcha\\/api2\\/bframe/i.test(f.src || ''));"
+    " if (frames.some(shown)) return 'captcha';"
+    " const t = (document.body && document.body.innerText) || '';"
+    " if (/verify (you are|you're) (a )?human|are you a robot|complete the captcha/i.test(t)) return 'captcha';"
+    " if (/phone number|verify your phone|text you a code/i.test(t)"
+    "     && /verif|confirm|code/i.test(t)) return 'phone';"
+    " if (/link (has |is )?(expired|invalid|already been used)|invalid (sign.in |magic )?link/i.test(t))"
+    "   return 'link';"
+    # "Couldn't verify your browser" is the prefill's to retry, not a wall yet.
+    " return ''; })()"
+)
+# Seen this many polls in a row (not a page passing through) before it counts.
+_WALL_TICKS = 3
+_WALL_KINDS = {
+    "captcha": (WALL_CAPTCHA, "claude.ai is asking for a human check (captcha)"),
+    "phone": (WALL_PHONE, "claude.ai is asking for phone verification"),
+    "link": (WALL_LINK_REJECTED, "claude.ai rejected the sign-in link (expired or already used)"),
+}
+
+
+class _WallWatch:
+    """Counts consecutive sightings of one page wall."""
+
+    def __init__(self) -> None:
+        self.kind = ""
+        self.count = 0
+
+    async def check(self, tab) -> None:
+        try:
+            seen = await tab.evaluate(_WALL_JS, return_by_value=True)
+        except Exception:
+            return  # navigating; look again next poll
+        seen = seen if isinstance(seen, str) else ""
+        self.count = self.count + 1 if seen and seen == self.kind else (1 if seen else 0)
+        self.kind = seen
+        if seen and self.count >= _WALL_TICKS:
+            kind, message = _WALL_KINDS[seen]
+            raise LoginWall(kind, message)
 
 
 def _stop_prefill(task) -> None:
@@ -864,6 +1014,7 @@ async def _nd_capture_session(
     out,
     orgs_fetch,
     email_fetch,
+    strict: bool = False,
 ) -> "str | tuple[str, NodriverBrowser]":
     """Async implementation of ``capture_session`` using nodriver."""
     import asyncio
@@ -881,13 +1032,26 @@ async def _nd_capture_session(
         browser_args=["--no-first-run", "--no-default-browser-check"],
     )
     tab = await browser.get(f"{CLAUDE}/login")
-    out(f"Sign in to claude.ai as {email} in the window that opened (waiting {int(timeout_s)}s)...")
-    prefill = _start_prefill(tab, email, out, root)
+    if strict:
+        out(f"Signing in to claude.ai as {email} hands-free (up to {int(timeout_s)}s)...")
+    else:
+        out(f"Sign in to claude.ai as {email} in the window that opened (waiting {int(timeout_s)}s)...")
+    try:
+        prefill = _start_prefill(tab, email, out, root, **({"strict": True} if strict else {}))
+    except LoginWall:
+        await _nd_stop(browser)
+        raise
+    walls = _WallWatch() if strict else None
 
     rejected: set[str] = set()
     deadline = time.monotonic() + timeout_s
     try:
         while time.monotonic() < deadline:
+            if strict:
+                wall = _prefill_wall(prefill)
+                if wall is not None:
+                    raise wall
+                await walls.check(tab)
             cookies = await _nd_cookies(browser)
             key = _session_cookie(cookies)
             if key and key not in rejected:
@@ -907,8 +1071,15 @@ async def _nd_capture_session(
                         return key
                     rejected.add(key)
                     seen = who or ", ".join(str(o.get("name")) for o in orgs) or "another account"
+                    if strict:
+                        raise LoginWall(
+                            WALL_NO_FORM,
+                            f"the browser profile is signed in as {seen}, not {email}",
+                        )
                     out(f"That window is signed in as {seen}, not {email} — sign out there and sign in again.")
             await asyncio.sleep(poll_s)
+        if strict:
+            raise LoginWall(WALL_TIMEOUT, f"{email} was not signed in within {int(timeout_s)}s")
         raise CaptureError(f"timed out after {int(timeout_s)}s waiting for {email} to sign in")
     except CaptureError:
         await _nd_stop(browser)
@@ -998,6 +1169,7 @@ async def _nd_mint_oauth_tokens(
     email: str | None = None,
     root: Path | None = None,
     on_session=None,
+    strict: bool = False,
 ) -> dict:
     """Async implementation of ``mint_oauth_tokens`` using nodriver.
 
@@ -1085,13 +1257,16 @@ async def _nd_mint_oauth_tokens(
                 reauth = False  # page mid-navigation; try again next tick
             if auth_error:
                 raise OAuthError(f"authorize failed: {auth_error[0]}")
+            wall = _prefill_wall(prefill)
+            if wall is not None:
+                raise ReauthRequired(f"{_REAUTH_MESSAGE}, and it hit a wall: {wall}")
             if reauth and prefill is None:
                 # The session still works; claude.ai only wants a recent
                 # sign-in before connecting Claude Code (seen 2026-11-15).
                 if not email:
                     raise ReauthRequired(_REAUTH_MESSAGE)
                 out(f"claude.ai wants a fresh sign-in before connecting Claude Code; signing in as {email}...")
-                prefill = _start_prefill(tab, email, out, root)
+                prefill = _start_prefill(tab, email, out, root, **({"strict": True} if strict else {}))
                 deadline = max(deadline, time.monotonic() + REAUTH_WAIT_S)
             if prefill is not None:
                 on_login = 0  # waiting on the sign-in, not signed out
@@ -1170,8 +1345,13 @@ def capture_session(
     clock=time.monotonic,
     sleep=time.sleep,
     _use_nodriver: bool | None = None,
+    strict: bool = False,
 ) -> "str | tuple[str, NodriverBrowser]":
     """Open a dedicated browser profile on claude.ai and return its sessionKey.
+
+    ``strict`` is the hands-free mode (``aswap login --auto``): the email is
+    entered, the link is read from the login mailboxes, and anything only a
+    person could finish raises ``LoginWall`` at once (nodriver only).
 
     When ``keep_browser`` is True, returns ``(session_key, browser)`` so
     the caller can reuse the browser connection (e.g. for the OAuth flow).
@@ -1201,8 +1381,10 @@ def capture_session(
     if use_nd:
         return _nd_run(_nd_capture_session(
             identity, root, chrome, timeout_s, poll_s, keep_browser,
-            out, orgs_fetch, email_fetch,
+            out, orgs_fetch, email_fetch, strict=strict,
         ))
+    if strict:
+        raise CaptureError("a hands-free sign-in needs nodriver")
 
     # Legacy CDP path (used by tests and when nodriver is unavailable).
     exe = find_chrome(chrome)
@@ -1500,6 +1682,7 @@ def mint_oauth_tokens(
     email: str | None = None,
     root: Path | None = None,
     on_session=None,
+    strict: bool = False,
 ) -> dict:
     """Use an authenticated browser to obtain Claude Code OAuth tokens.
 
@@ -1515,6 +1698,7 @@ def mint_oauth_tokens(
     if isinstance(browser, NodriverBrowser):
         return _nd_run(_nd_mint_oauth_tokens(
             browser._browser, timeout_s, out, email=email, root=root, on_session=on_session,
+            strict=strict,
         ))
     import http.server
     import threading
