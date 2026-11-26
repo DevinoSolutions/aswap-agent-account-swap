@@ -439,6 +439,12 @@ def billing_text(view: dict | None) -> str | None:
     return f"subscription {status.replace('_', ' ')}{note}"
 
 
+# What the listings show instead of usage bars once the plan is over (owner
+# 2026-11-26: bars on a lapsed account read as "still usable"). The usage
+# itself stays measured and stored, and ``--json`` still carries it.
+NO_PLAN_USAGE_NOTE = "usage hidden: no paid plan"
+
+
 def has_no_plan(view: dict | None) -> bool:
     """claude.ai says the plan is over (cancelled and lapsed, or none at all).
 
