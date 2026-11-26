@@ -549,6 +549,18 @@ class BillingCache:
             row["nextCheckAt"] = 0
         self._save(rows)
 
+    def store_limit_resets(self, identity: tuple[str, str], resets: list[dict]) -> None:
+        """Replace the identity's limit resets with a fresh reading (after
+        ``aswap reset`` spent one), so every surface shows it at once."""
+        rows = self._load()
+        hits = [r for r in rows.values() if self._matches(r, identity[0], identity[1])]
+        if not hits:
+            return
+        for row in hits:
+            row["limitResets"] = resets
+            row["limitResetsAt"] = self.clock()
+        self._save(rows)
+
     def session_state(self, identity: tuple[str, str]) -> str | None:
         if self.sessions is None:
             return None

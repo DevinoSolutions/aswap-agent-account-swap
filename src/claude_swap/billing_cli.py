@@ -602,3 +602,121 @@ def billing_command(argv: list[str]) -> None:
             error(f"Error: {e}")
             sys.exit(1)
         raise
+
+
+# --- aswap reset -------------------------------------------------------------
+
+_WEEKLY_KINDS = ("7d", "weekly", "full", "week")
+
+
+def _pick_grant(grants: list[dict], kind: str) -> list[dict]:
+    """The account's grants of ``kind`` ("7d" or a model name), unspent first."""
+    want = "Weekly" if kind.lower() in _WEEKLY_KINDS else None
+    found = [
+        g for g in grants
+        if (g["name"] == want if want else g["name"].lower() == kind.lower())
+    ]
+    return sorted(found, key=lambda g: (g["left"] <= 0, g["expiresAt"] or "9999"))
+
+
+def _kind_label(name: str) -> str:
+    return "7d" if name == "Weekly" else name
+
+
+def _percents_text(pcts: dict[str, float]) -> str:
+    return " · ".join(f"{k} {v:.0f}%" for k, v in pcts.items()) or "unknown"
+
+
+def reset_command(argv: list[str]) -> None:
+    """``aswap reset ACCOUNT [7d|MODEL]``: list or spend a claude.ai limit
+    reset ("Reset for free" on Settings > Usage) with the saved session."""
+    parser = argparse.ArgumentParser(
+        prog="aswap reset",
+        description="Use one of an account's claude.ai limit resets (Settings > Usage, "
+                    "\"Reset for free\"). Without a kind, list them.",
+    )
+    parser.add_argument("account", metavar="NUM|EMAIL")
+    parser.add_argument(
+        "kind", nargs="?", metavar="7d|MODEL",
+        help="7d: the full reset (5-hour and weekly limits, per-model ones too); "
+             "a model (e.g. fable): that model's reset",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="say what would be used, use nothing")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        sw = _switcher(args.debug)
+        num, email, org = sw.resolve_account(args.account)
+        session = sw._sessions.get((email, org or ""))
+        if not session or not session.get("sessionKey"):
+            error(f"Error: no claude.ai session for {email}: run aswap billing login {email} --no-token")
+            sys.exit(1)
+        key = session["sessionKey"]
+        before = bs.read_usage(key, org)
+        grants = bs.reset_grants(before)
+        pcts = bs.usage_percents(before)
+        if not args.kind:
+            _print_resets(num, email, grants, pcts, args.json)
+            return
+        picked = _pick_grant(grants, args.kind)
+        if not picked or picked[0]["left"] <= 0:
+            have = ", ".join(f"{_kind_label(g['name'])} ×{g['left']}" for g in grants if g["left"] > 0)
+            error(f"Error: {email} has no {args.kind} reset left (has: {have or 'none'})")
+            sys.exit(1)
+        grant = picked[0]
+        if not grant["usableNow"]:
+            why = grant["reason"] or "not usable now"
+            if why == "cooldown" and grant["cooldownUntil"]:
+                until = datetime.fromisoformat(grant["cooldownUntil"]).astimezone()
+                why += f" until {until:%H:%M:%S} (a reset was just used)"
+            error(f"Error: claude.ai won't use {email}'s {_kind_label(grant['name'])} reset now: {why}")
+            sys.exit(1)
+        label = _kind_label(grant["name"])
+        if args.dry_run:
+            print(f"  {num}: {email}  would use its {label} reset ({grant['id']})  now: {_percents_text(pcts)}")
+            return
+        result = bs.use_limit_reset(key, org, grant["id"])
+        after = bs.read_usage(key, org)
+        sw._billing.store_limit_resets((email, org or ""), bs.parse_limit_resets(after))
+        after_pcts = bs.usage_percents(after)
+        if args.json:
+            print(json.dumps({"account": num, "email": email, "used": grant["id"], "kind": label,
+                              "before": pcts, "after": after_pcts, "response": result}))
+            return
+        print(accent(f"  {num}: {email}  used its {label} reset"))
+        print(f"     before: {_percents_text(pcts)}")
+        print(f"     after:  {_percents_text(after_pcts)}")
+        left = [f"{_kind_label(g['name'])} ×{g['left']}" for g in bs.reset_grants(after) if g["left"] > 0]
+        print(dimmed(f"     resets left: {', '.join(left) or 'none'}"))
+    except bs.BillingSessionError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except Exception as e:  # noqa: BLE001 - CLI boundary
+        from claude_swap.exceptions import ClaudeSwitchError
+
+        if isinstance(e, ClaudeSwitchError):
+            error(f"Error: {e}")
+            sys.exit(1)
+        raise
+
+
+def _print_resets(num: str, email: str, grants: list[dict], pcts: dict, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps({"account": num, "email": email, "usage": pcts, "resets": grants}))
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    grants = [g for g in grants if g["left"] > 0 or (g["expiresAt"] or "9999") > now]
+    print(f"  {num}: {email}  now: {_percents_text(pcts)}")
+    if not grants:
+        print(dimmed("     no limit resets"))
+    for g in grants:
+        ends = datetime.fromisoformat(g["expiresAt"]).astimezone() if g["expiresAt"] else None
+        state = "ready" if g["usableNow"] else (g["reason"] or "not usable now")
+        if g["left"] <= 0:
+            state = "used"
+        when = f"  until {ends:%b %d %H:%M}" if ends else ""
+        print(f"     {_kind_label(g['name'])} ×{g['left']}{when}  ({state})")
+    ready = list(dict.fromkeys(_kind_label(g["name"]).lower() for g in grants if g["left"] > 0 and g["usableNow"]))
+    if ready:
+        print(dimmed(f"     use one: aswap reset {num} {'|'.join(ready)}"))
