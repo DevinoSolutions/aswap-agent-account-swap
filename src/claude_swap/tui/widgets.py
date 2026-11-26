@@ -20,9 +20,9 @@ from claude_swap.billing import (
     account_mark,
     billing_text,
     has_no_plan,
-    limit_resets_short,
-    limit_resets_text,
+    limit_reset_kinds,
 )
+from claude_swap.billing import _parse_iso
 from claude_swap.cvp import CVP_LABEL
 from claude_swap.weekly_anchor import weekly_text
 from claude_swap.json_output import USAGE_API_KEY
@@ -202,6 +202,32 @@ def reset_credits_text(last_good: dict | None, now: float) -> str | None:
     return text
 
 
+RESET_MARK = "↻"
+# A banked reset's expiry is shown only when it is this close.
+RESET_EXPIRY_SOON_S = 7 * 86400
+
+
+def _reset_kind_notes(billing: dict | None, now: float) -> dict[str, str]:
+    """Bar label → ``"↻ 1"`` for each kind of claude.ai limit reset
+    (``"7d"``, a model such as ``"Fable"``), with ``(use by Dec 1)`` when it
+    expires within a week and ``(not usable yet)`` when claude.ai says so."""
+    out: dict[str, str] = {}
+    for label, count, expires, not_usable in limit_reset_kinds(billing):
+        note = f"{RESET_MARK} {count}"
+        ends = _parse_iso(expires) if expires else None
+        if ends is not None and ends.timestamp() - now <= RESET_EXPIRY_SOON_S:
+            note += f" (use by {ends.astimezone().strftime('%b')} {ends.astimezone().day})"
+        if not_usable:
+            note += " (not usable yet)"
+        out[label] = note
+    return out
+
+
+def _bar_reset_kind(label: str) -> str:
+    """The reset kind a usage row's bar belongs to: weekly rows → ``7d``."""
+    return "7d" if label in ("7d", "Weekly") else label
+
+
 def account_card_text(
     acc: AccountSnapshot,
     width: int,
@@ -246,7 +272,7 @@ def account_card_text(
         # still measured and stored (--json has it).
         text.append("\n    ")
         text.append(NO_PLAN_USAGE_NOTE, style=palette.muted)
-        _append_billing(text, acc, palette)
+        _append_billing(text, acc, palette, width, now)
         return text
 
     sentinel = acc.usage.sentinel
@@ -263,7 +289,7 @@ def account_card_text(
             if last_seen is not None:
                 text.append("\n    ")
                 text.append(f"└ {last_seen}", style=palette.muted)
-        _append_billing(text, acc, palette)
+        _append_billing(text, acc, palette, width, now)
         return text
 
     rows = usage_rows(acc.usage.last_good, now, acc.usage.fetched_at)
@@ -276,7 +302,7 @@ def account_card_text(
             # identically.
             note = ERROR_NOTES.get(acc.usage.last_error, acc.usage.last_error)
             text.append(f" · {note}", style=palette.muted)
-        _append_billing(text, acc, palette)
+        _append_billing(text, acc, palette, width, now)
         return text
 
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
@@ -284,11 +310,21 @@ def account_card_text(
     bar_width = max(12, min(30, width - 42 - label_width))
     # everything on a row except the suffix: indent, label, bar, " NNN%", gap
     row_overhead = 4 + label_width + 1 + bar_width + 5 + 2
-    for label, pct, suffix, suffix_full in rows:
+    kinds = _reset_kind_notes(acc.billing, now)
+    reset_col = max((len(n) + 3 for n in kinds.values()), default=0)
+    shown: list[str] = []
+    previous = None
+    for _label, _pct, suffix, suffix_full in rows:
         # per-row: show the absolute clock only where it fits, so a long
         # spend row degrading doesn't cost the 5h/7d rows their clocks
-        if suffix_full != suffix and row_overhead + len(suffix_full) <= width:
+        if suffix_full != suffix and row_overhead + len(suffix_full) + reset_col <= width:
             suffix = suffix_full
+        # The 7d and Fable windows usually reset together: say it once.
+        shown.append("same" if suffix and suffix == previous else suffix)
+        previous = suffix
+    suffix_width = max(len(x) for x in shown)
+    placed: set[str] = set()
+    for (label, pct, _suffix, _full), suffix in zip(rows, shown):
         text.append("\n    ")
         text.append(
             usage_bar(
@@ -301,33 +337,59 @@ def account_card_text(
                 palette=palette,
             )
         )
+        kind = _bar_reset_kind(label)
+        if kind in kinds and kind not in placed:
+            placed.add(kind)
+            gap = suffix_width - len(suffix) + (0 if suffix else 2) + 3
+            text.append(" " * gap)
+            text.append(kinds[kind], style=palette.accent)
     resets = reset_credits_text(acc.usage.last_good, now)
     if resets:
         text.append("\n    ")
         text.append("Resets ", style=palette.muted)
         text.append(resets, style=palette.foreground)
-    _append_billing(text, acc, palette)
+    _append_billing(text, acc, palette, width, now, placed)
     return text
 
 
-def _append_billing(text: Text, acc: AccountSnapshot, palette: Palette) -> None:
-    """Closing "Resets" / "Weekly" / "Bills" lines: claude.ai's banked limit
-    resets, the remembered weekly reset and the next renewal."""
-    resets = limit_resets_text(acc.billing)
-    if resets:
+def _append_billing(
+    text: Text,
+    acc: AccountSnapshot,
+    palette: Palette,
+    width: int,
+    now: float,
+    placed: set[str] = frozenset(),
+) -> None:
+    """Closing lines: the limit resets no bar carries (``↻ 7d 1 · Fable 1``)
+    and one plan line, ``plan renews Dec 25 · weekly Thu 18:00 · 20x``
+    (split in two when it doesn't fit)."""
+    left = [
+        (label, note) for label, note in _reset_kind_notes(acc.billing, now).items()
+        if label not in placed
+    ]
+    if left:
         text.append("\n    ")
-        text.append("Resets ", style=palette.muted)
-        text.append(resets, style=palette.foreground)
+        text.append(
+            f"{RESET_MARK} " + " · ".join(f"{label} {note.removeprefix(RESET_MARK + ' ')}" for label, note in left),
+            style=palette.accent,
+        )
+    parts = []
+    bills = billing_text(acc.billing)
+    if bills and not has_no_plan(acc.billing):  # the card already says so
+        parts.append(("plan ", bills))
     week = weekly_text(acc.weekly)
     if week:
-        text.append("\n    ")
-        text.append("Weekly ", style=palette.muted)
-        text.append(week, style=palette.foreground)
-    bills = billing_text(acc.billing)
-    if bills:
-        text.append("\n    ")
-        text.append("Bills ", style=palette.muted)
-        text.append(bills, style=palette.foreground)
+        parts.append(("weekly ", week))
+    if not parts:
+        return
+    one_line = 4 + sum(len(a) + len(b) for a, b in parts) + 3 * (len(parts) - 1)
+    for i, (label, value) in enumerate(parts):
+        if i == 0 or one_line > width:
+            text.append("\n    ")
+        else:
+            text.append(" · ", style=palette.track)
+        text.append(label, style=palette.muted)
+        text.append(value, style=palette.foreground)
 
 
 def _append_account_mark(text: Text, acc: AccountSnapshot) -> None:
@@ -375,22 +437,31 @@ def mini_account_text(
         text.append("  (needs login)", style=palette.sev_warn)
     text.append("   ")
 
+    kinds = _reset_kind_notes(acc.billing, now)
     if has_no_plan(acc.billing):
         text.append(NO_PLAN_USAGE_NOTE, style=palette.muted)
-        _append_mini_resets(text, acc, palette)
+        _append_mini_resets(text, kinds, set(), palette)
         return text
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
         text.append(data.sentinel_label(sentinel), style=style)
-        _append_mini_resets(text, acc, palette)
+        _append_mini_resets(text, kinds, set(), palette)
         return text
 
     last_good = oauth.roll_passed_windows(acc.usage.last_good, now)
     fetched_at = acc.usage.fetched_at
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
     parts = 0
+    placed: set[str] = set()
+
+    def reset_badge(label: str) -> None:
+        kind = _bar_reset_kind(label)
+        if kind in kinds and kind not in placed:
+            placed.add(kind)
+            text.append(f" {RESET_MARK}{kinds[kind].removeprefix(RESET_MARK + ' ')}", style=palette.accent)
+
     for key, label in (
         ("five_hour", "5h"),
         ("seven_day", "7d"),
@@ -422,16 +493,21 @@ def mini_account_text(
             result = pace.compute_pace(window, fetched_at=fetched_at)
             if result and result.ahead:
                 text.append(" (ahead)", style=palette.sev_warn)
+        reset_badge(label)
         parts += 1
-    maxed = [
-        w["name"]
-        for w in (last_good.get("scoped") or [] if isinstance(last_good, dict) else [])
-        if float(w["pct"]) >= 100
-    ]
-    for name in maxed:
+    # Per-model windows: shown when maxed, or when a reset refills them.
+    for w in (last_good.get("scoped") or [] if isinstance(last_good, dict) else []):
+        name, pct = w["name"], float(w["pct"])
+        if pct < 100 and name not in kinds:
+            continue
         if parts:
             text.append(" · ", style=palette.track)
-        text.append(f"{name} (!)", style=palette.sev_crit)
+        if pct >= 100:
+            text.append(f"{name} (!)", style=palette.sev_crit)
+        else:
+            text.append(f"{name} ", style=palette.muted)
+            text.append(f"{pct:.0f}%", style=palette.severity(pct))
+        reset_badge(name)
         parts += 1
     resets = reset_credits_text(last_good, now)
     if resets:
@@ -441,17 +517,20 @@ def mini_account_text(
         parts += 1
     if not parts:
         text.append("usage unknown", style=palette.muted)
-    _append_mini_resets(text, acc, palette)
+    _append_mini_resets(text, kinds, placed, palette)
     return text
 
 
-def _append_mini_resets(text: Text, acc: AccountSnapshot, palette: Palette) -> None:
-    """``   Resets 7d ×1 · Fable ×1``: claude.ai's banked limit resets, each
-    kind with its count (the full card adds the expiry dates)."""
-    short = limit_resets_short(acc.billing)
-    if short:
-        text.append("   Resets ", style=palette.muted)
-        text.append(short, style=palette.accent)
+def _append_mini_resets(
+    text: Text, kinds: dict[str, str], placed: set[str], palette: Palette
+) -> None:
+    """``   ↻ Fable 1``: the limit resets no shown window carried."""
+    left = [(k, n) for k, n in kinds.items() if k not in placed]
+    if left:
+        text.append(
+            f"   {RESET_MARK} " + " · ".join(f"{k} {n.removeprefix(RESET_MARK + ' ')}" for k, n in left),
+            style=palette.accent,
+        )
 
 
 def section_header_text(label: str, width: int, *, palette: Palette) -> Text:

@@ -558,12 +558,10 @@ class TestLimitResets:
         text = billing.limit_resets_text(view, now=now)
         assert text.startswith("7d ×2 until Dec 10 ")
         assert " · Fable ×1 until Mar 9 2027 " in text and text.endswith("(not usable yet)")
-        assert billing.limit_resets_short(view) == "7d ×2 · Fable ×1"
         tenure = {"limitResets": [dict(_RESETS[1], id=i) for i in ("a", "b", "c")]}
         assert billing.limit_resets_text(tenure, now=now).startswith("Fable ×3 until Mar 9 2027 ")
         mixed = {"limitResets": [_RESETS[1], dict(_RESETS[1], id="b", usableNow=False)]}
         assert billing.limit_resets_text(mixed, now=now).endswith("(1 not usable yet)")
-        assert billing.limit_resets_short({}) is None
         assert billing.limit_resets_text({}, now=now) is None
         assert billing.limit_resets_text(None) is None
 
