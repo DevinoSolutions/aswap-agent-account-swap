@@ -182,7 +182,7 @@ def live_limit_resets(record: dict | None, now: float) -> list[dict]:
     return out
 
 
-def _reset_kinds(view: dict | None) -> list[tuple[str, int, str | None, int]]:
+def limit_reset_kinds(view: dict | None) -> list[tuple[str, int, str | None, int]]:
     """``(label, count, earliest expiry ISO, not-usable count)`` per kind:
     the weekly reset first (labelled "7d", like its usage row), then each
     model's ("Fable"). Separate grants of one kind (launch + tenure Fable
@@ -203,14 +203,6 @@ def _reset_kinds(view: dict | None) -> list[tuple[str, int, str | None, int]]:
     return [(label, *kinds[label]) for label in order]
 
 
-def limit_resets_short(view: dict | None) -> str | None:
-    """``7d ×1 · Fable ×3``: the count of each kind of banked reset."""
-    kinds = _reset_kinds(view)
-    if not kinds:
-        return None
-    return " · ".join(f"{label} ×{count}" for label, count, _e, _n in kinds)
-
-
 def limit_resets_text(view: dict | None, now: float | None = None) -> str | None:
     """``7d ×1 until Dec 10 17:00 · Fable ×3 until Mar 9 2027 02:59``.
 
@@ -218,7 +210,7 @@ def limit_resets_text(view: dict | None, now: float | None = None) -> str | None
     year only when it is not this one; "(N not usable yet)" when claude.ai
     says some can't be used now.
     """
-    kinds = _reset_kinds(view)
+    kinds = limit_reset_kinds(view)
     if not kinds:
         return None
     this_year = datetime.fromtimestamp(time.time() if now is None else now).astimezone().year

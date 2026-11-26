@@ -831,12 +831,30 @@ class TestMiniAccountText:
         acc = dataclasses.replace(
             make_account(2, entry=entry), billing={"endsAt": _iso_in(86400 * 20), "limitResets": resets}
         )
+        # No Fable window measured: its resets trail the row.
         mini = mini_account_text(acc, now).plain
-        assert "12%" in mini and mini.endswith("Resets 7d ×1 · Fable ×3")
-        card = account_card_text(acc, 120, now=now).plain
-        assert "Resets 7d ×1 until " in card and " · Fable ×3 until " in card
+        assert mini.endswith("7d 12% ↻1   ↻ Fable 3")
+        card = account_card_text(acc, 120, now=now).plain.splitlines()
+        assert card[1].lstrip().startswith("7d") and card[1].endswith("↻ 1")
+        assert card[2].strip() == "↻ Fable 3"
+        # Each count sits on the bar it refills; a shared countdown reads "same".
+        fable = dataclasses.replace(acc, usage=UsageEntry(
+            last_good={
+                "seven_day": {"pct": 12.0, "resets_at": _iso_in(3600 * 30)},
+                "scoped": [{"name": "Fable", "pct": 40.0, "resets_at": _iso_in(3600 * 30)}],
+            },
+            fetched_at=now, age_s=0.0,
+        ))
+        assert mini_account_text(fable, now).plain.endswith("7d 12% ↻1 · Fable 40% ↻3")
+        rows = account_card_text(fable, 120, now=now).plain.splitlines()
+        assert rows[1].endswith("↻ 1") and rows[2].endswith("↻ 3")
+        assert " same " in rows[2] and rows[1].index("↻") == rows[2].index("↻")
+        assert rows[3].lstrip().startswith("plan ")  # plan + weekly on one line
+        soon = dataclasses.replace(acc, billing={"endsAt": _iso_in(86400 * 20), "limitResets": [
+            dict(resets[0], expiresAt=_iso_in(86400 * 3))]})
+        assert "(use by " in account_card_text(soon, 120, now=now).plain
         plain = dataclasses.replace(acc, billing={"endsAt": _iso_in(86400 * 20)})
-        assert "Resets" not in mini_account_text(plain, now).plain
+        assert "↻" not in mini_account_text(plain, now).plain
 
     def test_five_hour_never_shows_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text
