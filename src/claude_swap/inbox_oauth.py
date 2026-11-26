@@ -216,6 +216,17 @@ def _read_token_file(path: Path) -> dict:
     return raw
 
 
+def _token_uri(raw: dict) -> str:
+    """The file's token endpoint, but only a Google one: its refresh token and
+    client secret are never posted wherever a file points them."""
+    uri = raw.get("token_uri")
+    if isinstance(uri, str):
+        parts = urllib.parse.urlparse(uri)
+        if parts.scheme == "https" and (parts.hostname or "").endswith(".googleapis.com"):
+            return uri
+    return GOOGLE_TOKEN
+
+
 def import_token_file(path: Path, *, hint: str | None = None) -> dict:
     """The row for a Gmail mailbox whose OAuth token already exists in ``path``.
 
@@ -230,7 +241,7 @@ def import_token_file(path: Path, *, hint: str | None = None) -> dict:
         scopes = scopes.split()
     if scopes and not any(s in _GMAIL_READ_SCOPES for s in scopes):
         raise InboxError(f"{path} has no Gmail read scope (needs gmail.readonly)")
-    tokens = _request(raw.get("token_uri") or GOOGLE_TOKEN, data={
+    tokens = _request(_token_uri(raw), data={
         "grant_type": "refresh_token", "refresh_token": raw["refresh_token"],
         "client_id": raw["client_id"], "client_secret": raw["client_secret"],
     })
@@ -344,7 +355,7 @@ class GmailSource(_ApiSource):
         token_file = self.row.get("tokenFile")
         if token_file:  # re-read each time: the file's owner may have renewed it
             raw = _read_token_file(Path(token_file))
-            return _request(raw.get("token_uri") or GOOGLE_TOKEN, data={
+            return _request(_token_uri(raw), data={
                 "grant_type": "refresh_token", "refresh_token": raw["refresh_token"],
                 "client_id": raw["client_id"], "client_secret": raw["client_secret"],
             })

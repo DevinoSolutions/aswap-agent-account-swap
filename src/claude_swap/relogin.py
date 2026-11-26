@@ -41,6 +41,17 @@ SKIPPED = "skipped"
 FAILED = "failed"
 
 
+ACTIVE_MESSAGE = "the active login: sign in with Claude Code /login instead"
+
+
+class ActiveSlot(Exception):
+    """The slot is the active login, which a hands-free re-login never touches."""
+
+
+def is_active(sw, num: str) -> bool:
+    return any(str(i[0]) == str(num) and i[4] for i in sw._build_accounts_info())
+
+
 @dataclass(frozen=True)
 class DeadAccount:
     num: str
@@ -95,6 +106,10 @@ def relogin_account(
     """
     from claude_swap.locking import FileLock
 
+    if is_active(sw, num):
+        # Its live credential would keep the dead token while the slot got
+        # the new one: "fixed" would be a lie, so this is never done.
+        raise ActiveSlot(ACTIVE_MESSAGE)
     identity = (email, org_uuid or "")
     key, browser = bs.capture_session(
         identity, sw.backup_dir, chrome=chrome, timeout_s=timeout_s,
@@ -141,6 +156,8 @@ def run_one(sw, num: str, email: str, org_uuid: str, *, chrome=None,
     """``relogin_account`` with every failure turned into a ``Result``."""
     try:
         relogin_account(sw, num, email, org_uuid, chrome=chrome, timeout_s=timeout_s, out=out)
+    except ActiveSlot as e:
+        return Result(num, email, SKIPPED, str(e))
     except bs.LoginWall as e:
         return Result(num, email, FAILED, str(e), wall=e.kind)
     except bs.NoPlan as e:
@@ -149,6 +166,8 @@ def run_one(sw, num: str, email: str, org_uuid: str, *, chrome=None,
         return Result(num, email, FAILED, str(e), wall="reauth")
     except bs.BillingSessionError as e:
         return Result(num, email, FAILED, str(e))
+    except Exception as e:  # noqa: BLE001 - one account's failure never hides the others'
+        return Result(num, email, FAILED, f"unexpected {type(e).__name__}")
     return Result(num, email, OK, "new token stored")
 
 
@@ -163,6 +182,9 @@ def login_auto(sw, account: str | None, *, chrome=None, timeout_s: float = AUTO_
         num, email, org = sw.resolve_account(account)
     except AccountNotFoundError:
         error(f"--auto only signs existing accounts in again; {account} is not one (use aswap login)")
+        sys.exit(2)
+    if is_active(sw, str(num)):
+        error(f"Account-{num} ({email}) is {ACTIVE_MESSAGE}")
         sys.exit(2)
     if not require_inbox(sw.backup_dir):
         sys.exit(1)
@@ -205,8 +227,12 @@ def relogin_dead_command(argv: list[str], *, sleep=time.sleep) -> None:
 
     from claude_swap.switcher import ClaudeAccountSwitcher
 
-    sw = ClaudeAccountSwitcher(debug=args.debug)
-    dead = dead_accounts(sw)
+    try:
+        sw = ClaudeAccountSwitcher(debug=args.debug)
+        dead = dead_accounts(sw)
+    except Exception as e:  # noqa: BLE001 - CLI boundary: a message, not a traceback
+        error(f"Error: could not read the accounts ({type(e).__name__}: {e})")
+        sys.exit(1)
     if args.accounts:
         want = {a.lower() for a in args.accounts}
         dead = [d for d in dead if d.num in want or d.email.lower() in want]
@@ -214,8 +240,7 @@ def relogin_dead_command(argv: list[str], *, sleep=time.sleep) -> None:
     todo: list[DeadAccount] = []
     for d in dead:
         if d.active:
-            results.append(Result(d.num, d.email, SKIPPED,
-                                  "the active login: sign in with Claude Code /login instead"))
+            results.append(Result(d.num, d.email, SKIPPED, ACTIVE_MESSAGE))
         elif d.disabled and not args.include_disabled:
             results.append(Result(d.num, d.email, SKIPPED, "disabled (--include-disabled to try it)"))
         else:
@@ -231,18 +256,22 @@ def relogin_dead_command(argv: list[str], *, sleep=time.sleep) -> None:
     if todo and not require_inbox(sw.backup_dir):
         sys.exit(1)
     stopped = None
-    for i, d in enumerate(todo):
-        if stopped is not None:
-            results.append(Result(d.num, d.email, SKIPPED, f"run stopped at the {stopped} wall"))
-            continue
-        if i:
-            sleep(args.pace)
-        print(f"\nAccount-{d.num}: {accent(d.email)}")
-        result = run_one(sw, d.num, d.email, d.org_uuid, chrome=args.chrome, timeout_s=args.timeout)
-        _report([result])
-        results.append(result)
-        if result.wall in bs.WALL_STOPS_RUN:
-            stopped = result.wall
+    try:
+        for i, d in enumerate(todo):
+            if stopped is not None:
+                results.append(Result(d.num, d.email, SKIPPED, f"run stopped at the {stopped} wall"))
+                continue
+            if i:
+                sleep(args.pace)
+            print(f"\nAccount-{d.num}: {accent(d.email)}")
+            result = run_one(sw, d.num, d.email, d.org_uuid, chrome=args.chrome, timeout_s=args.timeout)
+            _report([result])
+            results.append(result)
+            if result.wall in bs.WALL_STOPS_RUN:
+                stopped = result.wall
+    except KeyboardInterrupt:
+        done = {r.num for r in results}
+        results.extend(Result(d.num, d.email, SKIPPED, "interrupted") for d in todo if d.num not in done)
     print("\nRe-login results:")
     _report(sorted(results, key=lambda r: int(r.num) if r.num.isdigit() else 0))
     if any(r.status == FAILED for r in results):

@@ -869,7 +869,12 @@ async def _nd_prefill_email(
         raise
     except Exception as e:  # inbox trouble never blocks a manual sign-in
         if strict:
-            raise LoginWall(WALL_NO_EMAIL, f"login inbox failed: {e}") from None
+            from claude_swap.inbox import InboxError
+
+            # InboxError text is already redacted by the mailbox layer; any
+            # other exception could carry a URL, so only its type is shown.
+            detail = str(e) if isinstance(e, InboxError) else type(e).__name__
+            raise LoginWall(WALL_NO_EMAIL, f"login inbox failed: {detail}") from None
         out(f"Login inbox: {e} — finish with the code or link claude.ai sends.")
         return True
     finally:
@@ -990,9 +995,10 @@ _WALL_KINDS = {
 class _WallWatch:
     """Counts consecutive sightings of one page wall."""
 
-    def __init__(self) -> None:
+    def __init__(self, ticks: int = _WALL_TICKS) -> None:
         self.kind = ""
         self.count = 0
+        self.ticks = ticks
 
     async def check(self, tab) -> None:
         try:
@@ -1002,7 +1008,7 @@ class _WallWatch:
         seen = seen if isinstance(seen, str) else ""
         self.count = self.count + 1 if seen and seen == self.kind else (1 if seen else 0)
         self.kind = seen
-        if seen and self.count >= _WALL_TICKS:
+        if seen and self.count >= self.ticks:
             kind, message = _WALL_KINDS[seen]
             raise LoginWall(kind, message)
 
@@ -1111,11 +1117,15 @@ async def _nd_capture_session(
             )
         raise CaptureError(f"timed out after {int(timeout_s)}s waiting for {email} to sign in")
     except CaptureError:
+        # The mailbox watcher first: during the browser's shutdown awaits it
+        # could still open a link that just arrived.
+        _stop_prefill(prefill)
         await _nd_stop(browser)
         raise
     except Exception as e:
+        _stop_prefill(prefill)
         await _nd_stop(browser)
-        raise CaptureError(f"browser error: {e}") from None
+        raise CaptureError(f"browser error: {type(e).__name__}") from None
     finally:
         _stop_prefill(prefill)
 
@@ -1264,6 +1274,8 @@ async def _nd_mint_oauth_tokens(
     deadline = time.monotonic() + timeout_s
     on_login = no_plan = off_flow = 0
     prefill = None  # the fresh sign-in the reauth step asked for
+    # Polled every 0.5 s here (2 s in the capture): ask for more sightings.
+    walls = _WallWatch(ticks=_WALL_TICKS * 4) if strict else None
     reopened = False
     try:
         while time.monotonic() < deadline:
@@ -1288,7 +1300,11 @@ async def _nd_mint_oauth_tokens(
                 raise OAuthError(f"authorize failed: {auth_error[0]}")
             wall = _prefill_wall(prefill)
             if wall is not None:
-                raise ReauthRequired(f"{_REAUTH_MESSAGE}, and it hit a wall: {wall}")
+                raise wall  # its kind decides whether a relogin-dead run stops
+            if walls is not None and prefill is not None:
+                # The reauth sign-in goes through the same /login and
+                # /magic-link pages as the capture: same walls.
+                await walls.check(tab)
             if reauth and prefill is None:
                 # The session still works; claude.ai only wants a recent
                 # sign-in before connecting Claude Code (seen 2026-11-15).
@@ -1305,6 +1321,16 @@ async def _nd_mint_oauth_tokens(
                 raise NoPlan("claude.ai says a Pro or Max plan is required to connect Claude Code")
             await asyncio.sleep(0.5)
         else:
+            if strict and prefill is not None:
+                wall = _prefill_wall(prefill)
+                if wall is not None:
+                    raise wall
+                if not prefill.done():
+                    raise LoginWall(
+                        WALL_NO_EMAIL,
+                        f"{_REAUTH_MESSAGE}, and no sign-in email for {email} reached the login inbox",
+                    )
+                raise LoginWall(WALL_TIMEOUT, f"{_REAUTH_MESSAGE}, and the sign-in did not finish in time")
             if prefill is not None:
                 raise ReauthRequired(f"{_REAUTH_MESSAGE}, and the sign-in did not finish in time")
             raise OAuthError(

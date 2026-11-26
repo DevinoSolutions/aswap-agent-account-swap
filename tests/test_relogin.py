@@ -59,6 +59,11 @@ class TestTokenFile:
         with pytest.raises(ib.InboxError, match="not other@devino.ca"):
             io.import_token_file(_token_file(tmp_path), hint="other@devino.ca")
 
+    def test_secrets_go_only_to_a_google_token_endpoint(self, gmail, tmp_path):
+        io.import_token_file(_token_file(tmp_path, token_uri="https://evil.example/token"))
+        posted = [url for url, data in gmail if data and "refresh_token" in data]
+        assert posted == [io.GOOGLE_TOKEN]
+
     def test_not_a_token_file(self, gmail, tmp_path):
         bad = tmp_path / "x.json"
         bad.write_text('{"installed": {}}', encoding="utf-8")
@@ -122,10 +127,18 @@ class _Tab:
         self.opened: list[str] = []
         self.reloads = 0
 
+    clicks = 0
+
     async def select(self, selector, timeout=10):
         if selector == bs._EMAIL_INPUT and not self.has_form:
             raise TimeoutError
-        return _Element()
+        element = _Element()
+        if selector == bs._CONTINUE_BUTTON:
+            async def click():
+                self.clicks += 1
+
+            element.click = click
+        return element
 
     async def send(self, command):
         pass
@@ -172,8 +185,11 @@ def _strict(monkeypatch, tmp_path, tab, sources):
 class TestStrictPrefill:
     def test_opens_the_link(self, monkeypatch, tmp_path):
         tab = _Tab()
-        ok, _ = _strict(monkeypatch, tmp_path, tab, [_Source(["LINK"])])
-        assert ok and tab.opened == ["LINK"]
+        link = "https://claude.ai/magic-link#nonce:YUBleGFtcGxlLmNvbQ=="
+        ok, messages = _strict(monkeypatch, tmp_path, tab, [_Source([link])])
+        assert ok and tab.opened == [link]
+        assert tab.clicks == 1  # one Continue, so one sign-in mail
+        assert all(link not in m and "nonce" not in m for m in messages)
 
     def test_no_mailbox_is_a_wall_before_any_mail_is_requested(self, monkeypatch, tmp_path):
         tab = _Tab()
@@ -241,6 +257,199 @@ class TestWallWatch:
     def test_captcha_stops_a_whole_run(self):
         assert bs.WALL_CAPTCHA in bs.WALL_STOPS_RUN
         assert bs.WALL_NO_EMAIL not in bs.WALL_STOPS_RUN
+
+
+# --- relogin_account / login --auto: only the slot is ever written --------------
+
+
+def _blob(access="at-NEW-SECRET", refresh="rt-NEW-SECRET"):
+    return json.dumps({"claudeAiOauth": {"accessToken": access, "refreshToken": refresh, "expiresAt": 9}})
+
+
+class _Browser:
+    closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _real_switcher():
+    from claude_swap.models import Platform
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    s = ClaudeAccountSwitcher()
+    s.platform = Platform.LINUX
+    s._setup_directories()
+    s._init_sequence_file()
+    return s
+
+
+@pytest.fixture
+def slot(temp_home, monkeypatch):
+    """A switcher with one stored account and a live login that belongs to
+    someone else; capture and mint are stubbed (no browser, no network)."""
+    live_creds = temp_home / ".claude" / ".credentials.json"
+    live_conf = temp_home / ".claude.json"
+    live_creds.write_text(_blob("at-LIVE", "rt-LIVE"), encoding="utf-8")
+    live_conf.write_text(json.dumps({"oauthAccount": {"emailAddress": "live@example.com"}}), encoding="utf-8")
+    sw = _real_switcher()
+    sw.add_account_from_token("sk-ant-oat01-old", email="b@example.com")
+    num, email, org = sw.resolve_account("b@example.com")
+    browser = _Browser()
+    seen = SimpleNamespace(capture_kw=None, mint_kw=None, browser=browser, captures=0)
+
+    def capture(identity, root, **kw):
+        seen.captures += 1
+        seen.capture_kw = kw
+        return "sk-SESSION-SECRET", browser
+
+    def mint(b, root, **kw):
+        seen.mint_kw = kw
+        return _blob()
+
+    monkeypatch.setattr(bs, "capture_session", capture)
+    monkeypatch.setattr(relogin.tp, "mint_credentials", mint)
+    monkeypatch.setattr(sw._billing, "refresh", lambda *a, **kw: None)
+    before = {p: p.read_bytes() for p in (live_creds, live_conf)}
+    return SimpleNamespace(sw=sw, num=str(num), email=email, org=org or "", seen=seen, live=before)
+
+
+class TestReloginAccount:
+    def test_only_the_slot_is_written_never_the_live_login(self, slot):
+        relogin.relogin_account(slot.sw, slot.num, slot.email, slot.org, out=lambda m: None)
+        stored = json.loads(slot.sw._read_account_credentials(slot.num, slot.email))["claudeAiOauth"]
+        assert stored["refreshToken"] == "rt-NEW-SECRET"
+        for path, data in slot.live.items():
+            assert path.read_bytes() == data, f"{path.name} was written"
+        assert slot.seen.browser.closed
+        assert slot.seen.capture_kw["strict"] is True and slot.seen.mint_kw["strict"] is True
+
+    def test_a_wall_in_the_mint_closes_the_browser_and_keeps_the_old_token(self, slot, monkeypatch):
+        old = slot.sw._read_account_credentials(slot.num, slot.email)
+
+        def captcha(b, root, **kw):
+            raise bs.LoginWall(bs.WALL_CAPTCHA, "captcha")
+
+        monkeypatch.setattr(relogin.tp, "mint_credentials", captcha)
+        result = relogin.run_one(slot.sw, slot.num, slot.email, slot.org, out=lambda m: None)
+        assert result.status == relogin.FAILED and result.wall == bs.WALL_CAPTCHA
+        assert slot.seen.browser.closed
+        assert slot.sw._read_account_credentials(slot.num, slot.email) == old
+
+    def test_the_active_slot_is_refused_before_any_browser(self, slot, monkeypatch):
+        real = slot.sw._build_accounts_info
+
+        def as_active():
+            return [(n, e, on, o, str(n) == slot.num, c, a) for n, e, on, o, _x, c, a in real()]
+
+        monkeypatch.setattr(slot.sw, "_build_accounts_info", as_active)
+        with pytest.raises(relogin.ActiveSlot):
+            relogin.relogin_account(slot.sw, slot.num, slot.email, slot.org, out=lambda m: None)
+        assert relogin.run_one(slot.sw, slot.num, slot.email, slot.org).status == relogin.SKIPPED
+        monkeypatch.setattr(relogin, "require_inbox", lambda root: True)
+        with pytest.raises(SystemExit) as e:
+            relogin.login_auto(slot.sw, slot.email)
+        assert e.value.code == 2 and slot.seen.captures == 0
+
+    def test_login_auto_output_never_carries_a_secret(self, slot, monkeypatch, capsys):
+        monkeypatch.setattr(relogin, "require_inbox", lambda root: True)
+        relogin.login_auto(slot.sw, slot.email)
+        out = capsys.readouterr()
+        text = out.out + out.err
+        assert "new token stored" in text
+        for secret in ("SESSION-SECRET", "NEW-SECRET", "magic-link"):
+            assert secret not in text
+
+
+class TestRunOneClassification:
+    @pytest.mark.parametrize("exc, status, wall", [
+        (bs.LoginWall(bs.WALL_CAPTCHA, "x"), relogin.FAILED, bs.WALL_CAPTCHA),
+        (bs.LoginWall(bs.WALL_BROWSER_CHECK, "x"), relogin.FAILED, bs.WALL_BROWSER_CHECK),
+        (bs.LoginWall(bs.WALL_NO_EMAIL, "x"), relogin.FAILED, bs.WALL_NO_EMAIL),
+        (bs.NoPlan("x"), relogin.FAILED, "no-plan"),
+        (bs.ReauthRequired("x"), relogin.FAILED, "reauth"),
+        (bs.OAuthError("x"), relogin.FAILED, None),
+        (OSError("disk"), relogin.FAILED, None),
+        (relogin.ActiveSlot("x"), relogin.SKIPPED, None),
+    ])
+    def test_each_failure_keeps_its_kind(self, monkeypatch, exc, status, wall):
+        def boom(*a, **kw):
+            raise exc
+
+        monkeypatch.setattr(relogin, "relogin_account", boom)
+        r = relogin.run_one(None, "3", "c@x", "o")
+        assert (r.status, r.wall) == (status, wall)
+
+
+# --- the mint's reauth sign-in keeps the wall kind (M1) -------------------------
+
+
+class _MintTab:
+    """The consent tab: claude.ai sends it to /login?reauth=1."""
+
+    def __init__(self, wall_answer=""):
+        self.wall_answer = wall_answer
+
+    async def evaluate(self, js, return_by_value=False):
+        if js == bs._REAUTH_PAGE_JS:
+            return True
+        if js == bs._WALL_JS:
+            return self.wall_answer
+        return False
+
+    async def get(self, url):
+        pass
+
+
+class _MintBrowser:
+    def __init__(self, tab):
+        self.tab = tab
+
+    async def get(self, url, new_tab=False):
+        return self.tab
+
+
+def _mint(monkeypatch, tab, prefill_coro=None, timeout_s=5.0):
+    """Run the strict mint against a tab stuck on the reauth sign-in."""
+    real_sleep = asyncio.sleep
+
+    async def waiting_for_mail():
+        await real_sleep(60)  # the mailbox watcher, still waiting
+
+    def start(tab_, email, out, root, **kw):
+        assert kw.get("strict") is True
+        return asyncio.ensure_future((prefill_coro or waiting_for_mail)())
+
+    async def quick(s, *a, **kw):  # the 0.5 s poll, without the wait
+        return await real_sleep(0.001 if s < 5 else s)
+
+    monkeypatch.setattr(bs, "_start_prefill", start)
+    monkeypatch.setattr(bs, "REAUTH_WAIT_S", timeout_s)
+    monkeypatch.setattr(asyncio, "sleep", quick)
+    return asyncio.run(bs._nd_mint_oauth_tokens(
+        _MintBrowser(tab), timeout_s, lambda m: None, email="a@example.com", root=None, strict=True,
+    ))
+
+
+class TestMintReauthWalls:
+    def test_a_prefill_wall_keeps_its_kind(self, monkeypatch):
+        async def wall():
+            raise bs.LoginWall(bs.WALL_BROWSER_CHECK, "bot check")
+
+        with pytest.raises(bs.LoginWall) as e:
+            _mint(monkeypatch, _MintTab(), wall)
+        assert e.value.kind == bs.WALL_BROWSER_CHECK
+        assert e.value.kind in bs.WALL_STOPS_RUN
+
+    def test_a_captcha_on_the_reauth_pages_is_seen(self, monkeypatch):
+        with pytest.raises(bs.LoginWall) as e:
+            _mint(monkeypatch, _MintTab(wall_answer="captcha"))
+        assert e.value.kind == bs.WALL_CAPTCHA
+
+    def test_no_mail_during_the_reauth_is_no_email(self, monkeypatch):
+        with pytest.raises(bs.LoginWall) as e:
+            _mint(monkeypatch, _MintTab(), timeout_s=0.05)
+        assert e.value.kind == bs.WALL_NO_EMAIL
 
 
 # --- relogin-dead ------------------------------------------------------------
