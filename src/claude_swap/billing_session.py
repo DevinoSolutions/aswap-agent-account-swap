@@ -253,10 +253,14 @@ def _curl_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _http_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, str]:
+def _http_get(
+    url: str, headers: dict[str, str], timeout: float, body: str | None = None
+) -> tuple[int, str]:
+    """GET ``url``, or POST ``body`` when one is given."""
     curl = _curl()
     if curl is None:
-        req = urllib.request.Request(url, headers=headers)
+        data = body.encode("utf-8") if body is not None else None
+        req = urllib.request.Request(url, data=data, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.status, resp.read().decode("utf-8", errors="replace")
@@ -266,6 +270,8 @@ def _http_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, s
             raise BillingSessionError(f"claude.ai unreachable: {e}") from None
     config = "".join(f"header = {_curl_quote(f'{k}: {v}')}\n" for k, v in headers.items())
     config += f"url = {_curl_quote(url)}\n"
+    if body is not None:
+        config += f"data-binary = {_curl_quote(body)}\n"
     cmd = [curl, "-s", "-K", "-", "--max-time", str(int(timeout)), "--retry", "1",
            "-w", _STATUS_MARK.replace("\n", "\\n") + "%{http_code}"]
     try:
@@ -286,20 +292,25 @@ def _http_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, s
     return status, body
 
 
-def _request(path: str, session_key: str, timeout: float = 40.0) -> object:
+def _request(
+    path: str, session_key: str, timeout: float = 40.0, *, post: dict | None = None
+) -> object:
+    """GET ``path`` with the claude.ai session, or POST ``post`` as JSON."""
     base = endpoints.claude_ai_base()
-    status, body = _http_get(
-        base + path,
-        {
-            "Cookie": f"sessionKey={session_key}",
-            "User-Agent": _UA,
-            "Accept": "application/json",
-            "Origin": base,
-            "Referer": base + "/settings/billing",
-            "anthropic-client-platform": "web_claude_ai",
-        },
-        timeout,
-    )
+    headers = {
+        "Cookie": f"sessionKey={session_key}",
+        "User-Agent": _UA,
+        "Accept": "application/json",
+        "Origin": base,
+        "Referer": base + "/settings/billing",
+        "anthropic-client-platform": "web_claude_ai",
+    }
+    if post is None:
+        status, body = _http_get(base + path, headers, timeout)
+    else:
+        headers["Content-Type"] = "application/json"
+        headers["Referer"] = base + "/settings/usage"
+        status, body = _http_get(base + path, headers, timeout, json.dumps(post))
     if status >= 400:
         if status == 429 or "cf-chl" in body or "Just a moment" in body:
             raise SessionBlocked(f"claude.ai refused ({status}); retry later")
@@ -310,6 +321,8 @@ def _request(path: str, session_key: str, timeout: float = 40.0) -> object:
         if status in (401, 403):
             raise SessionExpired(f"claude.ai session rejected ({status})")
         raise BillingSessionError(f"claude.ai HTTP {status}")
+    if post is not None and not body.strip():
+        return {}
     try:
         return json.loads(body)
     except ValueError:
@@ -422,6 +435,83 @@ def parse_limit_resets(payload: object) -> list[dict]:
             "usableNow": grant.get("usable_now") is not False,
         })
     out.sort(key=lambda r: r["expiresAt"] or "9999")
+    return out
+
+
+# Spending one: the page's "Reset for free" (captured 2026-11-26) POSTs the
+# grant id here. A full reset zeroes the 5-hour and weekly windows (the
+# per-model ones too) but keeps the week's end; a model reset refills that
+# model's allowance and the 5-hour window. Afterwards every grant reads
+# ``unavailable_reason: "cooldown"`` for about a minute.
+_USE_RESET_PATH = "/api/organizations/{org}/reset_rate_limits"
+RESET_PROGRAM = "cedar_ember"
+
+
+def read_usage(session_key: str, org_uuid: str) -> dict:
+    """The claude.ai usage payload, limit resets (``cedar_ember``) included."""
+    data = _request(_RESETS_PATH.format(org=org_uuid), session_key)
+    return data if isinstance(data, dict) else {}
+
+
+def reset_grants(payload: object) -> list[dict]:
+    """Every grant, spent or not, soonest expiry first: ``id``, ``name`` (as
+    ``parse_limit_resets``), ``left``, ``usableNow``, ``reason`` (claude.ai's
+    unavailable_reason, e.g. "cooldown"), ``expiresAt``, ``cooldownUntil``."""
+    block = payload.get("cedar_ember") if isinstance(payload, dict) else None
+    if not isinstance(block, dict):
+        return []
+    models = _scoped_models(payload)
+    out = []
+    for grant in block.get("grants") or []:
+        if not isinstance(grant, dict) or not grant.get("id"):
+            continue
+        left = grant.get("resets_left")
+        clears = [c for c in grant.get("clears") or [] if isinstance(c, str)]
+        out.append({
+            "id": str(grant["id"]),
+            "name": _reset_name(grant, clears, models),
+            "left": left if isinstance(left, int) and not isinstance(left, bool) else 0,
+            "usableNow": grant.get("usable_now") is True,
+            "reason": grant.get("unavailable_reason"),
+            "expiresAt": _to_iso(grant.get("ends_at")),
+            "cooldownUntil": _to_iso(block.get("cooldown_until")),
+        })
+    out.sort(key=lambda r: r["expiresAt"] or "9999")
+    return out
+
+
+def use_limit_reset(session_key: str, org_uuid: str, grant_id: str) -> object:
+    """Spend one reset of ``grant_id``: what "Reset for free" sends."""
+    import uuid
+
+    return _request(
+        _USE_RESET_PATH.format(org=org_uuid),
+        session_key,
+        post={"program": RESET_PROGRAM, "grant_id": grant_id, "request_id": str(uuid.uuid4())},
+    )
+
+
+def usage_percents(payload: object) -> dict[str, float]:
+    """``{"5h": 0.0, "7d": 100.0, "Fable": 45.0}`` from the payload's limits."""
+    out: dict[str, float] = {}
+    limits = payload.get("limits") if isinstance(payload, dict) else None
+    for lim in limits if isinstance(limits, list) else []:
+        if not isinstance(lim, dict):
+            continue
+        pct = lim.get("percent")
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            continue
+        kind = lim.get("kind")
+        if kind == "session":
+            out["5h"] = float(pct)
+        elif kind == "weekly_all":
+            out["7d"] = float(pct)
+        elif kind == "weekly_scoped":
+            scope = lim.get("scope") if isinstance(lim.get("scope"), dict) else {}
+            model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+            name = model.get("display_name")
+            if isinstance(name, str) and name:
+                out[name] = float(pct)
     return out
 
 

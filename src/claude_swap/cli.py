@@ -2126,6 +2126,11 @@ def main() -> None:
 
         billing_command(argv[1:])
         return
+    if argv and argv[0] == "reset":
+        from claude_swap.billing_cli import reset_command
+
+        reset_command(argv[1:])
+        return
     if argv and argv[0] == "login":
         # `aswap login` is the friendly spelling of `aswap billing login`:
         # capture a claude.ai session and mint a CC OAuth token in one step.
@@ -2223,6 +2228,7 @@ Commands:
   %(prog)s relogin-dead [--dry-run]   hands-free re-login of every dead account
   %(prog)s inbox add|list|test|remove mailboxes the sign-in links are read from
   %(prog)s billing <command>          exact billing, weekly resets, resub plan
+  %(prog)s reset <num|email> [7d|model] list or use a claude.ai limit reset
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s warmup                     keep five-hour windows ready (opt-in spend)
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)

@@ -544,6 +544,139 @@ class TestLimitResets:
         assert len(out) == 2
 
 
+class TestUseLimitReset:
+    def test_grants_list_spent_ones_and_the_cooldown(self):
+        payload = json.loads(json.dumps(_CEDAR_USAGE))
+        payload["cedar_ember"]["cooldown_until"] = "2026-11-26T20:59:49.095636+00:00"
+        payload["cedar_ember"]["grants"][0].update(usable_now=False, unavailable_reason="cooldown")
+        out = {g["id"]: g for g in bs.reset_grants(payload)}
+        assert out["spent"]["left"] == 0 and out["spent"]["name"] == "Weekly"
+        assert out["launch-2610-fable"]["reason"] == "cooldown"
+        assert not out["launch-2610-fable"]["usableNow"] and out["full-reset-2611"]["usableNow"]
+        assert out["full-reset-2611"]["cooldownUntil"].startswith("2026-11-26T20:59:49")
+        assert bs.reset_grants({}) == []
+
+    def test_usage_percents(self):
+        payload = dict(_CEDAR_USAGE, limits=[{"kind": "session", "percent": 3}, *_CEDAR_USAGE["limits"]])
+        assert bs.usage_percents(payload) == {"5h": 3.0, "7d": 100.0, "Fable": 22.0}
+        assert bs.usage_percents(None) == {}
+
+    def test_use_posts_what_the_page_sends(self, monkeypatch):
+        calls = []
+
+        def fake_http(url, headers, timeout, body=None):
+            calls.append((url, headers, body))
+            return 200, ""
+
+        monkeypatch.setattr(bs, "_http_get", fake_http)
+        assert bs.use_limit_reset("sk", "org-1", "full-reset-2611") == {}
+        [(url, headers, body)] = calls
+        assert url.endswith("/api/organizations/org-1/reset_rate_limits")
+        sent = json.loads(body)
+        assert sent["program"] == "cedar_ember" and sent["grant_id"] == "full-reset-2611"
+        assert len(sent["request_id"]) == 36
+        assert headers["Content-Type"] == "application/json"
+        assert headers["Cookie"] == "sessionKey=sk"
+
+    def test_get_sends_no_body(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(bs, "_http_get", lambda url, h, t, *body: calls.append(body) or (200, "{}"))
+        bs._request("/api/x", "sk")
+        assert calls == [()]
+
+
+class _FakeSessions:
+    def __init__(self, key):
+        self.key = key
+
+    def get(self, identity):
+        return {"sessionKey": self.key} if self.key else None
+
+
+class _FakeBilling:
+    def __init__(self):
+        self.stored = []
+
+    def store_limit_resets(self, identity, resets):
+        self.stored.append((identity, resets))
+
+
+class _FakeSwitcher:
+    def __init__(self, key="sk"):
+        self._sessions = _FakeSessions(key)
+        self._billing = _FakeBilling()
+
+    def resolve_account(self, ident):
+        return "8", "hello@example.com", "org-1"
+
+
+class TestResetCommand:
+    @pytest.fixture
+    def cli(self, monkeypatch):
+        from claude_swap import billing_cli
+
+        sw = _FakeSwitcher()
+        monkeypatch.setattr(billing_cli, "_switcher", lambda debug: sw)
+        after = json.loads(json.dumps(_CEDAR_USAGE))
+        after["limits"][0]["percent"] = 0
+        after["cedar_ember"]["grants"][1]["resets_left"] = 0
+        used = []
+        monkeypatch.setattr(bs, "read_usage", lambda key, org: after if used else _CEDAR_USAGE)
+        monkeypatch.setattr(bs, "use_limit_reset", lambda key, org, gid: used.append((key, org, gid)) or {})
+        return billing_cli, sw, used
+
+    def test_uses_the_weekly_reset(self, cli, capsys):
+        billing_cli, sw, used = cli
+        billing_cli.reset_command(["hello@example.com", "7d"])
+        assert used == [("sk", "org-1", "full-reset-2611")]
+        out = capsys.readouterr().out
+        assert "used its 7d reset" in out
+        assert "before: 7d 100% · Fable 22%" in out and "after:  7d 0% · Fable 22%" in out
+        assert "resets left: Fable ×1" in out
+        [(identity, resets)] = sw._billing.stored
+        assert identity == ("hello@example.com", "org-1") and [r["name"] for r in resets] == ["Fable"]
+
+    def test_model_kind_is_case_insensitive(self, cli):
+        billing_cli, _sw, used = cli
+        billing_cli.reset_command(["8", "fable"])
+        assert used == [("sk", "org-1", "launch-2610-fable")]
+
+    def test_dry_run_and_listing_use_nothing(self, cli, capsys):
+        billing_cli, _sw, used = cli
+        billing_cli.reset_command(["8", "7d", "--dry-run"])
+        assert "would use its 7d reset" in capsys.readouterr().out
+        billing_cli.reset_command(["8"])
+        out = capsys.readouterr().out
+        assert "7d ×1" in out and "Fable ×1" in out and "use one: aswap reset 8 7d|fable" in out
+        assert "Nov 10" not in out  # a spent reset that expired is not listed
+        assert used == []
+
+    def test_spent_or_cooling_down_is_refused(self, monkeypatch, capsys):
+        from claude_swap import billing_cli
+
+        monkeypatch.setattr(billing_cli, "_switcher", lambda debug: _FakeSwitcher())
+        cooling = json.loads(json.dumps(_CEDAR_USAGE))
+        cooling["cedar_ember"]["cooldown_until"] = "2026-11-26T20:59:49+00:00"
+        for g in cooling["cedar_ember"]["grants"]:
+            g.update(usable_now=False, unavailable_reason="cooldown")
+        monkeypatch.setattr(bs, "read_usage", lambda key, org: cooling)
+        monkeypatch.setattr(bs, "use_limit_reset", lambda *a: pytest.fail("must not spend"))
+        with pytest.raises(SystemExit):
+            billing_cli.reset_command(["8", "7d"])
+        assert "cooldown until" in capsys.readouterr().err
+        with pytest.raises(SystemExit):
+            billing_cli.reset_command(["8", "opus"])
+        assert "no opus reset left (has: 7d ×1, Fable ×1)" in capsys.readouterr().err
+
+    def test_no_session(self, monkeypatch, capsys):
+        from claude_swap import billing_cli
+
+        monkeypatch.setattr(billing_cli, "_switcher", lambda debug: _FakeSwitcher(key=None))
+        with pytest.raises(SystemExit):
+            billing_cli.reset_command(["8", "7d"])
+        assert "no claude.ai session" in capsys.readouterr().err
+
+
 from claude_swap.switcher import ClaudeAccountSwitcher  # noqa: E402
 from claude_swap.usage_store import FetchRecord  # noqa: E402
 
