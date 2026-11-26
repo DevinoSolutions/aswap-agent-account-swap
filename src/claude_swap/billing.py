@@ -182,34 +182,58 @@ def live_limit_resets(record: dict | None, now: float) -> list[dict]:
     return out
 
 
-def limit_resets_text(view: dict | None, now: float | None = None) -> str | None:
-    """``2 available: Weekly until Dec 10 17:00 · Fable until Mar 9 2027``.
+def _reset_kinds(view: dict | None) -> list[tuple[str, int, str | None, int]]:
+    """``(label, count, earliest expiry ISO, not-usable count)`` per kind:
+    the weekly reset first (labelled "7d", like its usage row), then each
+    model's ("Fable"). Separate grants of one kind (launch + tenure Fable
+    resets) add up."""
+    kinds: dict[str, list] = {}
+    for r in (view or {}).get("limitResets") or []:
+        name = r.get("name") or "Reset"
+        label = "7d" if name == "Weekly" else name
+        left = r.get("left", 1)
+        k = kinds.setdefault(label, [0, None, 0])
+        k[0] += left
+        expires = r.get("expiresAt")
+        if isinstance(expires, str) and (k[1] is None or expires < k[1]):
+            k[1] = expires
+        if r.get("usableNow") is False:
+            k[2] += left
+    order = sorted(kinds, key=lambda label: (label != "7d", label.lower()))
+    return [(label, *kinds[label]) for label in order]
 
-    Local time; the year only when it is not this one. ``×N`` when several
-    resets share a name and expiry (one grant holding more, or separate
-    grants such as the launch and tenure Fable resets), "(not usable yet)"
-    when claude.ai says so.
+
+def limit_resets_short(view: dict | None) -> str | None:
+    """``7d ×1 · Fable ×3``: the count of each kind of banked reset."""
+    kinds = _reset_kinds(view)
+    if not kinds:
+        return None
+    return " · ".join(f"{label} ×{count}" for label, count, _e, _n in kinds)
+
+
+def limit_resets_text(view: dict | None, now: float | None = None) -> str | None:
+    """``7d ×1 until Dec 10 17:00 · Fable ×3 until Mar 9 2027 02:59``.
+
+    One part per kind with its count and earliest expiry, local time, the
+    year only when it is not this one; "(N not usable yet)" when claude.ai
+    says some can't be used now.
     """
-    resets = (view or {}).get("limitResets")
-    if not resets:
+    kinds = _reset_kinds(view)
+    if not kinds:
         return None
     this_year = datetime.fromtimestamp(time.time() if now is None else now).astimezone().year
-    groups: dict[tuple, int] = {}
-    for r in resets:
-        key = (r.get("name") or "Reset", r.get("expiresAt"), r.get("usableNow") is not False)
-        groups[key] = groups.get(key, 0) + r.get("left", 1)
     parts = []
-    for (name, expires, usable), left in groups.items():
-        part = name + (f" ×{left}" if left > 1 else "")
-        ends = _parse_iso(expires) if isinstance(expires, str) else None
+    for label, count, expires, not_usable in kinds:
+        part = f"{label} ×{count}"
+        ends = _parse_iso(expires) if expires else None
         if ends is not None:
             local = ends.astimezone()
             year = f" {local.year}" if local.year != this_year else ""
             part += f" until {local.strftime('%b')} {local.day}{year} {local.strftime('%H:%M')}"
-        if not usable:
-            part += " (not usable yet)"
+        if not_usable:
+            part += f" ({not_usable} not usable yet)" if not_usable < count else " (not usable yet)"
         parts.append(part)
-    return f"{sum(groups.values())} available: " + " · ".join(parts)
+    return " · ".join(parts)
 
 
 def _plan_view(

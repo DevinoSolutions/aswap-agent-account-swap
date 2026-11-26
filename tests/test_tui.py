@@ -814,6 +814,30 @@ class TestMiniAccountText:
         card = account_card_text(running, 100, now=now).plain
         assert "12%" in card and NO_PLAN_USAGE_NOTE not in card
 
+    def test_dashboard_rows_split_resets_with_counts(self):
+        # Owner 2026-11-26: resets on the dashboard, 7d and Fable apart, counted.
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        now = time.time()
+        entry = UsageEntry(
+            last_good={"seven_day": {"pct": 12.0, "resets_at": _iso_in(3600 * 30)}},
+            fetched_at=now, age_s=0.0,
+        )
+        resets = [
+            {"name": "Weekly", "left": 1, "expiresAt": _iso_in(86400 * 10), "usableNow": True},
+            {"name": "Fable", "left": 1, "expiresAt": _iso_in(86400 * 90), "usableNow": True},
+            {"name": "Fable", "left": 2, "expiresAt": _iso_in(86400 * 90), "usableNow": True},
+        ]
+        acc = dataclasses.replace(
+            make_account(2, entry=entry), billing={"endsAt": _iso_in(86400 * 20), "limitResets": resets}
+        )
+        mini = mini_account_text(acc, now).plain
+        assert "12%" in mini and mini.endswith("Resets 7d ×1 · Fable ×3")
+        card = account_card_text(acc, 120, now=now).plain
+        assert "Resets 7d ×1 until " in card and " · Fable ×3 until " in card
+        plain = dataclasses.replace(acc, billing={"endsAt": _iso_in(86400 * 20)})
+        assert "Resets" not in mini_account_text(plain, now).plain
+
     def test_five_hour_never_shows_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text
 
