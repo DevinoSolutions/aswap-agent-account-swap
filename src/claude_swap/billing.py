@@ -343,7 +343,9 @@ def period_end_ts(view: dict | None, now: float) -> float | None:
     return parsed.timestamp()
 
 
-CANCELLED_MARK = "❌"  # fully ended
+# Fully ended (no plan). Was ❌, which read as "error / limit hit" (owner
+# 2026-11-26); a limit hit has no mark, its 100% bars say it.
+CANCELLED_MARK = "🚫"
 CANCELLING_MARK = "⏳"  # cancelled, paid time still left
 # "none": claude.ai has no subscription for the organization (lapsed to free).
 _CANCELLED_STATUSES = frozenset({"canceled", "cancelled", "none"})

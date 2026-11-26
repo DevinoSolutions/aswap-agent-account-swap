@@ -316,7 +316,7 @@ def _append_billing(text: Text, acc: AccountSnapshot, palette: Palette) -> None:
 
 
 def _append_account_mark(text: Text, acc: AccountSnapshot) -> None:
-    """``⏳`` / ``❌`` / ``⏰`` before the email (see ``billing.account_mark``)."""
+    """``⏳`` / ``🚫`` / ``⏰`` before the email (see ``billing.account_mark``)."""
     mark = account_mark(acc.billing)
     if mark:
         text.append(f"{mark} ")
