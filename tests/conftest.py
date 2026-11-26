@@ -714,6 +714,7 @@ def _no_billing_network(monkeypatch):
     # Tests that restore the real refresh stub only subscription_details;
     # the limit-reset read rides along and must not reach claude.ai either.
     monkeypatch.setattr("claude_swap.billing_session.fetch_limit_resets", no_resets)
+    monkeypatch.setattr("claude_swap.billing_session.fetch_reset_state", no_resets)
 
 
 @pytest.fixture(autouse=True)

@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from claude_swap import billing_session as bs
 from claude_swap import token_push as tp
 from claude_swap import weekly_anchor as wa
-from claude_swap.billing import billing_text, has_no_plan, limit_resets_text
+from claude_swap.billing import billing_text, has_no_plan, limit_resets_text, live_resets_used, resets_used_text
 from claude_swap.printer import accent, dimmed, error, muted
 
 
@@ -253,10 +253,12 @@ def _status(sw, args) -> None:
             "session": sw._billing.session_state(identity),
             "billing": billing.get(str(num)),
             "weeklyReset": weekly.get(str(num)),
+            "resetsUsed": live_resets_used(sw._anchors.get(identity)),
         })
     present = {f"{r['email']}|{(i[3] or '')}" for r, i in zip(rows, info)}
     removed = [
-        {"email": r["email"], "lastSlot": r.get("lastSlot"), "weeklyReset": wa.weekly_view(r)}
+        {"email": r["email"], "lastSlot": r.get("lastSlot"), "weeklyReset": wa.weekly_view(r),
+         "resetsUsed": live_resets_used(r)}
         for k, r in sw._anchors.rows().items()
         if k not in present
     ]
@@ -270,10 +272,16 @@ def _status(sw, args) -> None:
         resets = limit_resets_text(r["billing"])
         if resets:
             print(f"     Resets: {resets}")
+        used = resets_used_text({"resetsUsed": r["resetsUsed"]})
+        if used:
+            print(dimmed(f"     Resets used: {used}"))
     if removed:
         print(dimmed("Remembered (not in aswap):"))
         for r in removed:
             print(f"  {r['email']} (was slot {r['lastSlot']})  Weekly: {wa.weekly_text(r['weeklyReset']) or 'unknown'}")
+            used = resets_used_text({"resetsUsed": r["resetsUsed"]})
+            if used:
+                print(dimmed(f"     Resets used: {used}"))
 
 
 _BASIS = {
@@ -460,6 +468,7 @@ def _plan(sw, args) -> None:
             "quotas": plan["quotas"],
             "quotasIfNow": plan["quotasIfNow"],
             "windowsHours": plan["windows"],
+            "resetsUsed": live_resets_used(row),
         }
         if renewal is not None:
             item["renewal"] = {
@@ -483,6 +492,9 @@ def _plan(sw, args) -> None:
             when =datetime.fromisoformat(r["recommendedAt"]).astimezone()
             print(f"     buy now -> {r['quotasIfNow']} weekly quotas (next reset in {r['nextResetInHours']}h)")
             print(f"     best: {when:%a %b %d %H:%M} local -> {r['quotas']} quotas (windows h: {r['windowsHours']})")
+            used = resets_used_text({"resetsUsed": r.get("resetsUsed")})
+            if used:
+                print(dimmed(f"     resets already used (gone if brought back before they expire): {used}"))
         ren = r.get("renewal")
         if ren:
             renews = datetime.fromisoformat(ren["renewsAt"]).astimezone()
@@ -657,7 +669,8 @@ def reset_command(argv: list[str]) -> None:
         grants = bs.reset_grants(before)
         pcts = bs.usage_percents(before)
         if not args.kind:
-            _print_resets(num, email, grants, pcts, args.json)
+            remembered = {r["id"]: r for r in live_resets_used(sw._anchors.get((email, org or "")))}
+            _print_resets(num, email, grants, pcts, args.json, remembered)
             return
         picked = _pick_grant(grants, args.kind)
         if not picked or picked[0]["left"] <= 0:
@@ -677,7 +690,15 @@ def reset_command(argv: list[str]) -> None:
             print(f"  {num}: {email}  would use its {label} reset ({grant['id']})  now: {_percents_text(pcts)}")
             return
         result = bs.use_limit_reset(key, org, grant["id"])
+        used_at = datetime.now(timezone.utc).isoformat()
         after = bs.read_usage(key, org)
+        spent = [u for u in bs.parse_used_resets(after) if u["id"] == grant["id"]] or [
+            {"id": grant["id"], "name": grant["name"], "used": 1, "total": None, "expiresAt": grant["expiresAt"]}
+        ]
+        try:
+            sw._anchors.note_resets_used((email, org or ""), spent, via="aswap reset", used_at=used_at)
+        except Exception:  # noqa: BLE001 - the reset itself went through
+            pass
         sw._billing.store_limit_resets((email, org or ""), bs.parse_limit_resets(after))
         after_pcts = bs.usage_percents(after)
         if args.json:
@@ -701,9 +722,13 @@ def reset_command(argv: list[str]) -> None:
         raise
 
 
-def _print_resets(num: str, email: str, grants: list[dict], pcts: dict, as_json: bool) -> None:
+def _print_resets(
+    num: str, email: str, grants: list[dict], pcts: dict, as_json: bool, remembered: dict | None = None
+) -> None:
+    remembered = remembered or {}
     if as_json:
-        print(json.dumps({"account": num, "email": email, "usage": pcts, "resets": grants}))
+        print(json.dumps({"account": num, "email": email, "usage": pcts, "resets": grants,
+                          "used": list(remembered.values())}))
         return
     now = datetime.now(timezone.utc).isoformat()
     grants = [g for g in grants if g["left"] > 0 or (g["expiresAt"] or "9999") > now]
@@ -715,6 +740,9 @@ def _print_resets(num: str, email: str, grants: list[dict], pcts: dict, as_json:
         state = "ready" if g["usableNow"] else (g["reason"] or "not usable now")
         if g["left"] <= 0:
             state = "used"
+            seen = resets_used_text({"resetsUsed": [remembered[g["id"]]]}) if g["id"] in remembered else None
+            if seen:
+                state = seen.split(" ", 1)[1]  # "used Nov 26 16:05 (aswap reset)"
         when = f"  until {ends:%b %d %H:%M}" if ends else ""
         print(f"     {_kind_label(g['name'])} ×{g['left']}{when}  ({state})")
     ready = list(dict.fromkeys(_kind_label(g["name"]).lower() for g in grants if g["left"] > 0 and g["usableNow"]))

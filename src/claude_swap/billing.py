@@ -203,6 +203,47 @@ def limit_reset_kinds(view: dict | None) -> list[tuple[str, int, str | None, int
     return [(label, *kinds[label]) for label in order]
 
 
+def live_resets_used(anchor_row: dict | None, now: float | None = None) -> list[dict]:
+    """The remembered spent resets (``WeeklyAnchorStore.note_resets_used``)
+    whose grant has not expired: what a brought-back account won't have."""
+    now = time.time() if now is None else now
+    out = []
+    for r in (anchor_row or {}).get("resetsUsed") or []:
+        if not isinstance(r, dict):
+            continue
+        ends = _parse_iso(r["expiresAt"]) if isinstance(r.get("expiresAt"), str) else None
+        if ends is None or ends.timestamp() > now:
+            out.append(r)
+    return out
+
+
+def resets_used_text(anchor_row: dict | None, now: float | None = None) -> str | None:
+    """``7d used Nov 26 16:05 (aswap reset) · Fable ×2 used by Nov 26``.
+
+    "used by" when aswap only saw the spend (made on the claude.ai page, or
+    before aswap tracked it); the exact time when aswap spent it.
+    """
+    parts = []
+    for r in live_resets_used(anchor_row, now):
+        label = "7d" if r.get("name") == "Weekly" else (r.get("name") or "Reset")
+        if (r.get("used") or 1) > 1:
+            label += f" ×{r['used']}"
+        exact = _parse_iso(r["usedAt"]) if isinstance(r.get("usedAt"), str) else None
+        seen = _parse_iso(r["seenAt"]) if isinstance(r.get("seenAt"), str) else None
+        if exact is not None:
+            local = exact.astimezone()
+            part = f"{label} used {local.strftime('%b')} {local.day} {local.strftime('%H:%M')}"
+            if r.get("via"):
+                part += f" ({r['via']})"
+        elif seen is not None:
+            local = seen.astimezone()
+            part = f"{label} used by {local.strftime('%b')} {local.day}"
+        else:
+            part = f"{label} used"
+        parts.append(part)
+    return " · ".join(parts) or None
+
+
 def limit_resets_text(view: dict | None, now: float | None = None) -> str | None:
     """``7d ×1 until Dec 10 17:00 · Fable ×3 until Mar 9 2027 02:59``.
 
@@ -597,7 +638,7 @@ class BillingCache:
 
         def fetch(item):
             num, (_email, org, token, session_key) = item
-            result: dict = {"exact": None, "profile": None, "session": None, "resets": None}
+            result: dict = {"exact": None, "profile": None, "session": None, "resets": None, "used": None}
             if session_key:
                 from claude_swap import billing_session as bs
 
@@ -605,7 +646,7 @@ class BillingCache:
                     result["exact"] = bs.fetch_subscription_details(session_key, org)
                     result["session"] = "ok"
                     try:
-                        result["resets"] = bs.fetch_limit_resets(session_key, org)
+                        result["resets"], result["used"] = bs.fetch_reset_state(session_key, org)
                     except Exception as e:  # advisory: keep the last reading
                         _logger.debug("limit resets failed for %s: %r", num, e)
                 except bs.SessionExpired:
@@ -681,6 +722,11 @@ class BillingCache:
                     )
                 except Exception:
                     _logger.debug("anchor subscription note failed", exc_info=True)
+            if self.anchors is not None and result["used"]:
+                try:
+                    self.anchors.note_resets_used(identity, result["used"])
+                except Exception:
+                    _logger.debug("anchor resets-used note failed", exc_info=True)
         try:
             self._save(rows)
         except OSError as e:

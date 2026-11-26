@@ -502,7 +502,7 @@ class TestLimitResets:
         from claude_swap import billing_session as bs
 
         monkeypatch.setattr(bs, "fetch_subscription_details", lambda key, org: dict(_ACTIVE))
-        monkeypatch.setattr(bs, "fetch_limit_resets", resets)
+        monkeypatch.setattr(bs, "fetch_reset_state", lambda key, org: (resets(key, org), []))
         sessions = FakeSessions({("a@example.com", "org-1"): {"sessionKey": "sk", "status": "ok"}})
         return billing.BillingCache(tmp_path, sessions=sessions)
 
@@ -522,7 +522,7 @@ class TestLimitResets:
 
         from claude_swap import billing_session as bs
 
-        monkeypatch.setattr(bs, "fetch_limit_resets", boom)
+        monkeypatch.setattr(bs, "fetch_reset_state", boom)
         cache.refresh(self.INFO, force=True)
         row = cache.records(self.IDENT)["3"]
         assert row["limitResets"] == _RESETS
@@ -533,9 +533,24 @@ class TestLimitResets:
         cache.refresh(self.INFO)
         from claude_swap import billing_session as bs
 
-        monkeypatch.setattr(bs, "fetch_limit_resets", lambda key, org: [])
+        monkeypatch.setattr(bs, "fetch_reset_state", lambda key, org: ([], []))
         cache.refresh(self.INFO, force=True)
         assert cache.records(self.IDENT)["3"]["limitResets"] == []
+
+    def test_refresh_remembers_spent_resets(self, tmp_path, monkeypatch):
+        from claude_swap import billing_session as bs
+        from claude_swap.weekly_anchor import WeeklyAnchorStore
+
+        monkeypatch.setattr(bs, "fetch_subscription_details", lambda key, org: dict(_ACTIVE))
+        spent = [{"id": "w", "name": "Weekly", "used": 1, "total": 1, "expiresAt": "2099-12-10T22:00:00+00:00"}]
+        monkeypatch.setattr(bs, "fetch_reset_state", lambda key, org: (list(_RESETS[1:]), spent))
+        sessions = FakeSessions({("a@example.com", "org-1"): {"sessionKey": "sk", "status": "ok"}})
+        anchors = WeeklyAnchorStore(tmp_path)
+        cache = billing.BillingCache(tmp_path, sessions=sessions, anchors=anchors)
+        cache.refresh(self.INFO)
+        [r] = anchors.get(("a@example.com", "org-1"))["resetsUsed"]
+        assert (r["id"], r["used"]) == ("w", 1) and r["seenAt"] and "usedAt" not in r
+        assert billing.resets_used_text(anchors.get(("a@example.com", "org-1"))).startswith("7d used by ")
 
     def test_view_drops_expired_resets(self):
         record = {"source": "exact", "currentPeriodEnd": "2099-01-01T00:00:00+00:00",
