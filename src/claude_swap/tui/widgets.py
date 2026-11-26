@@ -20,6 +20,7 @@ from claude_swap.billing import (
     account_mark,
     billing_text,
     has_no_plan,
+    limit_resets_short,
     limit_resets_text,
 )
 from claude_swap.cvp import CVP_LABEL
@@ -376,12 +377,14 @@ def mini_account_text(
 
     if has_no_plan(acc.billing):
         text.append(NO_PLAN_USAGE_NOTE, style=palette.muted)
+        _append_mini_resets(text, acc, palette)
         return text
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
         text.append(data.sentinel_label(sentinel), style=style)
+        _append_mini_resets(text, acc, palette)
         return text
 
     last_good = oauth.roll_passed_windows(acc.usage.last_good, now)
@@ -438,7 +441,17 @@ def mini_account_text(
         parts += 1
     if not parts:
         text.append("usage unknown", style=palette.muted)
+    _append_mini_resets(text, acc, palette)
     return text
+
+
+def _append_mini_resets(text: Text, acc: AccountSnapshot, palette: Palette) -> None:
+    """``   Resets 7d ×1 · Fable ×1``: claude.ai's banked limit resets, each
+    kind with its count (the full card adds the expiry dates)."""
+    short = limit_resets_short(acc.billing)
+    if short:
+        text.append("   Resets ", style=palette.muted)
+        text.append(short, style=palette.accent)
 
 
 def section_header_text(label: str, width: int, *, palette: Palette) -> Text:
