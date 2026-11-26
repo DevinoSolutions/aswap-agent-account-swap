@@ -485,6 +485,53 @@ class WeeklyAnchorStore:
         """Record (or with ``when=None`` clear) a cancel made by hand."""
         self._update(identity, {"cancelledAt": when})
 
+    def note_resets_used(
+        self,
+        identity: Identity,
+        used: list[dict],
+        *,
+        via: str | None = None,
+        used_at: str | None = None,
+    ) -> None:
+        """Remember the account's spent claude.ai limit resets (owner ask
+        2026-11-26): kept after the account is removed or lapses, since a
+        brought-back account won't have them again. ``used`` rows come from
+        ``billing_session.parse_used_resets``; ``seenAt`` is when aswap first
+        saw the spend, ``usedAt`` the exact time when aswap spent it."""
+        if not used:
+            return
+        now_iso = _iso(self.clock())
+        key = identity_key(identity)
+        with self._lock():
+            rows = self.rows()
+            row = rows.get(key)
+            if row is None:
+                row = rows[key] = _new_row(identity)
+            known = {r["id"]: r for r in row.get("resetsUsed") or [] if isinstance(r, dict) and r.get("id")}
+            changed = False
+            for u in used:
+                mine = known.get(u["id"])
+                count = u.get("used") or 1
+                more = mine is None or count > (mine.get("used") or 1)
+                if not more and not (used_at and not mine.get("usedAt")):
+                    continue
+                entry = dict(mine or {})
+                entry.update(id=u["id"], name=u.get("name"), used=count, total=u.get("total"),
+                             expiresAt=u.get("expiresAt"))
+                if more:
+                    entry["seenAt"] = now_iso
+                    entry.pop("usedAt", None)
+                    entry.pop("via", None)
+                if used_at:
+                    entry["usedAt"] = used_at
+                if via:
+                    entry["via"] = via
+                known[u["id"]] = entry
+                changed = True
+            if changed:
+                row["resetsUsed"] = sorted(known.values(), key=lambda r: r.get("usedAt") or r.get("seenAt") or "")
+                self._save(rows)
+
     def mark_removed(self, identity: Identity, slot: int) -> None:
         if self.get(identity) is None:
             return  # nothing remembered; nothing to annotate
@@ -578,6 +625,15 @@ def _merge_row(mine: dict, theirs: dict) -> dict:
     cancels = [r["cancelledAt"] for r in (mine, theirs) if isinstance(r.get("cancelledAt"), str)]
     if cancels:  # the latest recorded cancel wins, whichever machine saw it
         merged["cancelledAt"] = max(cancels, key=lambda v: _parse(v) or datetime.min.replace(tzinfo=timezone.utc))
+    used: dict[str, dict] = {}
+    for r in [*(mine.get("resetsUsed") or []), *(theirs.get("resetsUsed") or [])]:
+        if isinstance(r, dict) and r.get("id"):
+            have = used.get(r["id"])
+            # The bigger count wins; at equal counts, the one with an exact time.
+            if have is None or (r.get("used") or 1, bool(r.get("usedAt"))) > (have.get("used") or 1, bool(have.get("usedAt"))):
+                used[r["id"]] = r
+    if used:
+        merged["resetsUsed"] = sorted(used.values(), key=lambda r: r.get("usedAt") or r.get("seenAt") or "")
     tiers = dict(mine.get("tiers") or {})
     for name, block in (theirs.get("tiers") or {}).items():
         tiers[name] = _merge_tier(tiers.get(name), block)

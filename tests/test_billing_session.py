@@ -544,6 +544,52 @@ class TestLimitResets:
         assert len(out) == 2
 
 
+class TestUsedResets:
+    def test_spent_grants_are_listed_with_their_count(self):
+        out = bs.parse_used_resets(_CEDAR_USAGE)
+        assert [(u["id"], u["name"], u["used"], u["total"]) for u in out] == [("spent", "Weekly", 1, 1)]
+        assert bs.parse_used_resets(None) == []
+
+    def test_store_keeps_them_and_upgrades_to_the_exact_time(self, tmp_path):
+        from claude_swap.weekly_anchor import WeeklyAnchorStore
+
+        store = WeeklyAnchorStore(tmp_path, clock=lambda: 1_800_000_000)
+        ident = ("x@example.com", "org")
+        spent = [{"id": "g", "name": "Fable", "used": 1, "total": 3, "expiresAt": "2099-03-09T07:59:00+00:00"}]
+        store.note_resets_used(ident, spent)
+        store.note_resets_used(ident, spent)  # seen again: no change
+        [r] = store.get(ident)["resetsUsed"]
+        assert "usedAt" not in r and r["seenAt"]
+        store.note_resets_used(ident, spent, via="aswap reset", used_at="2026-11-26T21:00:00+00:00")
+        [r] = store.get(ident)["resetsUsed"]
+        assert r["usedAt"] == "2026-11-26T21:00:00+00:00" and r["via"] == "aswap reset"
+        store.note_resets_used(ident, [dict(spent[0], used=2)])  # a second one spent
+        [r] = store.get(ident)["resetsUsed"]
+        assert r["used"] == 2 and "usedAt" not in r
+
+    def test_machines_merge_by_grant(self):
+        from claude_swap.weekly_anchor import _merge_row
+
+        mine = {"email": "x", "tiers": {}, "resetsUsed": [{"id": "a", "used": 1, "seenAt": "2026-11-26T00:00:00+00:00"}]}
+        theirs = {"email": "x", "tiers": {}, "resetsUsed": [
+            {"id": "a", "used": 1, "usedAt": "2026-11-25T00:00:00+00:00"},
+            {"id": "b", "used": 1, "seenAt": "2026-11-26T01:00:00+00:00"},
+        ]}
+        merged = _merge_row(mine, theirs)
+        assert [(r["id"], r.get("usedAt")) for r in merged["resetsUsed"]] == [
+            ("a", "2026-11-25T00:00:00+00:00"), ("b", None)]
+
+    def test_expired_grants_drop_out_of_the_text(self):
+        from claude_swap import billing
+
+        row = {"resetsUsed": [
+            {"id": "old", "name": "Weekly", "used": 1, "expiresAt": "2020-01-01T00:00:00+00:00", "seenAt": "2019-12-01T00:00:00+00:00"},
+            {"id": "f", "name": "Fable", "used": 2, "expiresAt": "2099-01-01T00:00:00+00:00", "seenAt": "2026-11-26T12:00:00+00:00"},
+        ]}
+        assert billing.resets_used_text(row).startswith("Fable ×2 used by Nov 26")
+        assert billing.resets_used_text({}) is None
+
+
 class TestUseLimitReset:
     def test_grants_list_spent_ones_and_the_cooldown(self):
         payload = json.loads(json.dumps(_CEDAR_USAGE))
@@ -601,10 +647,23 @@ class _FakeBilling:
         self.stored.append((identity, resets))
 
 
+class _FakeAnchors:
+    def __init__(self):
+        self.notes = []
+
+    def note_resets_used(self, identity, used, via=None, used_at=None):
+        self.notes.append((identity, used, via, used_at))
+
+    def get(self, identity):
+        rows = [dict(u, usedAt=at, via=via) for _i, us, via, at in self.notes for u in us]
+        return {"resetsUsed": rows}
+
+
 class _FakeSwitcher:
     def __init__(self, key="sk"):
         self._sessions = _FakeSessions(key)
         self._billing = _FakeBilling()
+        self._anchors = _FakeAnchors()
 
     def resolve_account(self, ident):
         return "8", "hello@example.com", "org-1"
@@ -635,6 +694,8 @@ class TestResetCommand:
         assert "resets left: Fable ×1" in out
         [(identity, resets)] = sw._billing.stored
         assert identity == ("hello@example.com", "org-1") and [r["name"] for r in resets] == ["Fable"]
+        [(identity, used, via, at)] = sw._anchors.notes
+        assert [u["id"] for u in used] == ["full-reset-2611"] and via == "aswap reset" and at
 
     def test_model_kind_is_case_insensitive(self, cli):
         billing_cli, _sw, used = cli

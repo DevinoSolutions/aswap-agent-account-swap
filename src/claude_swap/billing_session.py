@@ -386,6 +386,38 @@ def fetch_limit_resets(session_key: str, org_uuid: str) -> list[dict]:
     return parse_limit_resets(_request(_RESETS_PATH.format(org=org_uuid), session_key))
 
 
+def fetch_reset_state(session_key: str, org_uuid: str) -> tuple[list[dict], list[dict]]:
+    """One read: the unspent resets and the spent ones (``parse_used_resets``)."""
+    payload = _request(_RESETS_PATH.format(org=org_uuid), session_key)
+    return parse_limit_resets(payload), parse_used_resets(payload)
+
+
+def parse_used_resets(payload: object) -> list[dict]:
+    """Grants with resets spent: ``id``, ``name``, ``used``, ``total``,
+    ``expiresAt``. A spent grant stays listed (``resets_left`` 0) until it
+    expires, whether aswap or the claude.ai page spent it."""
+    block = payload.get("cedar_ember") if isinstance(payload, dict) else None
+    if not isinstance(block, dict):
+        return []
+    models = _scoped_models(payload)
+    out = []
+    for grant in block.get("grants") or []:
+        if not isinstance(grant, dict) or not grant.get("id"):
+            continue
+        left, total = grant.get("resets_left"), grant.get("resets_total")
+        if any(isinstance(v, bool) or not isinstance(v, int) for v in (left, total)) or left >= total:
+            continue
+        clears = [c for c in grant.get("clears") or [] if isinstance(c, str)]
+        out.append({
+            "id": str(grant["id"]),
+            "name": _reset_name(grant, clears, models),
+            "used": total - left,
+            "total": total,
+            "expiresAt": _to_iso(grant.get("ends_at")),
+        })
+    return out
+
+
 def _scoped_models(payload: dict) -> list[str]:
     names = []
     for lim in payload.get("limits") or []:
