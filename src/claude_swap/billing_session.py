@@ -962,8 +962,10 @@ _WALL_JS = (
     " if (!['/login', '/magic-link', '/verify', '/phone', '/onboarding', '/cdn-cgi/']"
     "      .some(x => p.startsWith(x)) && !/verif|phone|challenge/i.test(p)) return '';"
     # A captcha's own words live in a cross-origin frame: look for its frame on
-    # screen instead (hCaptcha's invisible check escalates to a visible
-    # challenge frame, seen 2026-11-26 on /magic-link; reCAPTCHA's likewise).
+    # screen instead. /magic-link always carries hCaptcha's invisible check:
+    # its challenge frame exists there but stays hidden while the page says
+    # "Loading..." for about a minute and then signs in (observed 2026-11-26),
+    # so only a frame actually shown counts; reCAPTCHA's bframe likewise.
     # Not Turnstile's frame: its widget can sit on a page it already passed;
     # Cloudflare's full-page check says "Verify you are human" in the page.
     " const shown = f => { const r = f.getBoundingClientRect();"
