@@ -201,6 +201,26 @@ class TestStrictPrefill:
         assert e.value.kind == bs.WALL_NO_FORM and "/login" in str(e.value)
 
 
+class TestStopPrefill:
+    def test_stopping_frees_the_mailbox_thread_without_the_loop(self):
+        async def started():
+            task = bs._start_prefill(_Tab(has_form=False), "a@example.com", lambda m: None, None)
+            return task
+
+        loop = asyncio.new_event_loop()
+        try:
+            task = loop.run_until_complete(started())
+            bs._stop_prefill(task)  # the loop is no longer running here
+            assert task.aswap_stop.is_set()
+        finally:
+            loop.run_until_complete(asyncio.sleep(0))
+            loop.close()
+
+    def test_strict_needs_an_email(self):
+        with pytest.raises(bs.LoginWall):
+            bs._start_prefill(_Tab(), None, lambda m: None, None, strict=True)
+
+
 class TestWallWatch:
     def _tab(self, answers):
         class T:

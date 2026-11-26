@@ -794,6 +794,7 @@ async def _nd_prefill_email(
     inbox_root: Path | None = None,
     check_wait_s: float = _CHECK_WAIT_S,
     strict: bool = False,
+    stop_event=None,
 ) -> bool:
     """Type ``email`` into claude.ai's login form and press Continue.
 
@@ -835,7 +836,9 @@ async def _nd_prefill_email(
         )
     # Set when this task ends (a manual sign-in cancels it), so the polling
     # thread stops instead of holding the process open until its timeout.
-    stop = threading.Event()
+    # ``_stop_prefill`` sets it too: a cancel is only delivered while the
+    # event loop runs, and the capture may already have stopped it.
+    stop = stop_event or threading.Event()
     try:
         try:
             # Retries spent: the person presses Continue; still watch the inbox.
@@ -927,9 +930,14 @@ def _start_prefill(tab, email: str | None, out, root: Path | None = None, *, str
         if strict:
             raise LoginWall(WALL_NO_FORM, "a hands-free sign-in needs the account's email")
         return None
-    return asyncio.ensure_future(
-        _nd_prefill_email(tab, email, out, inbox_root=root, strict=strict)
+    import threading
+
+    stop = threading.Event()
+    task = asyncio.ensure_future(
+        _nd_prefill_email(tab, email, out, inbox_root=root, strict=strict, stop_event=stop)
     )
+    task.aswap_stop = stop
+    return task
 
 
 def _prefill_wall(task) -> "LoginWall | None":
@@ -1000,7 +1008,12 @@ class _WallWatch:
 
 
 def _stop_prefill(task) -> None:
-    if task is not None and not task.done():
+    if task is None:
+        return
+    stop = getattr(task, "aswap_stop", None)
+    if stop is not None:
+        stop.set()  # frees the mailbox-polling thread even if the loop never runs again
+    if not task.done():
         task.cancel()
 
 
@@ -1079,7 +1092,23 @@ async def _nd_capture_session(
                     out(f"That window is signed in as {seen}, not {email} — sign out there and sign in again.")
             await asyncio.sleep(poll_s)
         if strict:
-            raise LoginWall(WALL_TIMEOUT, f"{email} was not signed in within {int(timeout_s)}s")
+            wall = _prefill_wall(prefill)
+            if wall is not None:
+                raise wall
+            if prefill is not None and not prefill.done():
+                raise LoginWall(
+                    WALL_NO_EMAIL,
+                    f"no sign-in email for {email} reached the login inbox within "
+                    f"{int(timeout_s)}s — is its mail forwarded there?",
+                )
+            try:
+                where = await tab.evaluate("location.pathname")
+            except Exception:
+                where = "?"
+            raise LoginWall(
+                WALL_TIMEOUT,
+                f"{email} was not signed in within {int(timeout_s)}s (stuck on {where})",
+            )
         raise CaptureError(f"timed out after {int(timeout_s)}s waiting for {email} to sign in")
     except CaptureError:
         await _nd_stop(browser)
