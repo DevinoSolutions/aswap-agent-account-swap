@@ -708,6 +708,13 @@ def _no_billing_network(monkeypatch):
         "claude_swap.billing.BillingCache.refresh", lambda self, accounts_info, force=False: None
     )
 
+    def no_resets(session_key, org_uuid):
+        raise OSError("claude.ai is off-limits to the test suite")
+
+    # Tests that restore the real refresh stub only subscription_details;
+    # the limit-reset read rides along and must not reach claude.ai either.
+    monkeypatch.setattr("claude_swap.billing_session.fetch_limit_resets", no_resets)
+
 
 @pytest.fixture(autouse=True)
 def _no_auto_add_network(monkeypatch):

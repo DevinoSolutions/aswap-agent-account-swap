@@ -484,6 +484,87 @@ class TestExactRefresh:
         assert calls == [] and sessions.marks == []
 
 
+_RESETS = [
+    {"id": "w", "name": "Weekly", "left": 1, "total": 1,
+     "expiresAt": "2026-12-10T22:00:00+00:00", "usableNow": True},
+    {"id": "f", "name": "Fable", "left": 1, "total": 1,
+     "expiresAt": "2027-03-09T07:59:00+00:00", "usableNow": True},
+]
+_ACTIVE = {"periodEnd": "2099-01-01T00:00:00+00:00", "cancelAtPeriodEnd": False,
+           "status": "active", "interval": "monthly", "keys": []}
+
+
+class TestLimitResets:
+    INFO = [(3, "a@example.com", "Org", "org-1", False, "", "")]
+    IDENT = {"3": ("a@example.com", "org-1")}
+
+    def _cache(self, tmp_path, monkeypatch, resets):
+        from claude_swap import billing_session as bs
+
+        monkeypatch.setattr(bs, "fetch_subscription_details", lambda key, org: dict(_ACTIVE))
+        monkeypatch.setattr(bs, "fetch_limit_resets", resets)
+        sessions = FakeSessions({("a@example.com", "org-1"): {"sessionKey": "sk", "status": "ok"}})
+        return billing.BillingCache(tmp_path, sessions=sessions)
+
+    def test_refresh_stores_the_resets(self, tmp_path, monkeypatch):
+        cache = self._cache(tmp_path, monkeypatch, lambda key, org: list(_RESETS))
+        cache.refresh(self.INFO)
+        row = cache.records(self.IDENT)["3"]
+        assert row["limitResets"] == _RESETS
+        assert row["source"] == "exact"
+
+    def test_a_failed_read_keeps_the_last_one(self, tmp_path, monkeypatch):
+        cache = self._cache(tmp_path, monkeypatch, lambda key, org: list(_RESETS))
+        cache.refresh(self.INFO)
+
+        def boom(key, org):
+            raise OSError("blocked")
+
+        from claude_swap import billing_session as bs
+
+        monkeypatch.setattr(bs, "fetch_limit_resets", boom)
+        cache.refresh(self.INFO, force=True)
+        row = cache.records(self.IDENT)["3"]
+        assert row["limitResets"] == _RESETS
+        assert row["source"] == "exact"  # the subscription read still counts
+
+    def test_spent_resets_clear_the_list(self, tmp_path, monkeypatch):
+        cache = self._cache(tmp_path, monkeypatch, lambda key, org: list(_RESETS))
+        cache.refresh(self.INFO)
+        from claude_swap import billing_session as bs
+
+        monkeypatch.setattr(bs, "fetch_limit_resets", lambda key, org: [])
+        cache.refresh(self.INFO, force=True)
+        assert cache.records(self.IDENT)["3"]["limitResets"] == []
+
+    def test_view_drops_expired_resets(self):
+        record = {"source": "exact", "currentPeriodEnd": "2099-01-01T00:00:00+00:00",
+                  "subscriptionStatus": "active", "limitResets": _RESETS}
+        now = _dt("2026-12-20T00:00:00").timestamp()  # weekly reset expired Dec 10
+        view = billing.billing_view(record, now=now)
+        assert [r["name"] for r in view["limitResets"]] == ["Fable"]
+        later = _dt("2027-04-01T00:00:00").timestamp()
+        assert "limitResets" not in billing.billing_view(record, now=later)
+
+    def test_text(self, monkeypatch):
+        monkeypatch.setenv("TZ", "UTC")
+        if hasattr(time, "tzset"):
+            time.tzset()
+        now = _dt("2026-11-26T12:00:00").timestamp()
+        view = {"limitResets": [
+            dict(_RESETS[0], left=2),
+            dict(_RESETS[1], usableNow=False),
+        ]}
+        text = billing.limit_resets_text(view, now=now)
+        assert text.startswith("3 available: Weekly ×2 until Dec 10 ")
+        assert "Fable until Mar 9 2027 " in text and text.endswith("(not usable yet)")
+        tenure = {"limitResets": [dict(_RESETS[1], id=i) for i in ("a", "b", "c")]}
+        assert billing.limit_resets_text(tenure, now=now).startswith(
+            "3 available: Fable ×3 until Mar 9 2027 ")
+        assert billing.limit_resets_text({}, now=now) is None
+        assert billing.limit_resets_text(None) is None
+
+
 def _profile(tier, plan="claude_max", status="active", created="2026-07-15T06:18:03Z"):
     org = {
         "uuid": "org-1",
@@ -732,3 +813,21 @@ class TestCancelLog:
         assert "cancellation confirmed" in lines[0]
         assert f"plan ends {local:%a %b} {local.day} {local:%H:%M};" in lines[0]
         assert "no longer cancelling" in lines[1]
+
+
+class TestResetsInListing:
+    def test_list_tree_shows_resets_before_weekly_and_bills(self):
+        import re
+        import time as _time
+
+        from claude_swap.switcher import _usage_entry_lines
+        from claude_swap.usage_store import UsageEntry
+
+        entry = UsageEntry(
+            last_good={"seven_day": {"pct": 100.0}}, fetched_at=_time.time(), age_s=0.0
+        )
+        lines = _usage_entry_lines(entry, "renews Dec 25", "Wed 16:00", "2 available: Weekly")
+        plain = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in lines]
+        labels = [line.split()[1] for line in plain[1:]]
+        assert labels == ["Resets:", "Weekly:", "Bills:"]
+        assert plain[-1].startswith("└")

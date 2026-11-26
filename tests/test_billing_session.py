@@ -9,6 +9,9 @@ import pytest
 
 from claude_swap import billing_session as bs
 
+# Captured at import, before conftest's autouse stub replaces it per test.
+_REAL_FETCH_RESETS = bs.fetch_limit_resets
+
 ID = ("a@example.com", "org-1")
 
 
@@ -465,6 +468,81 @@ class TestOAuthMint:
 
 
 # --- switcher integration ------------------------------------------------------
+
+# Shape measured 2026-11-26 on a Max 20x account (claude.ai Settings > Usage
+# showed "Fable reset, expires Mar 9" and "Weekly reset, expires Dec 10").
+_CEDAR_USAGE = {
+    "limits": [
+        {"kind": "weekly_all", "scope": None, "percent": 100},
+        {"kind": "weekly_scoped", "scope": {"model": {"id": None, "display_name": "Fable"}}, "percent": 22},
+    ],
+    "cedar_ember": {
+        "eligible": True,
+        "grants": [
+            {
+                "id": "launch-2610-fable",
+                "label": "New model launch: one Fable reset for Max, Team Premium and Enterprise Premium",
+                "resets_total": 1, "resets_left": 1,
+                "ends_at": "2027-03-09T07:59:00+00:00",
+                "clears": ["seven_day_overage_included"],
+                "usable_now": True, "type": "full", "gives_back_weekly": True,
+            },
+            {
+                "id": "full-reset-2611",
+                "label": "One full limit reset (November 2026)",
+                "resets_total": 1, "resets_left": 1,
+                "ends_at": "2026-12-10T22:00:00+00:00",
+                "clears": ["seven_day", "seven_day_overage_included"],
+                "usable_now": True, "type": "weekly", "gives_back_weekly": False,
+            },
+            {
+                "id": "spent", "label": "One full limit reset (October 2026)",
+                "resets_total": 1, "resets_left": 0,
+                "ends_at": "2026-11-10T22:00:00+00:00", "clears": ["seven_day"],
+            },
+        ],
+    },
+}
+
+
+class TestLimitResets:
+    def test_names_and_order_match_claude_ai(self):
+        out = bs.parse_limit_resets(_CEDAR_USAGE)
+        assert [(r["name"], r["left"], r["expiresAt"]) for r in out] == [
+            ("Weekly", 1, "2026-12-10T22:00:00+00:00"),
+            ("Fable", 1, "2027-03-09T07:59:00+00:00"),
+        ]
+        assert all(r["usableNow"] for r in out)
+
+    def test_spent_grants_are_left_out(self):
+        assert "spent" not in {r["id"] for r in bs.parse_limit_resets(_CEDAR_USAGE)}
+
+    @pytest.mark.parametrize("payload", [None, [], {}, {"cedar_ember": None},
+                                         {"cedar_ember": {"eligible": False, "grants": []}}])
+    def test_no_block_means_no_resets(self, payload):
+        assert bs.parse_limit_resets(payload) == []
+
+    def test_unknown_model_reset_without_a_scoped_limit(self):
+        payload = {"cedar_ember": {"grants": [
+            {"id": "x", "label": "A reset", "resets_left": 2, "resets_total": 3,
+             "clears": ["seven_day_overage_included"], "usable_now": False},
+        ]}}
+        [r] = bs.parse_limit_resets(payload)
+        assert (r["name"], r["left"], r["total"], r["expiresAt"], r["usableNow"]) == (
+            "Model", 2, 3, None, False)
+
+    def test_fetch_asks_for_the_resets(self, monkeypatch):
+        seen = []
+
+        def fake_request(path, key, timeout=40.0):
+            seen.append(path)
+            return _CEDAR_USAGE
+
+        monkeypatch.setattr(bs, "_request", fake_request)
+        out = _REAL_FETCH_RESETS("sk", "org-1")
+        assert seen == ["/api/organizations/org-1/usage?cedar_ember=1&skip_spend=1"]
+        assert len(out) == 2
+
 
 from claude_swap.switcher import ClaudeAccountSwitcher  # noqa: E402
 from claude_swap.usage_store import FetchRecord  # noqa: E402

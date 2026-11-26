@@ -781,7 +781,7 @@ class TestMiniAccountText:
         now = time.time()
         cases = {
             "⏳": dataclasses.replace(make_account(1), billing={"endsAt": _iso_in(86400)}),
-            "❌": dataclasses.replace(make_account(2), billing={"subscriptionStatus": "canceled"}),
+            "🚫": dataclasses.replace(make_account(2), billing={"subscriptionStatus": "canceled"}),
             "⏰": dataclasses.replace(make_account(3), billing={"nextBillingAt": _iso_in(2 * 86400)}),
         }
         for mark, acc in cases.items():

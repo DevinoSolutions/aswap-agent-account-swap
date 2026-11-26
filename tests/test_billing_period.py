@@ -419,7 +419,7 @@ class TestCancelledMarkInList:
             h.switcher.list_accounts()
         out = capsys.readouterr().out
         assert "⏳ ending@example.com" in out
-        assert "❌ lapsed@example.com" in out
+        assert "🚫 lapsed@example.com" in out
         assert "⏰ soon@example.com" in out
         assert ": paying@example.com" in out
 

@@ -15,7 +15,7 @@ from rich.text import Text
 from textual.widgets import ListItem, ListView, Static
 
 from claude_swap import gate, oauth, pace
-from claude_swap.billing import account_mark, billing_text
+from claude_swap.billing import account_mark, billing_text, limit_resets_text
 from claude_swap.cvp import CVP_LABEL
 from claude_swap.weekly_anchor import weekly_text
 from claude_swap.json_output import USAGE_API_KEY
@@ -296,7 +296,13 @@ def account_card_text(
 
 
 def _append_billing(text: Text, acc: AccountSnapshot, palette: Palette) -> None:
-    """Closing "Weekly" / "Bills" lines: remembered reset and next renewal."""
+    """Closing "Resets" / "Weekly" / "Bills" lines: claude.ai's banked limit
+    resets, the remembered weekly reset and the next renewal."""
+    resets = limit_resets_text(acc.billing)
+    if resets:
+        text.append("\n    ")
+        text.append("Resets ", style=palette.muted)
+        text.append(resets, style=palette.foreground)
     week = weekly_text(acc.weekly)
     if week:
         text.append("\n    ")
@@ -310,7 +316,7 @@ def _append_billing(text: Text, acc: AccountSnapshot, palette: Palette) -> None:
 
 
 def _append_account_mark(text: Text, acc: AccountSnapshot) -> None:
-    """``⏳`` / ``❌`` / ``⏰`` before the email (see ``billing.account_mark``)."""
+    """``⏳`` / ``🚫`` / ``⏰`` before the email (see ``billing.account_mark``)."""
     mark = account_mark(acc.billing)
     if mark:
         text.append(f"{mark} ")

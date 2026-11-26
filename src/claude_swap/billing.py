@@ -158,6 +158,67 @@ def billing_view(
     period_start: tuple[str, str] | None = None,
     cancelled_at: str | None = None,
 ) -> dict | None:
+    """``_plan_view`` plus ``limitResets``: the unspent, unexpired limit
+    resets claude.ai last listed (``billing_session.parse_limit_resets``)."""
+    view = _plan_view(record, now, session_state, period_start, cancelled_at)
+    if view is not None:
+        resets = live_limit_resets(record, time.time() if now is None else now)
+        if resets:
+            view["limitResets"] = resets
+    return view
+
+
+def live_limit_resets(record: dict | None, now: float) -> list[dict]:
+    """The record's limit resets that have not expired by ``now``."""
+    rows = (record or {}).get("limitResets") if isinstance(record, dict) else None
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict) or not isinstance(r.get("left"), int) or r["left"] <= 0:
+            continue
+        ends = _parse_iso(r.get("expiresAt") or "") if isinstance(r.get("expiresAt"), str) else None
+        if ends is not None and ends.timestamp() <= now:
+            continue
+        out.append(r)
+    return out
+
+
+def limit_resets_text(view: dict | None, now: float | None = None) -> str | None:
+    """``2 available: Weekly until Dec 10 17:00 · Fable until Mar 9 2027``.
+
+    Local time; the year only when it is not this one. ``×N`` when several
+    resets share a name and expiry (one grant holding more, or separate
+    grants such as the launch and tenure Fable resets), "(not usable yet)"
+    when claude.ai says so.
+    """
+    resets = (view or {}).get("limitResets")
+    if not resets:
+        return None
+    this_year = datetime.fromtimestamp(time.time() if now is None else now).astimezone().year
+    groups: dict[tuple, int] = {}
+    for r in resets:
+        key = (r.get("name") or "Reset", r.get("expiresAt"), r.get("usableNow") is not False)
+        groups[key] = groups.get(key, 0) + r.get("left", 1)
+    parts = []
+    for (name, expires, usable), left in groups.items():
+        part = name + (f" ×{left}" if left > 1 else "")
+        ends = _parse_iso(expires) if isinstance(expires, str) else None
+        if ends is not None:
+            local = ends.astimezone()
+            year = f" {local.year}" if local.year != this_year else ""
+            part += f" until {local.strftime('%b')} {local.day}{year} {local.strftime('%H:%M')}"
+        if not usable:
+            part += " (not usable yet)"
+        parts.append(part)
+    return f"{sum(groups.values())} available: " + " · ".join(parts)
+
+
+def _plan_view(
+    record: dict | None,
+    now: float | None = None,
+    session_state: str | None = None,
+    period_start: tuple[str, str] | None = None,
+    cancelled_at: str | None = None,
+) -> dict | None:
     """Display/JSON view of a cached record.
 
     ``source == "exact"`` records come from claude.ai ``subscription_details``:
@@ -282,7 +343,9 @@ def period_end_ts(view: dict | None, now: float) -> float | None:
     return parsed.timestamp()
 
 
-CANCELLED_MARK = "❌"  # fully ended
+# Fully ended (no plan). Was ❌, which read as "error / limit hit" (owner
+# 2026-11-26); a limit hit has no mark, its 100% bars say it.
+CANCELLED_MARK = "🚫"
 CANCELLING_MARK = "⏳"  # cancelled, paid time still left
 # "none": claude.ai has no subscription for the organization (lapsed to free).
 _CANCELLED_STATUSES = frozenset({"canceled", "cancelled", "none"})
@@ -500,13 +563,17 @@ class BillingCache:
 
         def fetch(item):
             num, (_email, org, token, session_key) = item
-            result: dict = {"exact": None, "profile": None, "session": None}
+            result: dict = {"exact": None, "profile": None, "session": None, "resets": None}
             if session_key:
                 from claude_swap import billing_session as bs
 
                 try:
                     result["exact"] = bs.fetch_subscription_details(session_key, org)
                     result["session"] = "ok"
+                    try:
+                        result["resets"] = bs.fetch_limit_resets(session_key, org)
+                    except Exception as e:  # advisory: keep the last reading
+                        _logger.debug("limit resets failed for %s: %r", num, e)
                 except bs.SessionExpired:
                     result["session"] = "expired"
                 except Exception as e:  # blocked / network: retry later
@@ -545,6 +612,9 @@ class BillingCache:
                 )
                 if exact.get("status"):
                     row["subscriptionStatus"] = exact["status"]
+            if result["resets"] is not None:
+                row["limitResets"] = result["resets"]
+                row["limitResetsAt"] = now
             elif result["session"] == "expired" or row.get("source") is None:
                 row["source"] = "estimate"
             ok = exact is not None or result["profile"] is not None
