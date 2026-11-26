@@ -16,7 +16,8 @@ concurrency:
 jobs:
   test:
     name: test (${{ matrix.os }}, py${{ matrix.python }})
-    runs-on: ${{ matrix.os }}
+    # Self-hosted since 2026-11-26: the org's GitHub-hosted Actions budget ran out and hosted jobs were refused.
+    runs-on: ${{ matrix.os != 'ubuntu-latest' && matrix.os || github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubuntu-devino' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -46,7 +47,8 @@ jobs:
 
   build:
     name: build and smoke-test the package
-    runs-on: ubuntu-latest
+    # Self-hosted since 2026-11-26: the org's GitHub-hosted Actions budget ran out and hosted jobs were refused.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubuntu-devino' }}
     timeout-minutes: 10
 
     steps:
