@@ -331,6 +331,76 @@ def fetch_subscription_details(session_key: str, org_uuid: str) -> dict:
     return parse_subscription_details(data)
 
 
+# --- limit resets ------------------------------------------------------------
+#
+# claude.ai Settings > Usage lists "Limit resets": banked resets the owner can
+# spend with "Reset for free" (seen 2026-11-26: a monthly "full limit reset"
+# that clears the whole week, and a model-launch reset that refills one
+# model's allowance). The web usage endpoint sends them in ``cedar_ember``
+# only when asked with ``cedar_ember=1``; the OAuth usage endpoint answers
+# ``ineligible_reason: "surface"`` for the same account, so only a claude.ai
+# session can read them.
+
+_RESETS_PATH = "/api/organizations/{org}/usage?cedar_ember=1&skip_spend=1"
+
+
+def fetch_limit_resets(session_key: str, org_uuid: str) -> list[dict]:
+    """The account's unspent limit resets (``parse_limit_resets``)."""
+    return parse_limit_resets(_request(_RESETS_PATH.format(org=org_uuid), session_key))
+
+
+def _scoped_models(payload: dict) -> list[str]:
+    names = []
+    for lim in payload.get("limits") or []:
+        scope = lim.get("scope") if isinstance(lim, dict) else None
+        model = scope.get("model") if isinstance(scope, dict) else None
+        name = model.get("display_name") if isinstance(model, dict) else None
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    return names
+
+
+def _reset_name(grant: dict, clears: list[str], models: list[str]) -> str:
+    """"Weekly" for a reset that clears the whole week, else the model it
+    refills (named in the grant's label, or the account's only per-model
+    limit), as claude.ai labels them ("Weekly reset", "Fable reset")."""
+    if "seven_day" in clears:
+        return "Weekly"
+    label = str(grant.get("label") or "")
+    for name in models:
+        if name.lower() in label.lower():
+            return name
+    return models[0] if len(models) == 1 else "Model"
+
+
+def parse_limit_resets(payload: object) -> list[dict]:
+    """Unspent resets, soonest expiry first: ``name`` ("Weekly" or a model),
+    ``left``, ``total``, ``expiresAt`` (ISO, UTC) and ``usableNow``."""
+    block = payload.get("cedar_ember") if isinstance(payload, dict) else None
+    if not isinstance(block, dict):
+        return []
+    models = _scoped_models(payload)
+    out = []
+    for grant in block.get("grants") or []:
+        if not isinstance(grant, dict):
+            continue
+        left = grant.get("resets_left")
+        if isinstance(left, bool) or not isinstance(left, int) or left <= 0:
+            continue
+        clears = [c for c in grant.get("clears") or [] if isinstance(c, str)]
+        total = grant.get("resets_total")
+        out.append({
+            "id": str(grant.get("id") or ""),
+            "name": _reset_name(grant, clears, models),
+            "left": left,
+            "total": total if isinstance(total, int) and not isinstance(total, bool) else left,
+            "expiresAt": _to_iso(grant.get("ends_at")),
+            "usableNow": grant.get("usable_now") is not False,
+        })
+    out.sort(key=lambda r: r["expiresAt"] or "9999")
+    return out
+
+
 # Measured 2026-10-18 (an active monthly Max plan): next_charge_at (exact
 # instant) + next_charge_date, status "active", billing_interval "monthly",
 # plan_ending_at / plan_ending_before null, scheduled_downgrade null. A

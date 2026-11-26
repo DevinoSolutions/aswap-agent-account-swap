@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from claude_swap import billing_session as bs
 from claude_swap import token_push as tp
 from claude_swap import weekly_anchor as wa
-from claude_swap.billing import billing_text, has_no_plan
+from claude_swap.billing import billing_text, has_no_plan, limit_resets_text
 from claude_swap.printer import accent, dimmed, error, muted
 
 
@@ -267,6 +267,9 @@ def _status(sw, args) -> None:
         print(f"  {r['number']}: {r['email']}  {muted('session: ' + (r['session'] or 'none'))}")
         print(f"     Weekly: {wa.weekly_text(r['weeklyReset']) or 'unknown'}")
         print(f"     Bills:  {billing_text(r['billing']) or 'unknown'}{dimmed(_basis_text(r['billing']))}")
+        resets = limit_resets_text(r["billing"])
+        if resets:
+            print(f"     Resets: {resets}")
     if removed:
         print(dimmed("Remembered (not in aswap):"))
         for r in removed:

@@ -66,6 +66,7 @@ from claude_swap.billing import (
     account_mark,
     billing_text,
     billing_view,
+    limit_resets_text,
     looks_lapsed,
 )
 from claude_swap.billing_session import SessionStore, session_usable
@@ -349,7 +350,10 @@ def last_seen_note(entry: UsageEntry) -> str | None:
 
 
 def _usage_entry_lines(
-    entry: UsageEntry, billing: str | None = None, weekly: str | None = None
+    entry: UsageEntry,
+    billing: str | None = None,
+    weekly: str | None = None,
+    resets: str | None = None,
 ) -> list[str]:
     """Styled usage lines (sans indent) for one account's entry.
 
@@ -359,9 +363,14 @@ def _usage_entry_lines(
     with no measurement at all shows "usage unavailable" plus the last fetch
     error, so a failing endpoint is visible instead of a silent blank.
     ``weekly`` (``weekly_anchor.weekly_text``) and ``billing``
-    (``billing.billing_text``) close the tree as "Weekly:" / "Bills:" rows.
+    (``billing.billing_text``) close the tree as "Weekly:" / "Bills:" rows,
+    after the claude.ai limit resets (``billing.limit_resets_text``).
     """
-    extras = [(label, text) for label, text in (("Weekly:", weekly), ("Bills:", billing)) if text]
+    extras = [
+        (label, text)
+        for label, text in (("Resets:", resets), ("Weekly:", weekly), ("Bills:", billing))
+        if text
+    ]
     if entry.sentinel is not None:
         out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
         last_seen = last_seen_note(entry)
@@ -7521,7 +7530,8 @@ class ClaudeAccountSwitcher:
             print(f"  {slot}: {label} {muted(f'[{tag}]')}{markers}")
             bills = billing_text(billing.get(str(num)))
             week = weekly_text(weekly.get(str(num)))
-            for line in _usage_entry_lines(entries[str(num)], bills, week):
+            resets = limit_resets_text(billing.get(str(num)))
+            for line in _usage_entry_lines(entries[str(num)], bills, week, resets):
                 print(f"     {line}")
             if needs_login:
                 print(f"     {dimmed(self.needs_login_hint())}")
