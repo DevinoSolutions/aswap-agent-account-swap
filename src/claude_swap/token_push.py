@@ -51,18 +51,20 @@ def pace_mint(root: Path, *, out=print, rng=random.uniform, now=time.time, sleep
 
 def mint_credentials(
     browser, root: Path, *, out=print, paced: bool = True, email: str | None = None,
-    on_session=None,
+    on_session=None, strict: bool = False,
 ) -> str:
     """Mint a fresh token from a signed-in browser; returns Claude Code's credential JSON.
 
     ``email`` lets the mint answer claude.ai's reauth step with a fresh
     sign-in; ``on_session`` then gets the new claude.ai session key (the
-    sign-in revokes the old one).
+    sign-in revokes the old one). ``strict`` makes that sign-in hands-free
+    (see ``billing_session.LoginWall``).
     """
     if paced:
         pace_mint(root, out=out)
+    extra = {"strict": True} if strict else {}
     token_data = bs.mint_oauth_tokens(
-        browser, out=out, email=email, root=root, on_session=on_session,
+        browser, out=out, email=email, root=root, on_session=on_session, **extra,
     )
     try:
         profile = oauth.request_profile_data(token_data["access_token"])

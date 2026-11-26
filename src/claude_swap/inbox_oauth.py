@@ -193,10 +193,75 @@ def _id_token_email(id_token: str | None) -> str | None:
     return None
 
 
+# Scopes that let the Gmail API read a message body.
+_GMAIL_READ_SCOPES = (
+    GOOGLE_SCOPE,
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://mail.google.com/",
+)
+
+
+def _read_token_file(path: Path) -> dict:
+    """An authorized-user token file (``google-auth``'s JSON, as written by
+    ``gcloud``, the Google Workspace MCP and most Google client libraries):
+    ``refresh_token``, ``client_id`` and ``client_secret`` at the top level."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise InboxError(f"cannot read token file {path}: {type(e).__name__}") from None
+    if not isinstance(raw, dict) or not all(
+        isinstance(raw.get(k), str) and raw.get(k) for k in ("refresh_token", "client_id", "client_secret")
+    ):
+        raise InboxError(f"{path} is not an authorized-user token file (refresh_token, client_id, client_secret)")
+    return raw
+
+
+def _token_uri(raw: dict) -> str:
+    """The file's token endpoint, but only a Google one: its refresh token and
+    client secret are never posted wherever a file points them."""
+    uri = raw.get("token_uri")
+    if isinstance(uri, str):
+        parts = urllib.parse.urlparse(uri)
+        if parts.scheme == "https" and (parts.hostname or "").endswith(".googleapis.com"):
+            return uri
+    return GOOGLE_TOKEN
+
+
+def import_token_file(path: Path, *, hint: str | None = None) -> dict:
+    """The row for a Gmail mailbox whose OAuth token already exists in ``path``.
+
+    The row keeps the file's path, not a copy of the token: whatever keeps
+    that file fresh keeps aswap's access fresh too, and nothing secret is
+    written twice. The token must carry a scope that reads mail.
+    """
+    path = Path(path).expanduser().resolve()
+    raw = _read_token_file(path)
+    scopes = raw.get("scopes") or raw.get("scope") or []
+    if isinstance(scopes, str):
+        scopes = scopes.split()
+    if scopes and not any(s in _GMAIL_READ_SCOPES for s in scopes):
+        raise InboxError(f"{path} has no Gmail read scope (needs gmail.readonly)")
+    tokens = _request(_token_uri(raw), data={
+        "grant_type": "refresh_token", "refresh_token": raw["refresh_token"],
+        "client_id": raw["client_id"], "client_secret": raw["client_secret"],
+    })
+    address = _request(f"{GMAIL}/profile", token=tokens["access_token"]).get("emailAddress")
+    if not address:
+        raise InboxError("Gmail did not report the mailbox address")
+    if hint and address.lower() != hint.lower():
+        raise InboxError(f"{path} signs in {address}, not {hint}")
+    return {"kind": "google", "address": address, "tokenFile": str(path)}
+
+
 def connect(root: Path, args, *, out=print, open_browser=webbrowser.open) -> dict:
     """Sign in to a Gmail (``args.kind == "google"``) or Outlook mailbox;
     returns the row to store."""
     hint = getattr(args, "hint", None)
+    if args.kind == "google" and getattr(args, "token_file", None):
+        return import_token_file(Path(args.token_file), hint=hint)
+    if getattr(args, "no_browser", False):
+        def open_browser(_url):  # the URL is printed; open it in any browser
+            return None
     if args.kind == "google":
         cid, secret = _google_client(root, args)
 
@@ -287,10 +352,28 @@ class _ApiSource:
 
 class GmailSource(_ApiSource):
     def _refresh(self) -> dict:
+        token_file = self.row.get("tokenFile")
+        if token_file:  # re-read each time: the file's owner may have renewed it
+            raw = _read_token_file(Path(token_file))
+            return _request(_token_uri(raw), data={
+                "grant_type": "refresh_token", "refresh_token": raw["refresh_token"],
+                "client_id": raw["client_id"], "client_secret": raw["client_secret"],
+            })
         return _request(GOOGLE_TOKEN, data={
             "grant_type": "refresh_token", "refresh_token": self.row.get("refreshToken", ""),
             "client_id": self.row.get("clientId", ""), "client_secret": self.row.get("clientSecret", ""),
         })
+
+    def access_token(self) -> str:
+        if self.row.get("tokenFile"):
+            # Never write a refresh token into login_inbox.json for a row
+            # that points at someone else's token file.
+            if self._token is None or time.monotonic() > self._expires - 60:
+                tokens = self._refresh()
+                self._token = tokens["access_token"]
+                self._expires = time.monotonic() + float(tokens.get("expires_in") or 3600)
+            return self._token
+        return super().access_token()
 
     def _ids(self) -> list[str]:
         q = urllib.parse.urlencode({"q": _GMAIL_QUERY, "maxResults": 20, "includeSpamTrash": "true"})
