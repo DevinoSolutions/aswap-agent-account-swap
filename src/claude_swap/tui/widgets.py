@@ -15,7 +15,13 @@ from rich.text import Text
 from textual.widgets import ListItem, ListView, Static
 
 from claude_swap import gate, oauth, pace
-from claude_swap.billing import account_mark, billing_text, limit_resets_text
+from claude_swap.billing import (
+    NO_PLAN_USAGE_NOTE,
+    account_mark,
+    billing_text,
+    has_no_plan,
+    limit_resets_text,
+)
 from claude_swap.cvp import CVP_LABEL
 from claude_swap.weekly_anchor import weekly_text
 from claude_swap.json_output import USAGE_API_KEY
@@ -234,6 +240,14 @@ def account_card_text(
         text.append("\n    ")
         text.append(NEEDS_LOGIN_CARD_HINT, style=palette.muted)
 
+    if has_no_plan(acc.billing):
+        # The plan is over: bars would read as usable quota. The usage is
+        # still measured and stored (--json has it).
+        text.append("\n    ")
+        text.append(NO_PLAN_USAGE_NOTE, style=palette.muted)
+        _append_billing(text, acc, palette)
+        return text
+
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         text.append("\n    ")
@@ -359,6 +373,10 @@ def mini_account_text(
     if acc.needs_login:
         text.append("  (needs login)", style=palette.sev_warn)
     text.append("   ")
+
+    if has_no_plan(acc.billing):
+        text.append(NO_PLAN_USAGE_NOTE, style=palette.muted)
+        return text
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:

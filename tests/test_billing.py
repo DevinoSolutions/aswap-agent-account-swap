@@ -831,3 +831,22 @@ class TestResetsInListing:
         labels = [line.split()[1] for line in plain[1:]]
         assert labels == ["Resets:", "Weekly:", "Bills:"]
         assert plain[-1].startswith("└")
+
+
+class TestNoPlanListing:
+    def test_list_tree_hides_usage_when_the_plan_is_over(self):
+        import re
+        import time as _time
+
+        from claude_swap.billing import NO_PLAN_USAGE_NOTE
+        from claude_swap.switcher import _usage_entry_lines
+        from claude_swap.usage_store import UsageEntry
+
+        entry = UsageEntry(
+            last_good={"seven_day": {"pct": 12.0}}, fetched_at=_time.time(), age_s=0.0
+        )
+        lines = _usage_entry_lines(entry, "subscription canceled", "Wed 16:00", None, True)
+        plain = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in lines]
+        assert plain[0] == NO_PLAN_USAGE_NOTE
+        assert not any("12%" in line for line in plain)
+        assert [line.split()[1] for line in plain[1:]] == ["Weekly:", "Bills:"]

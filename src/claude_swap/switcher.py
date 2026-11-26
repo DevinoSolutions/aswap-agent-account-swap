@@ -62,10 +62,12 @@ from claude_swap.billing import (
     PLAN_RECHECK_MIN_S,
     PLAN_REFRESH_S,
     SESSION_BILLING_SCAN_S,
+    NO_PLAN_USAGE_NOTE,
     BillingCache,
     account_mark,
     billing_text,
     billing_view,
+    has_no_plan,
     limit_resets_text,
     looks_lapsed,
 )
@@ -354,6 +356,7 @@ def _usage_entry_lines(
     billing: str | None = None,
     weekly: str | None = None,
     resets: str | None = None,
+    no_plan: bool = False,
 ) -> list[str]:
     """Styled usage lines (sans indent) for one account's entry.
 
@@ -371,6 +374,12 @@ def _usage_entry_lines(
         for label, text in (("Resets:", resets), ("Weekly:", weekly), ("Bills:", billing))
         if text
     ]
+    if no_plan:
+        # The plan is over: bars would read as usable quota (the usage is
+        # still stored; --json has it).
+        out = [dimmed(NO_PLAN_USAGE_NOTE)]
+        out.extend(f"{dimmed('└')} {muted(f'{label} {text}')}" for label, text in extras)
+        return out
     if entry.sentinel is not None:
         out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
         last_seen = last_seen_note(entry)
@@ -7531,7 +7540,8 @@ class ClaudeAccountSwitcher:
             bills = billing_text(billing.get(str(num)))
             week = weekly_text(weekly.get(str(num)))
             resets = limit_resets_text(billing.get(str(num)))
-            for line in _usage_entry_lines(entries[str(num)], bills, week, resets):
+            no_plan = has_no_plan(billing.get(str(num)))
+            for line in _usage_entry_lines(entries[str(num)], bills, week, resets, no_plan):
                 print(f"     {line}")
             if needs_login:
                 print(f"     {dimmed(self.needs_login_hint())}")

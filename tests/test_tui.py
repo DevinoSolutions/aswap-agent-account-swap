@@ -791,6 +791,29 @@ class TestMiniAccountText:
         for text in (mini_account_text(later, now).plain, account_card_text(later, 100, now=now).plain):
             assert not any(m in text for m in cases)
 
+    def test_no_plan_hides_the_usage_bars(self):
+        # Owner 2026-11-26: bars on a lapsed account read as "still usable".
+        from claude_swap.billing import NO_PLAN_USAGE_NOTE
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        now = time.time()
+        entry = UsageEntry(
+            last_good={"seven_day": {"pct": 12.0, "resets_at": _iso_in(3600 * 30)}},
+            fetched_at=now, age_s=0.0,
+        )
+        for status in ("canceled", "none"):
+            acc = dataclasses.replace(
+                make_account(2, entry=entry), billing={"subscriptionStatus": status}
+            )
+            for text in (account_card_text(acc, 100, now=now).plain, mini_account_text(acc, now).plain):
+                assert NO_PLAN_USAGE_NOTE in text
+                assert "12%" not in text
+            assert acc.usage.last_good["seven_day"]["pct"] == 12.0  # kept, only hidden
+        # Cancelled with paid time left is still usable: bars stay.
+        running = dataclasses.replace(make_account(3, entry=entry), billing={"endsAt": _iso_in(86400)})
+        card = account_card_text(running, 100, now=now).plain
+        assert "12%" in card and NO_PLAN_USAGE_NOTE not in card
+
     def test_five_hour_never_shows_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text
 
