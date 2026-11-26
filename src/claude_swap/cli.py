@@ -2143,6 +2143,11 @@ def main() -> None:
 
         inbox_command(argv[1:])
         return
+    if argv and argv[0] == "relogin-dead":
+        from claude_swap.relogin import relogin_dead_command
+
+        relogin_dead_command(argv[1:])
+        return
     if argv and argv[0] == "map":
         _map_command(argv[1:])
         return
@@ -2214,6 +2219,9 @@ Commands:
   %(prog)s codex <command>            manage Codex CLI accounts
   %(prog)s backup [take|list|check|restore|export]  snapshots of state.db; crash restore
   %(prog)s login [num|email]          sign in: session + CC token in one step
+  %(prog)s login <num|email> --auto   hands-free re-login via the login inbox
+  %(prog)s relogin-dead [--dry-run]   hands-free re-login of every dead account
+  %(prog)s inbox add|list|test|remove mailboxes the sign-in links are read from
   %(prog)s billing <command>          exact billing, weekly resets, resub plan
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s warmup                     keep five-hour windows ready (opt-in spend)

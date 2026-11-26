@@ -363,10 +363,18 @@ def inbox_command(argv: list[str]) -> None:
     g.add_argument("--client-id")
     g.add_argument("--client-secret")
     g.add_argument("--hint", metavar="EMAIL", help="the address to sign in with")
+    g.add_argument("--token-file", metavar="PATH",
+                   help="use an existing authorized-user token file (refresh_token, client_id, "
+                        "client_secret; e.g. the Google Workspace MCP's) instead of signing in; "
+                        "aswap keeps the path, not a copy")
+    g.add_argument("--no-browser", action="store_true",
+                   help="print the sign-in URL instead of opening the default browser")
     o = kinds.add_parser("outlook", help="Outlook.com / Microsoft 365, read-only OAuth (Mail.Read)")
     o.add_argument("--client-id", help="Application (client) ID of your Entra app registration")
     o.add_argument("--tenant", help="common (default), consumers, organizations or a tenant ID")
     o.add_argument("--hint", metavar="EMAIL", help="the address to sign in with")
+    o.add_argument("--no-browser", action="store_true",
+                   help="print the sign-in URL instead of opening the default browser")
     i = kinds.add_parser("imap", help="any IMAP server, with a (app) password")
     i.add_argument("user", metavar="EMAIL")
     i.add_argument("--host", default=DEFAULT_HOST, help=f"IMAP server (default {DEFAULT_HOST})")
@@ -428,6 +436,8 @@ def inbox_command(argv: list[str]) -> None:
     if args.action == "list":
         for r in rows:
             where = f" on {r.get('host', DEFAULT_HOST)}" if r["kind"] == "imap" else ""
+            if r.get("tokenFile"):
+                where = f", token file {r['tokenFile']}"
             print(f"  {r['address']}  ({r['kind']}{where})")
         return
     failed = False
